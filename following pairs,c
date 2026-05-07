@@ -1,0 +1,52 @@
+*/
+This code should not be used might randomly crash
+/*
+
+
+#include <stdio.h>
+#include <stdint.h>
+#include "Markov.c"
+
+typedef uint8_t u8;
+
+MarkovPRNG rng;
+
+void SetSeed(unsigned char seed){
+    markov_seed(&rng, seed);
+}
+
+unsigned char getNext(){
+    return markov_next(&rng);
+}
+
+
+u8 FindSolution(uint8_t a, uint8_t b){
+    
+    for (u8 x = 0; x < 255; x++){
+        SetSeed(x);
+        if (getNext() == a){
+            if (getNext() == b){
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+
+int main() {
+
+    int sum = 0;
+
+    for (u8 x = 0; x < 255; x++){
+        for (u8 z = 0; z < 255; z++){
+            if (FindSolution(x,z) == 0){
+                sum++;
+            }
+        }
+    }
+
+    printf("found %d / %d",sum,256*256);
+
+    return 0;
+}
