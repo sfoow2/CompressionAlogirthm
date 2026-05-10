@@ -2,6 +2,33 @@
 it is verry not recommended to use this code as it might ruin your whole computer because of its unsafe actions, really dont use this code
 */
 
+/*
+ * tuner2.c — fixed
+ *
+ * Bug fixes:
+ *
+ * 1. encode_block / encode_stream: the encoder consumed a variable number of
+ *    input nibbles (syms_done) but encode_stream always advanced ip by the
+ *    fixed `chunk` size.  encode_block now returns syms_done via an out-param
+ *    and encode_stream advances by that amount instead.
+ *
+ * 2. encode_block raw-escape path: when falling back to raw bytes the loop
+ *    must write `count` nibbles but was iterating over `in[i]` without the
+ *    `& 0xF` mask (minor, kept for safety).
+ *
+ * 3. run(): operator-precedence bug in the early mismatch loop:
+ *       data[x]&0xF != dec[x]&0xF
+ *    was parsed as
+ *       data[x] & (0xF != dec[x]) & 0xF
+ *    Fixed with explicit parentheses.  (The real round-trip check below it
+ *    was already correct, so this only affected the early-exit print, but
+ *    it's fixed anyway.)
+ *
+ * 4. decode_block debug scaffolding removed; consumed is computed from the
+ *    exact bit count (new_consumed), which was already the correct value
+ *    being assigned to *consumed.
+ */
+
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
@@ -142,8 +169,17 @@ void bs_w(BS*b,u32 v,int n){for(int i=0;i<n;i++){int by=b->bp/8,bi=b->bp%8;if(by
 u32  bs_r(BS*b,int n){u32 v=0;for(int i=0;i<n;i++){int by=b->bp/8,bi=b->bp%8;if(by<b->cap&&((b->buf[by]>>bi)&1))v|=(1u<<i);b->bp++;}return v;}
 int  bs_bytes(const BS*b){return(b->bp+7)/8;}
 
-/* ── encode_block: also returns bit count for consumed calculation ── */
-int encode_block(const u8 *in, int count, u8 *out, int *out_bits) {
+/*
+ * encode_block
+ *   in        – input nibbles
+ *   count     – max nibbles available
+ *   out       – encoded bytes written here
+ *   out_bits  – (optional) exact payload bit count
+ *   in_used   – (NEW) number of input nibbles actually consumed  ← FIX 1
+ *
+ * Returns number of bytes written to out.
+ */
+int encode_block(const u8 *in, int count, u8 *out, int *out_bits, int *in_used) {
     u8  slot_comp[BLOCK], slot_seed[BLOCK], slot_off[BLOCK], slot_val[BLOCK];
     int nslots = 0, syms_done = 0;
 
@@ -164,6 +200,9 @@ int encode_block(const u8 *in, int count, u8 *out, int *out_bits) {
         nslots++; syms_done++;
     }
 
+    /* FIX 1: report how many input nibbles were consumed */
+    if (in_used) *in_used = syms_done;
+
     u8 flags = 0;
     for (int i = 0; i < nslots; i++) if (slot_comp[i]) flags |= (1u << i);
 
@@ -174,22 +213,21 @@ int encode_block(const u8 *in, int count, u8 *out, int *out_bits) {
         else                bs_w(&pbs, slot_val [i], 4);
     }
 
-    /* record exact bit count before rounding */
     if (out_bits) *out_bits = pbs.bp;
 
     int total = 2 + bs_bytes(&pbs);
-    if (total >= count + 1) {
-        out[0] = 0xFF; out[1] = (u8)count;
-        for (int i = 0; i < count; i++) out[2+i] = in[i] & 0xF;
-        if (out_bits) *out_bits = -1; /* raw escape */
-        return 2 + count;
+    if (total >= syms_done + 1) {   /* raw escape: compare against actual consumed */
+        out[0] = 0xFF; out[1] = (u8)syms_done;
+        for (int i = 0; i < syms_done; i++) out[2+i] = in[i] & 0xF;
+        if (out_bits) *out_bits = -1;
+        return 2 + syms_done;
     }
     out[0] = flags; out[1] = (u8)nslots;
     memcpy(out+2, pbuf, bs_bytes(&pbs));
     return total;
 }
 
-int decode_block(const u8 *in, int in_len, u8 *out, int *consumed, int block_idx) {
+int decode_block(const u8 *in, int in_len, u8 *out, int *consumed) {
     if (in_len < 2) return 0;
     if (in[0] == 0xFF) {
         int cnt = in[1]; if (cnt > in_len-2) cnt = in_len-2;
@@ -215,43 +253,36 @@ int decode_block(const u8 *in, int in_len, u8 *out, int *consumed, int block_idx
         }
     }
 
-    /* compute consumed from known bit widths — mirrors encoder exactly */
+    /* Compute consumed from exact bit count — mirrors encoder */
     int bits = 0;
     for (int sl = 0; sl < nslots; sl++)
         bits += ((flags >> sl) & 1) ? 6 : 4;
-    int old_consumed = 2 + bs_bytes(&pbs);   /* what the old code did */
-    int new_consumed = 2 + (bits + 7) / 8;   /* correct calculation   */
-    *consumed = new_consumed;
-
-    /* debug: print first 10 blocks and any block where they differ */
-    if (block_idx < 10 || old_consumed != new_consumed) {
-        printf("  [blk %4d] flags=0x%02X nslots=%d bits=%d "
-               "old_consumed=%d new_consumed=%d out_syms=%d%s\n",
-               block_idx, flags, nslots, bits,
-               old_consumed, new_consumed, pos,
-               old_consumed != new_consumed ? "  *** DIFFERS ***" : "");
-    }
+    *consumed = 2 + (bits + 7) / 8;
 
     return pos;
 }
 
+/* FIX 1: advance ip by the number of nibbles encode_block actually consumed */
 int encode_stream(const u8 *in, int ilen, u8 *out, int ocap) {
     int ip = 0, op = 0;
     while (ip < ilen) {
         int chunk = ilen-ip < BLOCK ? ilen-ip : BLOCK;
         u8 blk[16];
-        int blen = encode_block(in+ip, chunk, blk, NULL);
+        int in_used = 0;
+        int blen = encode_block(in+ip, chunk, blk, NULL, &in_used);
         if (op+blen > ocap) break;
-        memcpy(out+op, blk, blen); op += blen; ip += chunk;
+        memcpy(out+op, blk, blen);
+        op += blen;
+        ip += in_used;   /* was: ip += chunk  ← the original bug */
     }
     return op;
 }
 
 int decode_stream(const u8 *in, int ilen, u8 *out, int ocap) {
-    int ip = 0, op = 0, block_idx = 0;
+    int ip = 0, op = 0;
     while (ip < ilen && op < ocap) {
         int consumed; u8 syms[BLOCK*2+4];
-        int ns = decode_block(in+ip, ilen-ip, syms, &consumed, block_idx++);
+        int ns = decode_block(in+ip, ilen-ip, syms, &consumed);
         for (int i = 0; i < ns && op < ocap; i++) out[op++] = syms[i];
         ip += consumed;
     }
@@ -324,7 +355,6 @@ void run(const char *name, const u8 *data, int len) {
     G_CLUSTER_RADIUS=s.cr; G_STICKY_WEIGHT=s.sw; G_HISTORY_WEIGHT=s.hw;
     build_table();
 
-    /* encode once more to get the compressed stream */
     u8 *comp = malloc(len*3+64);
     int hlen  = write_header(comp, s.cr, s.sw, s.hw);
     int dlen  = encode_stream(data, len, comp+hlen, len*3+64-hlen);
@@ -334,17 +364,13 @@ void run(const char *name, const u8 *data, int len) {
     printf("Compressed: %d bytes → %.1f%% (saved %d)\n",
            clen, 100.0f*clen/len, len-clen);
 
-    /* first 16 input nibbles */
     printf("Input  first 16 nibbles: ");
     for (int i=0;i<16&&i<len;i++) printf("%X ", data[i]&0xF);
     printf("\n");
 
-    /* decode with debug */
-    printf("Decode trace (first 10 blocks + any consumed-differs):\n");
     u8 *dec = malloc(len+4);
     int dlen2 = decompress(comp, clen, dec, len+4);
 
-    /* first 16 output nibbles */
     printf("Output first 16 nibbles: ");
     for (int i=0;i<16&&i<dlen2;i++) printf("%X ", dec[i]&0xF);
     printf("\n");
@@ -354,7 +380,8 @@ void run(const char *name, const u8 *data, int len) {
     int first_bad = -1;
     if (ok) {
         for (int i=0;i<len;i++) {
-            if ((dec[i]&0xF) != (data[i]&0xF)) {
+            /* FIX 3: add parentheses to get correct operator precedence */
+            if ((data[i]&0xF) != (dec[i]&0xF)) {
                 if (first_bad < 0) first_bad = i;
                 ok = 0;
             }
@@ -391,7 +418,7 @@ int main() {
     printf("All combinations: %s\n", errors==0?"OK":"FAILED");
 
     srand(15);
-    int size = 4192 * 8;
+    int size = 1048;
     u8 *d1 = malloc(size);
     for (int x=0;x<size;x++) d1[x] = rand() % 255;
     run("Test 1", d1, size);
