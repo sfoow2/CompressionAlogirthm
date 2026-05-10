@@ -1,0 +1,446 @@
+*/
+  FOR NO REASON SHOULD YOU USE THIS CODE AS IT WILL BREAK YOUR SYSTEM IT IT VERY RECOMMENEDED TO IGNORE THIS CODE AND MOVE ON WITH YOUR LIFE AS YOU WILL BE WAISITNG YOUR TIME TRYING TO FIGURE IT OUT FOR NOTHIGN
+
+/*
+
+
+
+/*
+ * tuner2.c — fixed
+ *
+ * Bug fixes:
+ *
+ * 1. encode_block / encode_stream: the encoder consumed a variable number of
+ *    input nibbles (syms_done) but encode_stream always advanced ip by the
+ *    fixed `chunk` size.  encode_block now returns syms_done via an out-param
+ *    and encode_stream advances by that amount instead.
+ *
+ * 2. encode_block raw-escape path: when falling back to raw bytes the loop
+ *    must write `count` nibbles but was iterating over `in[i]` without the
+ *    `& 0xF` mask (minor, kept for safety).
+ *
+ * 3. run(): operator-precedence bug in the early mismatch loop:
+ *       data[x]&0xF != dec[x]&0xF
+ *    was parsed as
+ *       data[x] & (0xF != dec[x]) & 0xF
+ *    Fixed with explicit parentheses.  (The real round-trip check below it
+ *    was already correct, so this only affected the early-exit print, but
+ *    it's fixed anyway.)
+ *
+ * 4. decode_block debug scaffolding removed; consumed is computed from the
+ *    exact bit count (new_consumed), which was already the correct value
+ *    being assigned to *consumed.
+ */
+
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+#include <stdlib.h>
+#include <time.h>
+
+typedef uint8_t  u8;
+typedef uint16_t u16;
+typedef uint32_t u32;
+
+#define MAGIC 0xC0
+
+#define CR_MIN   1
+#define CR_MAX   7
+#define SW_MIN   5
+#define SW_MAX  80
+#define SW_STEP  5
+#define HW_MIN   0
+#define HW_MAX  40
+#define HW_STEP  5
+
+#define HEADER_BYTES 3
+
+u16 pack_settings(int cr, int sw, int hw) {
+    int cr_idx = (cr - CR_MIN);
+    int sw_idx = (sw - SW_MIN) / SW_STEP;
+    int hw_idx = (hw - HW_MIN) / HW_STEP;
+    return (u16)((cr_idx << 13) | (sw_idx << 9) | (hw_idx << 5));
+}
+
+void unpack_settings(u16 packed, int *cr, int *sw, int *hw) {
+    int cr_idx = (packed >> 13) & 0x07;
+    int sw_idx = (packed >>  9) & 0x0F;
+    int hw_idx = (packed >>  5) & 0x0F;
+    *cr = cr_idx + CR_MIN;
+    *sw = sw_idx * SW_STEP + SW_MIN;
+    *hw = hw_idx * HW_STEP + HW_MIN;
+}
+
+int write_header(u8 *out, int cr, int sw, int hw) {
+    u16 packed = pack_settings(cr, sw, hw);
+    out[0] = MAGIC;
+    out[1] = (u8)(packed >> 8);
+    out[2] = (u8)(packed & 0xFF);
+    return HEADER_BYTES;
+}
+
+int read_header(const u8 *in, int *cr, int *sw, int *hw) {
+    if (in[0] != MAGIC) return 0;
+    u16 packed = ((u16)in[1] << 8) | in[2];
+    unpack_settings(packed, cr, sw, hw);
+    return 1;
+}
+
+static int G_CLUSTER_RADIUS = 24;
+static int G_STICKY_WEIGHT  = 40;
+static int G_HISTORY_WEIGHT = 15;
+#define HISTORY_LEN 4
+
+typedef struct {
+    uint32_t lcg;
+    uint8_t  last;
+    uint8_t  history[HISTORY_LEN];
+    int      hpos;
+    uint32_t bias[16];
+} NibblePRNG;
+
+static inline uint32_t lcg_step(uint32_t *s, uint8_t fb) {
+    *s = *s * 1664525u + 1013904223u + (uint32_t)fb;
+    return *s;
+}
+
+void nibble_seed_g(NibblePRNG *m, u8 seed) {
+    m->lcg  = (uint32_t)seed * 2654435761u ^ 0xDEADBEEFu;
+    m->last = seed & 0x0F;
+    m->hpos = 0;
+    memset(m->history, m->last, sizeof(m->history));
+}
+
+u8 nibble_next_g(NibblePRNG *m) {
+    int CR = G_CLUSTER_RADIUS;
+    int SW = G_STICKY_WEIGHT;
+    int HW = G_HISTORY_WEIGHT;
+
+    for (int i = 0; i < 16; i++)
+        m->bias[i] = (lcg_step(&m->lcg, m->last) >> 16) & 0xFF;
+    for (int d = -CR; d <= CR; d++) {
+        int idx  = ((int)m->last + d + 16) & 0x0F;
+        int dist = d < 0 ? -d : d;
+        if (dist <= CR) m->bias[idx] += (uint32_t)(CR - dist + 1) * 3u;
+    }
+    m->bias[m->last] += (uint32_t)SW;
+    for (int h = 0; h < HISTORY_LEN; h++)
+        m->bias[m->history[h]] += (uint32_t)HW;
+
+    uint64_t total = 0;
+    for (int i = 0; i < 16; i++) total += m->bias[i];
+    uint64_t r = ((uint64_t)(lcg_step(&m->lcg, m->last) >> 8) << 16)
+               |  (lcg_step(&m->lcg, m->last) >> 16);
+    u8 out = 0; uint64_t acc = 0;
+    for (int i = 0; i < 16; i++) {
+        acc += m->bias[i];
+        if ((r % total) < acc) { out = (u8)i; break; }
+    }
+    m->history[m->hpos] = m->last;
+    m->hpos = (m->hpos + 1) % HISTORY_LEN;
+    m->last = out;
+    return out;
+}
+
+#define NSEEDS  16
+#define WINDOW4  4
+#define BLOCK    8
+
+static int enc_seed  [16][16];
+static int enc_offset[16][16];
+static NibblePRNG g_nib;
+
+void build_table() {
+    for (int a = 0; a < 16; a++)
+        for (int b = 0; b < 16; b++)
+            enc_seed[a][b] = -1;
+    for (int s = 0; s < NSEEDS; s++) {
+        nibble_seed_g(&g_nib, (u8)s);
+        u8 a = nibble_next_g(&g_nib);
+        for (int w = 0; w < WINDOW4; w++) {
+            u8 b = nibble_next_g(&g_nib);
+            if (enc_seed[a][b] == -1) {
+                enc_seed  [a][b] = s;
+                enc_offset[a][b] = w;
+            }
+        }
+    }
+}
+
+typedef struct { u8 *buf; int cap; int bp; } BS;
+void bs_init(BS*b,u8*buf,int c){b->buf=buf;b->cap=c;b->bp=0;memset(buf,0,c);}
+void bs_w(BS*b,u32 v,int n){for(int i=0;i<n;i++){int by=b->bp/8,bi=b->bp%8;if(by<b->cap&&((v>>i)&1))b->buf[by]|=(1u<<bi);b->bp++;}}
+u32  bs_r(BS*b,int n){u32 v=0;for(int i=0;i<n;i++){int by=b->bp/8,bi=b->bp%8;if(by<b->cap&&((b->buf[by]>>bi)&1))v|=(1u<<i);b->bp++;}return v;}
+int  bs_bytes(const BS*b){return(b->bp+7)/8;}
+
+/*
+ * encode_block
+ *   in        – input nibbles
+ *   count     – max nibbles available
+ *   out       – encoded bytes written here
+ *   out_bits  – (optional) exact payload bit count
+ *   in_used   – (NEW) number of input nibbles actually consumed  ← FIX 1
+ *
+ * Returns number of bytes written to out.
+ */
+int encode_block(const u8 *in, int count, u8 *out, int *out_bits, int *in_used) {
+    u8  slot_comp[BLOCK], slot_seed[BLOCK], slot_off[BLOCK], slot_val[BLOCK];
+    int nslots = 0, syms_done = 0;
+
+    while (syms_done < count && nslots < BLOCK) {
+        int a = in[syms_done] & 0xF;
+        if (syms_done + 1 < count) {
+            int b = in[syms_done+1] & 0xF;
+            int s = enc_seed[a][b];
+            if (s >= 0) {
+                slot_comp[nslots] = 1;
+                slot_seed[nslots] = (u8)s;
+                slot_off [nslots] = (u8)enc_offset[a][b];
+                nslots++; syms_done += 2; continue;
+            }
+        }
+        slot_comp[nslots] = 0;
+        slot_val [nslots] = (u8)(in[syms_done] & 0xF);
+        nslots++; syms_done++;
+    }
+
+    /* FIX 1: report how many input nibbles were consumed */
+    if (in_used) *in_used = syms_done;
+
+    u8 flags = 0;
+    for (int i = 0; i < nslots; i++) if (slot_comp[i]) flags |= (1u << i);
+
+    u8 pbuf[12]; memset(pbuf, 0, 12);
+    BS pbs; bs_init(&pbs, pbuf, 12);
+    for (int i = 0; i < nslots; i++) {
+        if (slot_comp[i]) { bs_w(&pbs, slot_seed[i], 4); bs_w(&pbs, slot_off[i], 2); }
+        else                bs_w(&pbs, slot_val [i], 4);
+    }
+
+    if (out_bits) *out_bits = pbs.bp;
+
+    int total = 2 + bs_bytes(&pbs);
+    if (total >= syms_done + 1) {   /* raw escape: compare against actual consumed */
+        out[0] = 0xFF; out[1] = (u8)syms_done;
+        for (int i = 0; i < syms_done; i++) out[2+i] = in[i] & 0xF;
+        if (out_bits) *out_bits = -1;
+        return 2 + syms_done;
+    }
+    out[0] = flags; out[1] = (u8)nslots;
+    memcpy(out+2, pbuf, bs_bytes(&pbs));
+    return total;
+}
+
+int decode_block(const u8 *in, int in_len, u8 *out, int *consumed) {
+    if (in_len < 2) return 0;
+    if (in[0] == 0xFF) {
+        int cnt = in[1]; if (cnt > in_len-2) cnt = in_len-2;
+        for (int i = 0; i < cnt; i++) out[i] = in[2+i] & 0xF;
+        *consumed = 2+cnt; return cnt;
+    }
+    u8  flags  = in[0];
+    int nslots = in[1];
+    BS pbs; pbs.buf=(u8*)(in+2); pbs.cap=in_len-2; pbs.bp=0;
+    int pos = 0;
+
+    for (int sl = 0; sl < nslots; sl++) {
+        if ((flags >> sl) & 1) {
+            u8  seed = (u8)bs_r(&pbs, 4);
+            int off  = (int)bs_r(&pbs, 2);
+            nibble_seed_g(&g_nib, seed);
+            u8 a = nibble_next_g(&g_nib);
+            for (int i = 0; i < off; i++) nibble_next_g(&g_nib);
+            u8 b = nibble_next_g(&g_nib);
+            out[pos++] = a; out[pos++] = b;
+        } else {
+            out[pos++] = (u8)bs_r(&pbs, 4);
+        }
+    }
+
+    /* Compute consumed from exact bit count — mirrors encoder */
+    int bits = 0;
+    for (int sl = 0; sl < nslots; sl++)
+        bits += ((flags >> sl) & 1) ? 6 : 4;
+    *consumed = 2 + (bits + 7) / 8;
+
+    return pos;
+}
+
+/* FIX 1: advance ip by the number of nibbles encode_block actually consumed */
+int encode_stream(const u8 *in, int ilen, u8 *out, int ocap) {
+    int ip = 0, op = 0;
+    while (ip < ilen) {
+        int chunk = ilen-ip < BLOCK ? ilen-ip : BLOCK;
+        u8 blk[16];
+        int in_used = 0;
+        int blen = encode_block(in+ip, chunk, blk, NULL, &in_used);
+        if (op+blen > ocap) break;
+        memcpy(out+op, blk, blen);
+        op += blen;
+        ip += in_used;   /* was: ip += chunk  ← the original bug */
+    }
+    return op;
+}
+
+int decode_stream(const u8 *in, int ilen, u8 *out, int ocap) {
+    int ip = 0, op = 0;
+    while (ip < ilen && op < ocap) {
+        int consumed; u8 syms[BLOCK*2+4];
+        int ns = decode_block(in+ip, ilen-ip, syms, &consumed);
+        for (int i = 0; i < ns && op < ocap; i++) out[op++] = syms[i];
+        ip += consumed;
+    }
+    return op;
+}
+
+typedef struct { int cr, sw, hw, compressed_size; float ratio; } Settings;
+
+Settings tune(const u8 *data, int len, int verbose) {
+    Settings best = {CR_MIN, SW_MIN, HW_MIN, len*3, 999.0f};
+    int total_iters = (CR_MAX-CR_MIN+1)*((SW_MAX-SW_MIN)/SW_STEP+1)*((HW_MAX-HW_MIN)/HW_STEP+1);
+    int iter = 0;
+    u8 *enc = (u8*)malloc(len*3+64);
+    if (!enc) { printf("OOM\n"); return best; }
+    for (int cr=CR_MIN; cr<=CR_MAX; cr++)
+    for (int sw=SW_MIN; sw<=SW_MAX; sw+=SW_STEP)
+    for (int hw=HW_MIN; hw<=HW_MAX; hw+=HW_STEP) {
+        G_CLUSTER_RADIUS=cr; G_STICKY_WEIGHT=sw; G_HISTORY_WEIGHT=hw;
+        build_table();
+        int sz=encode_stream(data,len,enc,len*3+64);
+        float rat=(float)sz/len;
+        if (sz<best.compressed_size){best.cr=cr;best.sw=sw;best.hw=hw;best.compressed_size=sz;best.ratio=rat;}
+        iter++;
+        if (verbose&&(iter%50==0||iter==total_iters))
+            printf("  [%d/%d] best: CR=%d SW=%d HW=%d → %d bytes (%.1f%%)\r",
+                   iter,total_iters,best.cr,best.sw,best.hw,best.compressed_size,best.ratio*100);
+    }
+    free(enc);
+    if (verbose) printf("\n");
+    return best;
+}
+
+int compress(const u8 *in, int ilen, u8 *out, int ocap, int *used_compression) {
+    Settings s = tune(in, ilen, 0);
+    int total_compressed = HEADER_BYTES + s.compressed_size;
+    if (total_compressed >= ilen) {
+        *used_compression = 0;
+        if (ilen <= ocap) memcpy(out, in, ilen);
+        return ilen;
+    }
+    G_CLUSTER_RADIUS=s.cr; G_STICKY_WEIGHT=s.sw; G_HISTORY_WEIGHT=s.hw;
+    build_table();
+    int hlen = write_header(out, s.cr, s.sw, s.hw);
+    int dlen = encode_stream(in, ilen, out+hlen, ocap-hlen);
+    *used_compression = 1;
+    return hlen + dlen;
+}
+
+int decompress(const u8 *in, int ilen, u8 *out, int ocap) {
+    if (ilen < 1) return 0;
+    if (in[0] != MAGIC) {
+        int n = ilen < ocap ? ilen : ocap;
+        memcpy(out, in, n);
+        return n;
+    }
+    if (ilen < HEADER_BYTES) return 0;
+    int cr, sw, hw;
+    read_header(in, &cr, &sw, &hw);
+    G_CLUSTER_RADIUS=cr; G_STICKY_WEIGHT=sw; G_HISTORY_WEIGHT=hw;
+    build_table();
+    return decode_stream(in+HEADER_BYTES, ilen-HEADER_BYTES, out, ocap);
+}
+
+void phex(const u8*b,int n){for(int i=0;i<n;i++)printf("%02X ",b[i]);printf("\n");}
+
+void run(const char *name, const u8 *data, int len) {
+    printf("\n--- %s (%d bytes) ---\n", name, len);
+    Settings s = tune(data, len, 1);
+
+    G_CLUSTER_RADIUS=s.cr; G_STICKY_WEIGHT=s.sw; G_HISTORY_WEIGHT=s.hw;
+    build_table();
+
+    u8 *comp = malloc(len*3+64);
+    int hlen  = write_header(comp, s.cr, s.sw, s.hw);
+    int dlen  = encode_stream(data, len, comp+hlen, len*3+64-hlen);
+    int clen  = hlen + dlen;
+
+    printf("Best: CR=%d SW=%d HW=%d\n", s.cr, s.sw, s.hw);
+    printf("Compressed: %d bytes → %.1f%% (saved %d)\n",
+           clen, 100.0f*clen/len, len-clen);
+
+    printf("Input  first 16 nibbles: ");
+    for (int i=0;i<16&&i<len;i++) printf("%X ", data[i]&0xF);
+    printf("\n");
+
+    u8 *dec = malloc(len+4);
+    int dlen2 = decompress(comp, clen, dec, len+4);
+
+    printf("Output first 16 nibbles: ");
+    for (int i=0;i<16&&i<dlen2;i++) printf("%X ", dec[i]&0xF);
+    printf("\n");
+
+    /* find first mismatch */
+    int ok = (dlen2 == len);
+    int first_bad = -1;
+    if (ok) {
+        for (int i=0;i<len;i++) {
+            /* FIX 3: add parentheses to get correct operator precedence */
+            if ((data[i]&0xF) != (dec[i]&0xF)) {
+                if (first_bad < 0) first_bad = i;
+                ok = 0;
+            }
+        }
+    }
+    if (first_bad >= 0) {
+        printf("First mismatch at nibble %d: got %X expected %X\n",
+               first_bad, dec[first_bad]&0xF, data[first_bad]&0xF);
+        printf("  Around that point (input) : ");
+        for (int i=first_bad-2;i<first_bad+6&&i<len;i++)
+            printf("%X%s", data[i]&0xF, i==first_bad?"*":" ");
+        printf("\n");
+        printf("  Around that point (output): ");
+        for (int i=first_bad-2;i<first_bad+6&&i<dlen2;i++)
+            printf("%X%s", dec[i]&0xF, i==first_bad?"*":" ");
+        printf("\n");
+    }
+    printf("Round-trip: %s  (got %d bytes, expected %d)\n",
+           ok ? "OK" : "MISMATCH", dlen2, len);
+
+    free(comp); free(dec);
+}
+
+uint32_t rng_state = 12345; // seed however you want
+
+uint8_t rand16(void) {
+    rng_state ^= rng_state << 13;
+    rng_state ^= rng_state >> 17;
+    rng_state ^= rng_state << 5;
+    return rng_state & 0xF;
+}
+
+int main() {
+    printf("=== Pack/Unpack Verification ===\n");
+    int errors = 0;
+    for (int cr=CR_MIN;cr<=CR_MAX;cr++)
+    for (int sw=SW_MIN;sw<=SW_MAX;sw+=SW_STEP)
+    for (int hw=HW_MIN;hw<=HW_MAX;hw+=HW_STEP) {
+        u16 p=pack_settings(cr,sw,hw); int cr2,sw2,hw2;
+        unpack_settings(p,&cr2,&sw2,&hw2);
+        if (cr2!=cr||sw2!=sw||hw2!=hw){printf("FAIL: (%d,%d,%d)\n",cr,sw,hw);errors++;}
+    }
+    printf("All combinations: %s\n", errors==0?"OK":"FAILED");
+
+    rng_state = (uint32_t)time(NULL);
+    if (rng_state == 0) rng_state = 1;
+
+
+    int size = 1048;
+    u8* d1 = malloc(size);
+    for (int x = 0; x < size; x++) {
+        d1[x] = rand16();
+    }
+
+    run("Test 1", d1, size);
+    free(d1);
+    return 0;
+}
