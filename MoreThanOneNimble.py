@@ -5,32 +5,41 @@ DO NOT USE THIS CODE AS IT IS UNSAFE AND WILL BREAK YOUR COMPUTER DONT EVEN TRY 
 
 
 /*
- * prng_compress.c  —  nibble-pair PRNG compression
+ * prng_compress.c  —  nibble-pair PRNG compression with per-pass scramble search
  *
- * See original file header for full documentation.
+ * MULTI-PASS + SCRAMBLE
+ * =====================
+ * Before each compression pass the encoder brute-forces a reversible
+ * per-nibble scramble (operation + parameter k) together with the PRNG
+ * settings.  The combination that produces the smallest compressed output
+ * on the tuning sample is committed, then the scramble is applied to the
+ * full current nibble stream before encoding.
  *
- * MULTI-PASS NOTE
- * ===============
- * Pass p>0 operates on the nibble expansion of pass (p-1)'s compressed
- * output.  Compressed data has near-uniform byte distribution, so its
- * nibble expansion carries very little PRNG-matchable structure.  A second
- * pass will therefore almost always expand rather than shrink.
+ * Scramble operations (all 4-bit, all reversible):
+ *   ADD  k   (n+k)  mod 16        inverse: SUB k
+ *   SUB  k   (n-k)  mod 16        inverse: ADD k
+ *   XOR  k    n ^ k               inverse: XOR k
+ *   ROL  k   rotate-left  k bits  inverse: ROR k
+ *   ROR  k   rotate-right k bits  inverse: ROL k
+ *   FLIP     bit-reverse nibble   inverse: FLIP
+ *   NOT      ~n & 0xF             inverse: NOT
  *
- * The stopping condition (enc_len >= cur_nib_len/2) correctly catches this,
- * but we also add a cheap pre-screen: count how many nibble pairs in the
- * expanded stream are covered by the lookup table under the best settings
- * found by tune().  If fewer than MIN_COVERAGE_PCT percent of pairs can be
- * compressed, we skip the encode attempt entirely.
- *
- * This means passes=2+ will still fire on genuinely structured data
- * (e.g. an input whose pass-0 compressed form retains byte-level patterns)
- * while avoiding wasted work on random-looking compressed streams.
+ * Header layout:
+ *   Byte 0        : MAGIC (0xC0)
+ *   Byte 1        : passes (1..MAX_PASSES)
+ *   For each pass p = 0 .. passes-1:
+ *     Byte 2+3*p  : packed PRNG settings high byte
+ *     Byte 3+3*p  : packed PRNG settings low byte
+ *     Byte 4+3*p  : scramble byte = (op << 4) | (k & 0xF)
+ *   Payload starts at byte 2 + 3*passes.
  */
 
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
+#include <omp.h>
 
 typedef uint8_t  u8;
 typedef uint16_t u16;
@@ -38,42 +47,97 @@ typedef uint32_t u32;
 typedef uint64_t u64;
 
 #define MAGIC        0xC0u
-#define HEADER_BYTES 4
 #define MAX_PASSES   4
 
 #define CR_MIN  1
 #define CR_MAX  7
 #define SW_MIN  5
 #define SW_MAX  80
-#define SW_STEP 5
+#define SW_STEP 1
 #define HW_MIN  0
 #define HW_MAX  40
-#define HW_STEP 5
+#define HW_STEP 1
 
 #define NSEEDS       16
 #define WINDOW        8
-#define BLOCK         8
+#define BLOCK         32
 #define HISTORY_LEN   4
 
-
+/* ── settings pack/unpack ── */
 
 static u16 pack_settings(int cr, int sw, int hw)
 {
-    return (u16)(((cr - CR_MIN) << 13) |
-                 (((sw - SW_MIN) / SW_STEP) <<  9) |
-                 (((hw - HW_MIN) / HW_STEP) <<  5));
+    int cr_val = cr - CR_MIN;           /* 0-6, needs 3 bits */
+    int sw_val = sw - SW_MIN;           /* 0-75, needs 7 bits */
+    int hw_val = hw - HW_MIN;           /* 0-40, needs 6 bits */
+    return (u16)((cr_val << 13) | (sw_val << 6) | hw_val);
 }
 
 static void unpack_settings(u16 p, int *cr, int *sw, int *hw)
 {
     *cr = ((p >> 13) & 0x07) + CR_MIN;
-    *sw = ((p >>  9) & 0x0F) * SW_STEP + SW_MIN;
-    *hw = ((p >>  5) & 0x0F) * HW_STEP + HW_MIN;
+    *sw = ((p >>  6) & 0x7F) + SW_MIN;
+    *hw = (p & 0x3F) + HW_MIN;
 }
+
+/* ── nibble scramble ── */
+
+typedef enum {
+    SCRAM_ADD  = 0,
+    SCRAM_SUB  = 1,
+    SCRAM_XOR  = 2,
+    SCRAM_ROL  = 3,
+    SCRAM_ROR  = 4,
+    SCRAM_FLIP = 5,
+    SCRAM_NOT  = 6
+} ScramOp;
+
+static u8 rol4(u8 n, int k) { k &= 3; return (u8)(((n << k) | (n >> (4-k))) & 0xF); }
+static u8 ror4(u8 n, int k) { k &= 3; return (u8)(((n >> k) | (n << (4-k))) & 0xF); }
+static u8 flip4(u8 n)       { return (u8)(((n&1)<<3)|((n&2)<<1)|((n&4)>>1)|((n&8)>>3)); }
+
+static u8 scramble_nib(u8 n, ScramOp op, int k)
+{
+    n &= 0xF;
+    switch (op) {
+        case SCRAM_ADD:  return (u8)((n + k) & 0xF);
+        case SCRAM_SUB:  return (u8)((n - k + 16) & 0xF);
+        case SCRAM_XOR:  return (u8)(n ^ (k & 0xF));
+        case SCRAM_ROL:  return rol4(n, k);
+        case SCRAM_ROR:  return ror4(n, k);
+        case SCRAM_FLIP: return flip4(n);
+        case SCRAM_NOT:  return (u8)((~n) & 0xF);
+        default:         return n;
+    }
+}
+
+static u8 unscramble_nib(u8 n, ScramOp op, int k)
+{
+    n &= 0xF;
+    switch (op) {
+        case SCRAM_ADD:  return (u8)((n - k + 16) & 0xF);
+        case SCRAM_SUB:  return (u8)((n + k) & 0xF);
+        case SCRAM_XOR:  return (u8)(n ^ (k & 0xF));
+        case SCRAM_ROL:  return ror4(n, k);
+        case SCRAM_ROR:  return rol4(n, k);
+        case SCRAM_FLIP: return flip4(n);
+        case SCRAM_NOT:  return (u8)((~n) & 0xF);
+        default:         return n;
+    }
+}
+
+static u8 pack_scramble(ScramOp op, int k)
+{ return (u8)(((int)op << 4) | (k & 0xF)); }
+
+static void unpack_scramble(u8 b, ScramOp *op, int *k)
+{ *op = (ScramOp)((b >> 4) & 0x7); *k = b & 0xF; }
+
+/* ── PRNG (thread-local for parallelization) ── */
 
 static int G_CR = 3;
 static int G_SW = 40;
 static int G_HW = 15;
+#pragma omp threadprivate(G_CR, G_SW, G_HW)
 
 typedef struct {
     u32 lcg;
@@ -125,6 +189,7 @@ static u8 nibble_next(NibblePRNG *m)
 static int enc_seed[16][16];
 static int enc_off [16][16];
 static NibblePRNG g_prng;
+#pragma omp threadprivate(enc_seed, enc_off, g_prng)
 
 static void build_table(void)
 {
@@ -144,7 +209,9 @@ static void build_table(void)
     }
 }
 
-#define TUNE_SAMPLE 512
+#define TUNE_SAMPLE 4096  /* increased from 512 to get representative sample */
+
+/* ── bit stream (unchanged) ── */
 
 typedef struct { u8 *buf; int cap; int bp; } BS;
 
@@ -173,6 +240,8 @@ static u32 bs_r(BS *b, int n)
 
 static int bs_bytes(const BS *b) { return (b->bp + 7) / 8; }
 
+/* ── nibble/byte conversion (unchanged) ── */
+
 static int bytes_to_nibbles(const u8 *in, int len, u8 *out)
 {
     for (int i = 0; i < len; i++) {
@@ -189,6 +258,8 @@ static int nibbles_to_bytes(const u8 *in, int nib_len, u8 *out)
         out[i] = (u8)((in[2*i] << 4) | (in[2*i + 1] & 0x0Fu));
     return out_len;
 }
+
+/* ── block encode/decode (unchanged) ── */
 
 static int encode_block(const u8 *in, int count, u8 *out, int *in_used)
 {
@@ -211,41 +282,44 @@ static int encode_block(const u8 *in, int count, u8 *out, int *in_used)
         nslots++; ndone++;
     }
     if (in_used) *in_used = ndone;
-    u8 flags = 0;
+    u32 flags = 0;
     for (int i = 0; i < nslots; i++)
-        if (comp[i]) flags |= (u8)(1u << i);
-    u8 pbuf[16]; memset(pbuf, 0, sizeof pbuf);
+        if (comp[i]) flags |= (1u << i);
+    u8 pbuf[128]; memset(pbuf, 0, sizeof pbuf);
     BS pbs; bs_init(&pbs, pbuf, (int)sizeof pbuf);
     for (int i = 0; i < nslots; i++) {
         if (comp[i]) { bs_w(&pbs, seed_s[i], 4); bs_w(&pbs, off_s[i], 3); }
         else            bs_w(&pbs, raw_s[i], 4);
     }
-    int comp_bytes = 2 + bs_bytes(&pbs);
-    int raw_bytes  = 2 + ndone;
+    int comp_bytes = 5 + bs_bytes(&pbs);  /* 4 bytes flags + 1 byte nslots */
+    int raw_bytes  = 5 + ndone;            /* 4 bytes flags + 1 byte ndone */
     if (comp_bytes >= raw_bytes) {
-        out[0] = 0xFF; out[1] = (u8)ndone;
-        for (int i = 0; i < ndone; i++) out[2 + i] = in[i] & 0x0Fu;
+        out[0] = 0xFF; out[1] = 0xFF; out[2] = 0xFF; out[3] = 0xFF;
+        out[4] = (u8)ndone;
+        for (int i = 0; i < ndone; i++) out[5 + i] = in[i] & 0x0Fu;
         return raw_bytes;
     }
-    out[0] = flags; out[1] = (u8)nslots;
-    memcpy(out + 2, pbuf, bs_bytes(&pbs));
+    out[0] = (u8)(flags >> 24); out[1] = (u8)(flags >> 16);
+    out[2] = (u8)(flags >> 8);  out[3] = (u8)flags;
+    out[4] = (u8)nslots;
+    memcpy(out + 5, pbuf, bs_bytes(&pbs));
     return comp_bytes;
 }
 
 static int decode_block(const u8 *in, int in_len, u8 *out, int *consumed)
 {
-    if (in_len < 2) return 0;
-    if (in[0] == 0xFF) {
-        int cnt = (int)in[1];
-        if (cnt > in_len - 2) cnt = in_len - 2;
-        for (int i = 0; i < cnt; i++) out[i] = in[2 + i] & 0x0Fu;
-        *consumed = 2 + cnt;
+    if (in_len < 5) return 0;
+    u32 flags = ((u32)in[0] << 24) | ((u32)in[1] << 16) | ((u32)in[2] << 8) | (u32)in[3];
+    if (flags == 0xFFFFFFFFu) {
+        int cnt = (int)in[4];
+        if (cnt > in_len - 5) cnt = in_len - 5;
+        for (int i = 0; i < cnt; i++) out[i] = in[5 + i] & 0x0Fu;
+        *consumed = 5 + cnt;
         return cnt;
     }
-    u8  flags  = in[0];
-    int nslots = (int)in[1];
+    int nslots = (int)in[4];
     BS  pbs;
-    pbs.buf = (u8 *)(in + 2); pbs.cap = in_len - 2; pbs.bp = 0;
+    pbs.buf = (u8 *)(in + 5); pbs.cap = in_len - 5; pbs.bp = 0;
     int pos = 0;
     for (int sl = 0; sl < nslots; sl++) {
         if ((flags >> sl) & 1u) {
@@ -263,7 +337,7 @@ static int decode_block(const u8 *in, int in_len, u8 *out, int *consumed)
     int bits = 0;
     for (int sl = 0; sl < nslots; sl++)
         bits += ((flags >> sl) & 1u) ? 7 : 4;
-    *consumed = 2 + (bits + 7) / 8;
+    *consumed = 5 + (bits + 7) / 8;
     return pos;
 }
 
@@ -282,6 +356,54 @@ static int encode_stream(const u8 *in, int ilen, u8 *out, int ocap)
     return op;
 }
 
+static void analyze_compression(const u8 *in, int ilen)
+{
+    int total_matched = 0, total_raw = 0, total_blocks = 0, total_bits = 0;
+
+    int ip = 0;
+    while (ip < ilen) {
+        int chunk = (ilen - ip < BLOCK) ? (ilen - ip) : BLOCK;
+        u8  comp[BLOCK];
+        int nslots = 0, ndone = 0;
+
+        while (ndone < chunk && nslots < BLOCK) {
+            int a = in[ip + ndone] & 0xF;
+            if (ndone + 1 < chunk) {
+                int b = in[ip + ndone + 1] & 0xF;
+                if (enc_seed[a][b] >= 0) {
+                    comp[nslots] = 1;
+                    total_matched++;
+                    total_bits += 7;  /* 4 bits seed + 3 bits offset */
+                    nslots++; ndone += 2; continue;
+                }
+            }
+            comp[nslots] = 0;
+            total_raw++;
+            total_bits += 4;
+            nslots++; ndone++;
+        }
+
+        total_blocks++;
+        total_bits += 16;  /* flags byte + count byte per block */
+        ip += ndone;
+    }
+
+    int total_bytes_data = (total_bits + 7) / 8;
+    int total_bytes_with_header = 5 + total_bytes_data;
+
+    fprintf(stderr, "  [ANALYSIS]\n");
+    fprintf(stderr, "    Input:          %d nibbles\n", ilen);
+    fprintf(stderr, "    Matched pairs:  %d (%.1f%%)\n", total_matched, 100.0f*total_matched*2/ilen);
+    fprintf(stderr, "    Raw nibbles:    %d (%.1f%%)\n", total_raw, 100.0f*total_raw/ilen);
+    fprintf(stderr, "    Blocks:         %d\n", total_blocks);
+    fprintf(stderr, "    Data bits:      %d matched*7 + %d raw*4 = %d bits\n",
+            total_matched, total_raw, total_bits - total_blocks*16);
+    fprintf(stderr, "    Block overhead: %d blocks * 16 bits = %d bits\n", total_blocks, total_blocks*16);
+    fprintf(stderr, "    Payload bytes:  %d (%.1f%% of input)\n", total_bytes_data, 100.0f*total_bytes_data/((ilen+1)/2));
+    fprintf(stderr, "    Header:         5 bytes\n");
+    fprintf(stderr, "    Total:          %d bytes (%.1f%% of input)\n", total_bytes_with_header, 100.0f*total_bytes_with_header/((ilen+1)/2));
+}
+
 static int decode_stream(const u8 *in, int ilen, u8 *out, int ocap)
 {
     int ip = 0, op = 0;
@@ -296,29 +418,109 @@ static int decode_stream(const u8 *in, int ilen, u8 *out, int ocap)
     return op;
 }
 
-typedef struct { int cr, sw, hw, csz; float ratio; } Settings;
+/* ── joint scramble + PRNG tuner ── */
 
-static Settings tune(const u8 *data, int len)
+typedef struct { int cr, sw, hw, csz; float ratio; } Settings;
+typedef struct { Settings prng; ScramOp op; int k; } TuneResult;
+
+static const char *scram_name(ScramOp op)
 {
-    int slen = (len < TUNE_SAMPLE) ? len : TUNE_SAMPLE;
-    Settings best = { CR_MIN, SW_MIN, HW_MIN, slen * 3, 999.0f };
-    u8 *enc = (u8 *)malloc((size_t)(slen * 3 + 64));
-    if (!enc) return best;
-    for (int cr = CR_MIN; cr <= CR_MAX; cr++)
-    for (int sw = SW_MIN; sw <= SW_MAX; sw += SW_STEP)
-    for (int hw = HW_MIN; hw <= HW_MAX; hw += HW_STEP) {
-        G_CR = cr; G_SW = sw; G_HW = hw;
-        build_table();
-        int sz = encode_stream(data, slen, enc, slen * 3 + 64);
-        if (sz < best.csz) {
-            best.cr = cr; best.sw = sw; best.hw = hw;
-            best.csz = sz;
-            best.ratio = (float)sz / (float)slen;
-        }
+    switch (op) {
+        case SCRAM_ADD:  return "ADD";
+        case SCRAM_SUB:  return "SUB";
+        case SCRAM_XOR:  return "XOR";
+        case SCRAM_ROL:  return "ROL";
+        case SCRAM_ROR:  return "ROR";
+        case SCRAM_FLIP: return "FLP";
+        case SCRAM_NOT:  return "NOT";
+        default:         return "???";
     }
-    free(enc);
+}
+
+static TuneResult tune_scramble(const u8 *data, int len)
+{
+    /* ops and their k iteration ranges */
+    static const int OPS[]  = { SCRAM_ADD, SCRAM_SUB, SCRAM_XOR,
+                                 SCRAM_ROL, SCRAM_ROR, SCRAM_FLIP, SCRAM_NOT };
+    static const int KMAX[] = { 16, 16, 16, 4, 4, 1, 1 };
+    enum { N_OPS = 7 };
+
+    int slen = (len < TUNE_SAMPLE) ? len : TUNE_SAMPLE;
+
+    TuneResult best;
+    best.prng.cr  = CR_MIN; best.prng.sw = SW_MIN; best.prng.hw = HW_MIN;
+    best.prng.csz = slen * 3; best.prng.ratio = 999.0f;
+    best.op = SCRAM_ADD; best.k = 0;
+
+    u8 *scratch = (u8 *)malloc((size_t)slen);
+    u8 *enc     = (u8 *)malloc((size_t)(slen * 3 + 64));
+    if (!scratch || !enc) { free(scratch); free(enc); return best; }
+
+    int tries = 0;
+    int best_per_op[7];
+    for (int j = 0; j < 7; j++) best_per_op[j] = INT_MAX;
+
+    for (int oi = 0; oi < N_OPS; oi++) {
+        ScramOp op = (ScramOp)OPS[oi];
+        int     km = KMAX[oi];
+
+        int best_for_op = INT_MAX;
+        int best_k_for_op = -1;
+
+        for (int k = 0; k < km; k++) {
+            /* apply this scramble to the tuning sample */
+            for (int i = 0; i < slen; i++)
+                scratch[i] = scramble_nib(data[i], op, k);
+
+            /* find best PRNG for this (op,k) combo */
+            int best_sz_for_this_k = INT_MAX;
+            int local_tries = 0;
+
+            #pragma omp parallel for collapse(3) reduction(min:best_sz_for_this_k) \
+                reduction(+:local_tries)
+            for (int cr = CR_MIN; cr <= CR_MAX; cr++)
+            for (int sw = SW_MIN; sw <= SW_MAX; sw += SW_STEP)
+            for (int hw = HW_MIN; hw <= HW_MAX; hw += HW_STEP) {
+                G_CR = cr; G_SW = sw; G_HW = hw;
+                build_table();
+                int sz = encode_stream(scratch, slen, enc, slen * 3 + 64);
+                local_tries++;
+
+                if (sz < best_sz_for_this_k) {
+                    best_sz_for_this_k = sz;
+                }
+
+                if (sz < best.prng.csz) {
+                    #pragma omp critical
+                    {
+                        if (sz < best.prng.csz) {
+                            best.prng.cr  = cr; best.prng.sw = sw; best.prng.hw = hw;
+                            best.prng.csz = sz;
+                            best.prng.ratio = (float)sz / (float)slen;
+                            best.op = op; best.k  = k;
+                        }
+                    }
+                }
+            }
+            tries += local_tries;
+
+            if (best_sz_for_this_k < best_for_op) {
+                best_for_op = best_sz_for_this_k;
+                best_k_for_op = k;
+            }
+        }
+        best_per_op[oi] = best_for_op;
+    }
+
+    fprintf(stderr, "  [TUNE] best: %s:%d with CR=%d SW=%d HW=%d → %d bytes (%.1f%%), %d combos tried\n",
+            scram_name(best.op), best.k, best.prng.cr, best.prng.sw, best.prng.hw,
+            best.prng.csz, 100.0f*best.prng.csz/slen, tries);
+
+    free(scratch); free(enc);
     return best;
 }
+
+/* ── compress ── */
 
 int compress(const u8 *in, int ilen, u8 *out, int ocap, int *used)
 {
@@ -331,8 +533,9 @@ int compress(const u8 *in, int ilen, u8 *out, int ocap, int *used)
     u8 *enc_b = (u8 *)malloc((size_t)enc_cap);
     u8 *nib_a = (u8 *)malloc((size_t)nib_cap);
     u8 *nib_b = (u8 *)malloc((size_t)nib_cap);
-    if (!enc_a || !enc_b || !nib_a || !nib_b) {
-        free(enc_a); free(enc_b); free(nib_a); free(nib_b);
+    u8 *scr   = (u8 *)malloc((size_t)nib_cap);  /* scratch for pre-encode scramble */
+    if (!enc_a || !enc_b || !nib_a || !nib_b || !scr) {
+        free(enc_a); free(enc_b); free(nib_a); free(nib_b); free(scr);
         return 0;
     }
 
@@ -343,34 +546,47 @@ int compress(const u8 *in, int ilen, u8 *out, int ocap, int *used)
     u8 *enc_try      = enc_b;
     int enc_good_len = 0;
 
-    int pass_cr[MAX_PASSES], pass_sw[MAX_PASSES], pass_hw[MAX_PASSES];
+    int     pass_cr[MAX_PASSES], pass_sw[MAX_PASSES], pass_hw[MAX_PASSES];
+    ScramOp pass_op[MAX_PASSES];
+    int     pass_k [MAX_PASSES];
     int passes = 0;
 
     u8 *nib_cur = nib_a;
     u8 *nib_alt = nib_b;
 
     for (int p = 0; p < MAX_PASSES; p++) {
-        Settings s = tune(cur_nibs, cur_nib_len);
-        G_CR = s.cr; G_SW = s.sw; G_HW = s.hw;
-        build_table();
+        TuneResult tr = tune_scramble(cur_nibs, cur_nib_len);
 
-        int enc_len = encode_stream(cur_nibs, cur_nib_len, enc_try, enc_cap);
+        /* apply the best-found scramble to the full current nibble stream */
+        for (int i = 0; i < cur_nib_len; i++)
+            scr[i] = scramble_nib(cur_nibs[i], tr.op, tr.k);
+
+        G_CR = tr.prng.cr; G_SW = tr.prng.sw; G_HW = tr.prng.hw;
+        build_table();
+        analyze_compression(scr, cur_nib_len);
+        int enc_len = encode_stream(scr, cur_nib_len, enc_try, enc_cap);
 
         /*
-         * Would keeping this pass make the final file smaller?
-         * Total output = header bytes + payload bytes.
-         * Header = HEADER_BYTES + 2*(passes) extra settings words.
-         * Pass 0: compare against raw input (ilen bytes, no header).
-         * Pass p>0: compare against the previous best total output size.
+         * Would accepting this pass shrink the total output?
+         * New header cost: 2 (magic+passes) + 3*(passes+1) bytes.
+         * Compare against raw input (pass 0) or previous best total (pass >0).
          */
-        int new_header = HEADER_BYTES + 2 * passes; /* header if we accept this pass */
+        int new_header = 2 + 3 * (passes + 1);
         int new_total  = new_header + enc_len;
-        int prev_total = (passes == 0) ? ilen : (HEADER_BYTES + 2 * (passes - 1) + enc_good_len);
-        if (new_total >= prev_total) break;
+        int prev_total = (passes == 0) ? ilen : (2 + 3 * passes + enc_good_len);
+        int accept = new_total < prev_total;
 
-        pass_cr[passes] = s.cr;
-        pass_sw[passes] = s.sw;
-        pass_hw[passes] = s.hw;
+        fprintf(stderr, "[PASS %d] %d nibs → %d B total=%d (prev=%d) %s scram=%s:%d CR=%d\n",
+                p, cur_nib_len, enc_len, new_total, prev_total,
+                accept ? "✓" : "✗", scram_name(tr.op), tr.k, tr.prng.cr);
+
+        if (!accept) break;
+
+        pass_cr[passes] = tr.prng.cr;
+        pass_sw[passes] = tr.prng.sw;
+        pass_hw[passes] = tr.prng.hw;
+        pass_op[passes] = tr.op;
+        pass_k [passes] = tr.k;
         passes++;
 
         u8 *tmp = enc_good; enc_good = enc_try; enc_try = tmp;
@@ -387,7 +603,7 @@ int compress(const u8 *in, int ilen, u8 *out, int ocap, int *used)
     if (passes == 0) {
         int n = (ilen <= ocap) ? ilen : ocap;
         memcpy(out, in, n);
-        free(enc_a); free(enc_b); free(nib_a); free(nib_b);
+        free(enc_a); free(enc_b); free(nib_a); free(nib_b); free(scr);
         return ilen;
     }
 
@@ -395,23 +611,22 @@ int compress(const u8 *in, int ilen, u8 *out, int ocap, int *used)
 
     int op = 0;
     out[op++] = (u8)MAGIC;
-    u16 p0 = pack_settings(pass_cr[0], pass_sw[0], pass_hw[0]);
-    out[op++] = (u8)(p0 >> 8);
-    out[op++] = (u8)(p0 & 0xFF);
     out[op++] = (u8)passes;
-
-    for (int p = 1; p < passes; p++) {
+    for (int p = 0; p < passes; p++) {
         u16 pk = pack_settings(pass_cr[p], pass_sw[p], pass_hw[p]);
         out[op++] = (u8)(pk >> 8);
         out[op++] = (u8)(pk & 0xFF);
+        out[op++] = pack_scramble(pass_op[p], pass_k[p]);
     }
 
     if (op + enc_good_len <= ocap) memcpy(out + op, enc_good, enc_good_len);
     op += enc_good_len;
 
-    free(enc_a); free(enc_b); free(nib_a); free(nib_b);
+    free(enc_a); free(enc_b); free(nib_a); free(nib_b); free(scr);
     return op;
 }
+
+/* ── decompress ── */
 
 int decompress(const u8 *in, int ilen, u8 *out, int ocap)
 {
@@ -421,26 +636,27 @@ int decompress(const u8 *in, int ilen, u8 *out, int ocap)
         memcpy(out, in, n);
         return n;
     }
-    if (ilen < HEADER_BYTES) return 0;
+    if (ilen < 2) return 0;
 
-    int cr0, sw0, hw0;
-    unpack_settings(((u16)in[1] << 8) | in[2], &cr0, &sw0, &hw0);
-    int passes = (int)in[3];
+    int passes = (int)in[1];
     if (passes < 1 || passes > MAX_PASSES) return 0;
 
-    int pass_cr[MAX_PASSES], pass_sw[MAX_PASSES], pass_hw[MAX_PASSES];
-    pass_cr[0] = cr0; pass_sw[0] = sw0; pass_hw[0] = hw0;
+    int hdr_total = 2 + 3 * passes;
+    if (ilen < hdr_total) return 0;
 
-    int hdr_off = HEADER_BYTES;
-    for (int p = 1; p < passes; p++) {
-        if (hdr_off + 2 > ilen) return 0;
-        u16 pk = ((u16)in[hdr_off] << 8) | in[hdr_off + 1];
+    int     pass_cr[MAX_PASSES], pass_sw[MAX_PASSES], pass_hw[MAX_PASSES];
+    ScramOp pass_op[MAX_PASSES];
+    int     pass_k [MAX_PASSES];
+
+    for (int p = 0; p < passes; p++) {
+        int off = 2 + 3 * p;
+        u16 pk = ((u16)in[off] << 8) | in[off + 1];
         unpack_settings(pk, &pass_cr[p], &pass_sw[p], &pass_hw[p]);
-        hdr_off += 2;
+        unpack_scramble(in[off + 2], &pass_op[p], &pass_k[p]);
     }
 
-    const u8 *payload = in + hdr_off;
-    int        plen   = ilen - hdr_off;
+    const u8 *payload = in + hdr_total;
+    int        plen   = ilen - hdr_total;
 
     int nib_cap  = (ocap + plen) * 2 + 256;
     int byte_cap = nib_cap / 2 + 256;
@@ -460,11 +676,16 @@ int decompress(const u8 *in, int ilen, u8 *out, int ocap)
     u8 *nib_cur = nib_a;
     u8 *nib_alt = nib_b;
 
+    /* undo passes in reverse: decode compressed stream, then un-scramble */
     for (int p = passes - 1; p >= 0; p--) {
         G_CR = pass_cr[p]; G_SW = pass_sw[p]; G_HW = pass_hw[p];
         build_table();
 
         int nib_len = decode_stream(byte_buf, cur_byte_len, nib_cur, nib_cap);
+
+        /* reverse this pass's scramble */
+        for (int i = 0; i < nib_len; i++)
+            nib_cur[i] = unscramble_nib(nib_cur[i], pass_op[p], pass_k[p]);
 
         if (p == 0) {
             int out_len = (nib_len < ocap) ? nib_len : ocap;
@@ -473,6 +694,7 @@ int decompress(const u8 *in, int ilen, u8 *out, int ocap)
             return out_len;
         }
 
+        /* convert unscrambled nibbles back to bytes for the next (outer) pass */
         int new_byte_len = nibbles_to_bytes(nib_cur, nib_len, byte_buf);
         cur_byte_len = new_byte_len;
         u8 *tmp = nib_cur; nib_cur = nib_alt; nib_alt = tmp;
@@ -483,6 +705,7 @@ int decompress(const u8 *in, int ilen, u8 *out, int ocap)
 }
 
 /* ── test harness ── */
+
 static u32 xr = 0x12345678u;
 static u8 xrand_nib(void)
 { xr ^= xr << 13; xr ^= xr >> 17; xr ^= xr << 5; return xr & 0xFu; }
@@ -510,12 +733,21 @@ static int run_test(const char *name, const u8 *data, int len)
     }
 
     if (used) {
-        int passes = (int)comp[3];
-        printf("  %-38s  %4d -> %4d B  (%.1f%%)  passes=%d  %s\n",
-               name, len, clen, 100.0f * clen / len, passes,
+        /* read back scramble info from the header for display */
+        int passes = (int)comp[1];  /* header: [MAGIC][passes][prng+scr per pass...] */
+        char scr_str[64] = "";
+        for (int pp = 0; pp < passes && pp < MAX_PASSES; pp++) {
+            ScramOp op; int k;
+            unpack_scramble(comp[4 + 3*pp], &op, &k);
+            char tmp[16];
+            snprintf(tmp, sizeof tmp, "%s%s:%d", pp > 0 ? "," : "", scram_name(op), k);
+            strncat(scr_str, tmp, sizeof(scr_str) - strlen(scr_str) - 1);
+        }
+        printf("  %-38s  %4d -> %4d B  (%.1f%%)  p=%d  [%s]  %s\n",
+               name, len, clen, 100.0f * clen / len, passes, scr_str,
                ok ? "OK" : "MISMATCH");
     } else {
-        printf("  %-38s  %4d -> %4d B  (raw)           %s\n",
+        printf("  %-38s  %4d -> %4d B  (raw)                    %s\n",
                name, len, clen, ok ? "OK" : "MISMATCH");
     }
 
@@ -545,6 +777,7 @@ int main(void)
 {
     int pass = 0, fail = 0;
 
+    /* PRNG settings pack/unpack */
     {
         int errs = 0;
         for (int cr=CR_MIN;cr<=CR_MAX;cr++)
@@ -554,11 +787,31 @@ int main(void)
             unpack_settings(pack_settings(cr,sw,hw), &cr2,&sw2,&hw2);
             if (cr2!=cr||sw2!=sw||hw2!=hw) errs++;
         }
-        printf("settings pack/unpack (%d combinations): %s\n",
-               (CR_MAX-CR_MIN+1)*((SW_MAX-SW_MIN)/SW_STEP+1)*((HW_MAX-HW_MIN)/HW_STEP+1),
-               errs ? "FAIL" : "OK");
+        int n = (CR_MAX-CR_MIN+1)*((SW_MAX-SW_MIN)/SW_STEP+1)*((HW_MAX-HW_MIN)/HW_STEP+1);
+        printf("settings pack/unpack (%d combinations): %s\n", n, errs ? "FAIL" : "OK");
     }
 
+    /* scramble pack/unpack and round-trip */
+    {
+        int errs_pack = 0, errs_rt = 0;
+        for (int oi = 0; oi <= 6; oi++)
+        for (int k = 0; k < 16; k++) {
+            ScramOp op2; int k2;
+            unpack_scramble(pack_scramble((ScramOp)oi, k), &op2, &k2);
+            if ((int)op2 != oi || k2 != k) errs_pack++;
+            for (int n = 0; n < 16; n++) {
+                u8 s = scramble_nib((u8)n, (ScramOp)oi, k);
+                u8 u = unscramble_nib(s, (ScramOp)oi, k);
+                if (u != (u8)n) errs_rt++;
+            }
+        }
+        printf("scramble pack/unpack  (%d combinations): %s\n", 7*16,
+               errs_pack ? "FAIL" : "OK");
+        printf("scramble round-trip   (%d nibble*op*k):  %s\n", 16*7*16,
+               errs_rt ? "FAIL" : "OK");
+    }
+
+    /* single-block encode/decode */
     {
         printf("\nsingle-block encode/decode:\n");
         G_CR=3; G_SW=40; G_HW=15; build_table();
@@ -577,48 +830,24 @@ int main(void)
     }
 
     printf("\nfull compress/decompress:\n");
-    printf("  %-38s  %18s  passes  rt\n", "test", "size");
-    printf("  %s\n", "----------------------------------------------------------------------");
+    printf("  %-38s  %18s  p  scramble(s)       rt\n", "test", "size");
+    printf("  %s\n",
+           "------------------------------------------------------------------------");
 
     #define T(label, data, len) \
         do { int r = run_test(label, data, len); if(r) pass++; else fail++; } while(0)
 
-    xr = 0xDEADBEEFu;
-    { enum{N=256}; u8 d[N]; for(int i=0;i<N;i++) d[i]=xrand_nib(); T("random 256",d,N); }
-    xr = 0xCAFEBABEu;
-    { enum{N=512}; u8 d[N]; for(int i=0;i<N;i++) d[i]=xrand_nib(); T("random 512",d,N); }
-    xr = 0x99887766u;
-    { enum{N=1024}; u8 *d=(u8*)malloc(N); for(int i=0;i<N;i++) d[i]=xrand_nib();
-      T("random 1024",d,N); free(d); }
+
     xr = 0x11223344u;
-    { enum{N=4096 * 4096}; u8 *d=(u8*)malloc(N); for(int i=0;i<N;i++) d[i]=xrand_nib();
-      T("random 4096",d,N); free(d); }
+    { enum{N=4096}; u8 *d=(u8*)malloc(N); for(int i=0;i<N;i++) d[i]=xrand_nib();
+      T("random 4096",d,N); free(d); 
+    }
 
-    xr = 0xABCDu;
-    { enum{N=256}; u8 d[N];
-      for(int i=0;i<N;i++){
-          u32 r=(xr^=xr<<13,xr^=xr>>17,xr^=xr<<5,xr);
-          d[i]=(r&0xFF)<178 ? (u8)(4+(r>>8)%4) : xrand_nib();
-      }
-      T("biased 70% in {4-7} (256)",d,N); }
 
-    { enum{N=128}; u8 d[N]; for(int i=0;i<N;i++) d[i]=(u8)(i%5);
-      T("pattern 01234... (128)",d,N); }
-    { enum{N=256}; u8 d[N]; for(int i=0;i<N;i++) d[i]=(u8)(i%16);
-      T("pattern 0-F repeat (256)",d,N); }
-    { enum{N=128}; u8 d[N]; for(int i=0;i<N;i++) d[i]=(u8)((i/4)%16);
-      T("slow ramp (128)",d,N); }
-    { enum{N=64};  u8 d[N]; memset(d,0x07,N); T("all 7s (64)",d,N); }
-    { enum{N=128}; u8 d[N]; memset(d,0x00,N); T("all 0s (128)",d,N); }
-    { u8 d[]={0xA}; T("single nibble",d,1); }
-    { u8 d[]={0xA,0xB}; T("two nibbles",d,2); }
-    { u8 d[]={0x1,0x2,0x3}; T("three nibbles",d,3); }
-    { enum{N=256}; u8 d[N]; for(int i=0;i<N;i++) d[i]=(u8)((i%256)&0xF);
-      T("sawtooth nibbles (256)",d,N); }
-    { enum{N=128}; u8 d[N]; for(int i=0;i<N;i++) d[i]=(u8)(i&1?0xA:0x5);
-      T("alternating 5/A (128)",d,N); }
 
-    printf("  %s\n", "----------------------------------------------------------------------");
+    printf("  %s\n",
+           "------------------------------------------------------------------------");
     printf("\nresult: %d passed, %d failed\n", pass, fail);
     return fail > 0 ? 1 : 0;
 }
+
