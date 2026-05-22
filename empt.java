@@ -3,6 +3,10 @@
 
 
 
+//DO NOT USE THIS CODE YOU WILL BREAK YOUR COMPUTER THIS BREAKS THE LAWS OF MATTER
+
+
+
 #include <stdio.h>
 #include <time.h>
 #include <stdlib.h>
@@ -27,20 +31,17 @@ float getEntropy(u8* Data, int size) {
 }
 
 
-u8 getRandomNum(int seed, u8 thresh){
-    srand(seed);
+u8 getRandomNum(u8 seed, unsigned short thresh){
+    uint32_t s = (uint32_t)seed | 0x12340000u;
 
     u8 val = 0;
 
     for (int x = 0; x < 8; x++){
-        val = val | (((rand() % 100) >= thresh) << x);
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        val |= (u8)(((s >> 16) >= thresh) << x);
     }
-
-
-    /*printf("0b");
-    for (int x = 0; x<8;x++){
-        printf("%d",((val >> x) & 1) == 1);
-    }*/
 
     return val;
 
@@ -49,90 +50,58 @@ u8 getRandomNum(int seed, u8 thresh){
 
 
 int main(){
-    srand(523);
+    int StartSeed = 523;
 
-    int size = 1048 * 16;
+    srand(StartSeed);
+
+    int size = 256;
     u8 *Data = malloc(size);
-    u8 *Data2 = malloc(size);
+    u8 *DataBack = malloc(size);
     for (int x = 0; x < size; x++){
         Data[x] = rand() % 255;
-        Data2[x] = Data[x];
+        DataBack[x] = Data[x];
     }
-
-    int freq[256] = {0};
-    for (int i = 0; i < size; i++) {
-        freq[Data[i]]++;
-    }
-
-    int TopElement = 0;
-    int TopCount = 0;
-
-    for (int x = 0; x < 255; x++){ 
-        if (freq[x] > TopCount){
-            TopElement = x;
-            TopCount = freq[x];
-        }
-    }
-
-    printf("Top Element is = %d with %d show",TopElement,TopCount);
 
     float BaseEmpt = getEntropy(Data,size);
 
-    float TopEmpt = 8;
-    int TopSeed = 0; 
-    u8 TopThresh = 0; 
-    
-    for (int seed = 0; seed < 65536; seed++){
+    float TopEmpt = BaseEmpt;
+    unsigned short TopTr = 0;
+    u8 Topseed = 0;
 
-        for (int tr = 1; tr < 100; tr++){
+    for (u8 seed = 0; seed < 255; seed++){
 
-            for (int x = 0; x < size; x++){
-                Data2[x] = Data[x];
-            }   
+        for (unsigned short tr = 1; tr < 65535; tr++){
             
             for (int x = 0; x < size; x++){
-                Data2[x] = Data2[x] = getRandomNum(seed + x,tr + x);
+                Data[x] = DataBack[x];
             }
 
-            float empt = getEntropy(Data2,size);
+            for (int x = 0; x < size; x++){
+                Data[x] = Data[x] ^ getRandomNum(seed - x, tr + x);
+            }
+
+            float empt = getEntropy(Data,size);
 
             if (empt <= TopEmpt){
+                Topseed = seed;
+                TopTr = tr;
                 TopEmpt = empt;
-                TopSeed = seed;
-                TopThresh = tr;
             }
+        }   
+    }
 
+    u8 same = 0;
+    for (int x = 0; x < size; x++){
+        if (DataBack[x] == Data[x]){
+            same++;
         }
     }
-
-    printf("\nStart = %lf, end = %lf, seed = %d, thre = %d",BaseEmpt,TopEmpt,TopSeed,TopThresh);
-
-
-    // Encode original data with best parameters found
-    u8 *Encoded = malloc(size);
-    for (int x = 0; x < size; x++) {
-        Encoded[x] = Data[x] ^ getRandomNum(TopSeed + x, TopThresh + x);
+    if (same > 0){
+        printf("has %d thats same", same);
     }
 
 
-    // Reverse: XOR with same key again (XOR is its own inverse)
-    u8 *Recovered = malloc(size);
-    for (int x = 0; x < size; x++) {
-        Recovered[x] = Encoded[x] ^ getRandomNum(TopSeed + x, TopThresh + x);
-    }
-
-    // Check if recovered matches original
-    int match = 1;
-    for (int x = 0; x < size; x++) {
-        if (Recovered[x] != Data[x]) {
-            match = 0;
-            printf("\n  Mismatch at index %d: original=%d, recovered=%d", x, Data[x], Recovered[x]);
-        }
-    }
-    printf("\nReversed data %s the original", match ? "matches" : "does NOT match");
-
-    free(Encoded);
-    free(Recovered);
+    printf("Base = %lf, other = %lf, seed = %u, tr = %u",BaseEmpt,TopEmpt,Topseed,TopTr);
 
     return 0;
     
