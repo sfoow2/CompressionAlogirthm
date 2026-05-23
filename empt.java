@@ -7,6 +7,10 @@
 
 
 
+//DO NOT USE THIS CODE YOU WILL BREAK YOUR COMPUTER THIS BREAKS THE LAWS OF MATTER
+
+
+
 #include <stdio.h>
 #include <time.h>
 #include <stdlib.h>
@@ -31,7 +35,7 @@ float getEntropy(u8* Data, int size) {
 }
 
 
-u8 getRandomNum(u8 seed, unsigned short thresh){
+u8 getRandomNum(u8 seed, u8 thresh){
     uint32_t s = (uint32_t)seed | 0x12340000u;
 
     u8 val = 0;
@@ -40,37 +44,33 @@ u8 getRandomNum(u8 seed, unsigned short thresh){
         s ^= s << 13;
         s ^= s >> 17;
         s ^= s << 5;
-        val |= (u8)(((s >> 16) >= thresh) << x);
+        val |= (u8)((((s >> 24) & 0xFF) >= thresh) << x);
     }
 
     return val;
 
 }
 
+float LastTopEmpt = 0;
+u8 LastTr = 0;
+u8 LastSeed = 0;
 
+u8 TryToComp(u8* Data, int size){
 
-int main(){
-    int StartSeed = 523;
-
-    srand(StartSeed);
-
-    int size = 256;
-    u8 *Data = malloc(size);
-    u8 *DataBack = malloc(size);
+    u8* DataBack = malloc(size);
     for (int x = 0; x < size; x++){
-        Data[x] = rand() % 255;
         DataBack[x] = Data[x];
     }
 
     float BaseEmpt = getEntropy(Data,size);
 
     float TopEmpt = BaseEmpt;
-    unsigned short TopTr = 0;
+    u8 TopTr = 0;
     u8 Topseed = 0;
 
     for (u8 seed = 0; seed < 255; seed++){
 
-        for (unsigned short tr = 1; tr < 65535; tr++){
+        for (u8 tr = 1; tr < 255; tr++){
             
             for (int x = 0; x < size; x++){
                 Data[x] = DataBack[x];
@@ -90,19 +90,75 @@ int main(){
         }   
     }
 
-    u8 same = 0;
     for (int x = 0; x < size; x++){
-        if (DataBack[x] == Data[x]){
-            same++;
+        Data[x] = DataBack[x] ^ getRandomNum(Topseed - x, TopTr + x);//should write the values
+    }
+
+    LastTr = TopTr;
+    LastSeed = Topseed;
+    LastTopEmpt = TopEmpt; 
+
+    if (BaseEmpt <= TopEmpt){
+        return 1; //cant do more
+    } else {
+
+        float SizeBase = (size * BaseEmpt) / 8;
+        float SizeAfter = (size * TopEmpt) / 8;
+        
+        float Diff = SizeBase - SizeAfter;
+
+        if (Diff > 2){
+            return 0;
+        } else {
+            return 3;
         }
     }
-    if (same > 0){
-        printf("has %d thats same", same);
+}
+
+
+
+
+int main(){
+    srand(56);
+
+
+    FILE *fptr = fopen("before.bin","w");
+
+    int size = 256;
+    u8 *Data = malloc(size);
+    for (int x = 0; x < size; x++){
+        Data[x] = rand() % 256;
+        fprintf(fptr, "%c", Data[x]);
+    }
+
+    float BaseEmpt = getEntropy(Data,size);
+
+    printf("Base = %lf",BaseEmpt);
+
+    for (int count = 0; count < 255; count++){
+        u8 prot = TryToComp(Data,size);
+
+        if (prot == 0){
+            printf("\nNew Layer: %d empt = %lf Seed = %d, tresh = %d",count,LastTopEmpt,LastSeed,LastTr);
+        } else if (prot == 1){
+            printf("\nFound Max at %d, empt = %lf", count, LastTopEmpt);
+            break;
+        } else if (prot == 3){
+            printf("\n Found one but too low at %d, empt = %lf", count, LastTopEmpt);
+            break;
+        }
+    }    
+
+    FILE *after = fopen("after.bin","w");
+    
+    for (int x = 0; x < size; x++){
+        fprintf(after, "%c", Data[x]);
     }
 
 
-    printf("Base = %lf, other = %lf, seed = %u, tr = %u",BaseEmpt,TopEmpt,Topseed,TopTr);
-
+    fclose(fptr);
+    fclose(after);
     return 0;
+
     
 }
