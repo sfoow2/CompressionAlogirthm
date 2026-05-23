@@ -6,14 +6,20 @@
 #include <math.h>
 
 typedef uint8_t  u8;
-typedef uint32_t u32;
 typedef uint64_t u64;
 
-// xorshift64 — data generation only, kept completely separate from search PRNG
-static inline u64 xs64(u64 s) { s ^= s<<13; s ^= s>>7; s ^= s<<17; return s; }
+// xorshift64: data generation only
+static inline u64 xs64(u64 s) { s^=s<<13; s^=s>>7; s^=s<<17; return s; }
 
-// xorshift32 — the search PRNG, linear over GF(2) so we can do matrix math on it
-static inline u32 xs32(u32 s) { s ^= s<<13; s ^= s>>17; s ^= s<<5; return s; }
+// xoshiro256 without output transform = 100% linear over GF(2), 256-bit state
+// All ops are XOR, shift, or rotate — all linear over GF(2)
+static void xs256_step(u64 s[4]) {
+    u64 t  = s[1] << 17;
+    s[2] ^= s[0];  s[3] ^= s[1];
+    s[1] ^= s[2];  s[0] ^= s[3];
+    s[2] ^= t;
+    s[3]  = (s[3] << 45) | (s[3] >> 19);  // rotate = linear
+}
 
 static float byteEntropy(const u8 *d, int n) {
     int freq[256] = {0};
@@ -27,68 +33,77 @@ static float byteEntropy(const u8 *d, int n) {
     return (float)e;
 }
 
-// Build M[i] — a 32-bit mask where bit j = 1 means "seed bit j affects bit 7
-// of the i-th xs32 output". Computed by running each of the 32 basis vectors
-// through the PRNG and recording which bit-7s light up.
-static void buildM(u32 *M, int N) {
-    memset(M, 0, N * sizeof(u32));
-    for (int j = 0; j < 32; j++) {
-        u32 s = (1u << j);
+// Build M[i][0..3]: bit-packed 256-bit row where bit j = 1 means
+// "seed bit j affects bit 7 of s[0] at output position i".
+// Done by running each of the 256 basis vectors through xs256 and recording.
+static void buildM(u64 (*M)[4], int N) {
+    memset(M, 0, N * 4 * sizeof(u64));
+    for (int j = 0; j < 256; j++) {
+        u64 s[4] = {0,0,0,0};
+        s[j>>6] = 1ULL << (j&63);      // basis vector e_j
         for (int i = 0; i < N; i++) {
-            s = xs32(s);
-            if ((s >> 7) & 1) M[i] |= (1u << j);
+            xs256_step(s);
+            if ((s[0] >> 7) & 1)        // bit 7 of s[0] lit up
+                M[i][j>>6] |= 1ULL << (j&63);
         }
     }
 }
 
-// GF(2) Gaussian elimination: solve A * x = b (mod 2).
-// A[0..31] are the 32 rows; b[0..31] are the RHS bits (0 or 1).
-// Returns 1 with solution in *x_out if A has full rank, else 0.
-static int gf2_solve(u32 A[32], const u8 b[32], u32 *x_out) {
-    // Augmented matrix: LHS in bits 0-31, RHS in bit 32
-    u64 aug[32];
-    for (int i = 0; i < 32; i++)
-        aug[i] = (u64)A[i] | ((u64)b[i] << 32);
-
-    int pivot_col[32];
-    int pr = 0;  // next pivot row
-
-    for (int col = 0; col < 32 && pr < 32; col++) {
-        // Find a row at or below pr that has a 1 in this column
-        int found = -1;
-        for (int r = pr; r < 32; r++)
-            if ((aug[r] >> col) & 1) { found = r; break; }
-        if (found < 0) continue;  // no pivot here, column is all zeros
-
-        // Swap found row into pivot position
-        u64 tmp = aug[pr]; aug[pr] = aug[found]; aug[found] = tmp;
-        pivot_col[pr] = col;
-
-        // Eliminate this column from every other row (full RREF)
-        for (int r = 0; r < 32; r++)
-            if (r != pr && ((aug[r] >> col) & 1))
-                aug[r] ^= aug[pr];
-        pr++;
+// GF(2) Gaussian elimination on a 256x256 system (full RREF).
+// A[0..255][0..3] = bit-packed rows, b[0..255] = RHS bits (0 or 1).
+// Returns 1 with solution packed into x_out[4] if full rank, else 0.
+static int gf2_solve256(u64 A[256][4], const u8 b[256], u64 x_out[4]) {
+    // Augmented [A | b]: b stored as bit 0 of word [4]
+    u64 aug[256][5];
+    for (int i = 0; i < 256; i++) {
+        aug[i][0]=A[i][0]; aug[i][1]=A[i][1];
+        aug[i][2]=A[i][2]; aug[i][3]=A[i][3];
+        aug[i][4]=b[i];    // 0 or 1
     }
 
-    if (pr < 32) return 0;  // rank < 32, no unique solution
+    int pivot_col[256], pr = 0;
 
-    // Read off the solution: each pivot row r tells us x[pivot_col[r]]
-    u32 x = 0;
-    for (int r = 0; r < 32; r++)
-        if ((aug[r] >> 32) & 1)
-            x |= (1u << pivot_col[r]);
-    *x_out = x;
+    for (int col = 0; col < 256 && pr < 256; col++) {
+        // Find pivot row
+        int found = -1;
+        for (int r = pr; r < 256; r++)
+            if ((aug[r][col>>6] >> (col&63)) & 1) { found = r; break; }
+        if (found < 0) continue;
+
+        // Swap rows pr <-> found
+        u64 tmp[5];
+        memcpy(tmp,        aug[pr],    5*sizeof(u64));
+        memcpy(aug[pr],    aug[found], 5*sizeof(u64));
+        memcpy(aug[found], tmp,        5*sizeof(u64));
+        pivot_col[pr] = col;
+
+        // Eliminate col from every other row (full RREF, not just lower)
+        for (int r = 0; r < 256; r++) {
+            if (r == pr) continue;
+            if (!((aug[r][col>>6] >> (col&63)) & 1)) continue;
+            aug[r][0]^=aug[pr][0]; aug[r][1]^=aug[pr][1];
+            aug[r][2]^=aug[pr][2]; aug[r][3]^=aug[pr][3];
+            aug[r][4]^=aug[pr][4];
+        }
+        pr++;
+    }
+    if (pr < 256) return 0;  // singular, no unique solution
+
+    // Read solution: pivot row r tells us x[pivot_col[r]] = aug[r][4] & 1
+    x_out[0]=x_out[1]=x_out[2]=x_out[3]=0;
+    for (int r = 0; r < 256; r++)
+        if (aug[r][4] & 1)
+            x_out[pivot_col[r]>>6] |= 1ULL << (pivot_col[r]&63);
     return 1;
 }
 
-// Count how many of the N xs32 outputs (starting from seed) have bit 7 == data_bits[i]
-static int evaluate(u32 seed, const u8 *data_bits, int N) {
-    u32 s = seed;
+// Count how many of the N xs256 outputs (from seed) have bit 7 of s[0] == data_bits[i]
+static int evaluate256(const u64 seed[4], const u8 *data_bits, int N) {
+    u64 s[4] = {seed[0], seed[1], seed[2], seed[3]};
     int m = 0;
     for (int i = 0; i < N; i++) {
-        s = xs32(s);
-        m += (((s >> 7) & 1) == data_bits[i]);
+        xs256_step(s);
+        m += (((s[0]>>7)&1) == data_bits[i]);
     }
     return m;
 }
@@ -96,11 +111,11 @@ static int evaluate(u32 seed, const u8 *data_bits, int N) {
 int main() {
     const int DATA_SEED = 42;
     const int SIZE      = 1048;
-    // Each candidate costs O(32^3) to solve + O(SIZE) to evaluate.
-    // Much cheaper per good candidate than random sampling.
-    const int N_CANDS   = 200000;
+    // 256-bit seed guarantees 256 exact matches per solved system vs 32 for 32-bit,
+    // so fewer candidates needed for a similar best-of distribution.
+    const int N_CANDS   = 20000;
 
-    // --- Generate data with xorshift64 ---
+    // Generate data
     u64 ds = (u64)DATA_SEED;
     u8 *data = malloc(SIZE);
     for (int i = 0; i < SIZE; i++) { ds = xs64(ds); data[i] = (u8)(ds & 0xFF); }
@@ -117,59 +132,68 @@ int main() {
     printf("Bytes < 128:  %d / %d (%.1f%%)\n", data_ones, SIZE, 100.0f * data_ones / SIZE);
     printf("Byte entropy (before): %.6f / 8.000000 bits\n\n", base_ent);
 
-    // --- Build the GF(2) matrix M (SIZE x 32) for xs32 ---
-    printf("Building GF(2) matrix (%d x 32)...\n", SIZE);
-    u32 *M = malloc(SIZE * sizeof(u32));
+    // Build GF(2) matrix: 1048 rows, each 256 bits wide (4 x u64)
+    printf("Building GF(2) matrix (%d x 256 bits)...\n", SIZE);
+    u64 (*M)[4] = malloc(SIZE * 4 * sizeof(u64));
     buildM(M, SIZE);
 
-    // --- Information Set Decoding ---
-    // Pick N_CANDS random subsets of 32 positions.
-    // Each subset gives a 32x32 GF(2) system whose exact solution is the unique
-    // seed that perfectly matches those 32 positions. Then we check the full SIZE
-    // positions and keep the best overall seed.
-    // About 29% of random 32x32 GF(2) matrices are full rank, so ~29% solve.
-    printf("Solving %d random GF(2) systems (32x32)...\n\n", N_CANDS);
+    printf("Solving %d random 256x256 GF(2) systems...\n", N_CANDS);
+    printf("(~29%% will be full rank — same as 32-bit case)\n\n");
 
-    u64 sampler  = 0xFEDCBA9876543210ULL;
-    u32 best_seed  = 0;
-    int best_match = 0;
-    int n_solved   = 0;
+    u64 sampler     = 0xFEDCBA9876543210ULL;
+    u64 best_seed[4] = {0,0,0,0};
+    int best_match   = 0, n_solved = 0;
+
+    // Allocate work buffers once outside the loop
+    u8  *used  = calloc(SIZE, 1);
+    int *idx   = malloc(256 * sizeof(int));
+    u64 (*A_sub)[4] = malloc(256 * 4 * sizeof(u64));
+    u8  *b_sub = malloc(256);
 
     for (int c = 0; c < N_CANDS; c++) {
-        // Pick 32 distinct random positions from [0, SIZE)
-        int idx[32], n = 0;
-        while (n < 32) {
+        // Pick 256 distinct random positions from [0, SIZE)
+        int n = 0;
+        while (n < 256) {
             sampler = xs64(sampler);
             int pos = (int)((sampler >> 33) % (u64)SIZE);
-            int dup = 0;
-            for (int j = 0; j < n; j++) if (idx[j] == pos) { dup = 1; break; }
-            if (!dup) idx[n++] = pos;
+            if (!used[pos]) { used[pos] = 1; idx[n++] = pos; }
         }
 
-        // Extract the 32x32 submatrix and corresponding data bits
-        u32 A[32]; u8 b[32];
-        for (int i = 0; i < 32; i++) { A[i] = M[idx[i]]; b[i] = data_bits[idx[i]]; }
+        // Build 256x256 submatrix and reset used[] in one pass
+        for (int i = 0; i < 256; i++) {
+            A_sub[i][0]=M[idx[i]][0]; A_sub[i][1]=M[idx[i]][1];
+            A_sub[i][2]=M[idx[i]][2]; A_sub[i][3]=M[idx[i]][3];
+            b_sub[i] = data_bits[idx[i]];
+            used[idx[i]] = 0;
+        }
 
-        u32 seed_cand;
-        if (!gf2_solve(A, b, &seed_cand)) continue;
+        u64 seed_cand[4];
+        if (!gf2_solve256(A_sub, b_sub, seed_cand)) continue;
         n_solved++;
 
-        int m = evaluate(seed_cand, data_bits, SIZE);
-        if (m > best_match) { best_match = m; best_seed = seed_cand; }
+        int m = evaluate256(seed_cand, data_bits, SIZE);
+        if (m > best_match) {
+            best_match = m;
+            memcpy(best_seed, seed_cand, 4*sizeof(u64));
+        }
     }
 
-    printf("Systems solved (full rank): %d / %d  (~%.0f%% as expected for random GF2)\n",
+    printf("Systems solved: %d / %d (~%.0f%%)\n",
            n_solved, N_CANDS, 100.0f * n_solved / N_CANDS);
-    printf("Best seed:   0x%08X\n", best_seed);
-    printf("Bit matches: %d / %d (%.2f%%)\n\n", best_match, SIZE, 100.0f * best_match / SIZE);
+    printf("Best seed: %016llX %016llX\n",
+           (unsigned long long)best_seed[0], (unsigned long long)best_seed[1]);
+    printf("           %016llX %016llX\n",
+           (unsigned long long)best_seed[2], (unsigned long long)best_seed[3]);
+    printf("Bit matches: %d / %d (%.2f%%)\n\n",
+           best_match, SIZE, 100.0f * best_match / SIZE);
 
-    // --- Apply correction: where xs32 output has bit 7 = 1, add 128 to data byte ---
-    u32 state = best_seed;
+    // Apply correction: where xs256 output has bit 7 of s[0] = 1, add 128
+    u64 state[4]; memcpy(state, best_seed, sizeof(state));
     u8 *corrected = malloc(SIZE);
     memcpy(corrected, data, SIZE);
     for (int i = 0; i < SIZE; i++) {
-        state = xs32(state);
-        if ((state >> 7) & 1) {
+        xs256_step(state);
+        if ((state[0] >> 7) & 1) {
             int v = corrected[i] + 128;
             corrected[i] = (v > 255) ? 255 : (u8)v;
         }
@@ -178,11 +202,19 @@ int main() {
     int small_after = 0;
     for (int i = 0; i < SIZE; i++) if (corrected[i] < 128) small_after++;
 
-    printf("Small bytes before: %d / %d (%.1f%%)\n", data_ones,   SIZE, 100.0f * data_ones   / SIZE);
-    printf("Small bytes after:  %d / %d (%.1f%%)\n", small_after, SIZE, 100.0f * small_after  / SIZE);
+    printf("Small bytes before: %d / %d (%.1f%%)\n", data_ones,   SIZE, 100.0f*data_ones/SIZE);
+    printf("Small bytes after:  %d / %d (%.1f%%)\n", small_after, SIZE, 100.0f*small_after/SIZE);
     printf("Byte entropy before: %.6f / 8.000000 bits\n", base_ent);
     printf("Byte entropy after:  %.6f / 8.000000 bits\n", byteEntropy(corrected, SIZE));
 
+    printf("\nSeed overhead: 32 bytes (256-bit seed)\n");
+    float before_bytes = (base_ent            * SIZE) / 8.0f;
+    float after_bytes  = (byteEntropy(corrected, SIZE) * SIZE) / 8.0f;
+    printf("Ideal bytes before: %.2f\n", before_bytes);
+    printf("Ideal bytes after:  %.2f\n", after_bytes);
+    printf("Net savings:        %.2f bytes\n", before_bytes - after_bytes - 32.0f);
+
     free(M); free(data); free(data_bits); free(corrected);
+    free(used); free(idx); free(A_sub); free(b_sub);
     return 0;
 }
