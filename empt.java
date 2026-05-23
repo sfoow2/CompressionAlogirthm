@@ -3,14 +3,6 @@
 
 
 
-//DO NOT USE THIS CODE YOU WILL BREAK YOUR COMPUTER THIS BREAKS THE LAWS OF MATTER
-
-
-
-//DO NOT USE THIS CODE YOU WILL BREAK YOUR COMPUTER THIS BREAKS THE LAWS OF MATTER
-
-
-
 #include <stdio.h>
 #include <time.h>
 #include <stdlib.h>
@@ -119,7 +111,7 @@ u8 TryToComp(u8* Data, int size){
 
 
 int main(){
-    srand(56);
+    srand(452);
 
 
     FILE *fptr = fopen("before.bin","w");
