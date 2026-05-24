@@ -1,0 +1,335 @@
+//IGNORE THIS CODE, DONT EVEN READ IT IS IT NOT SAFE, SKIP THIS CODE DONT EVEN THINK ABOUT READING IT, YOU WILL END UP CRACHING YOUR MACHINE BECAUSE OF UNSAFE BEHAVOR I WILL NOT TAKE RESPONSIBLITES FOR WHAT HAPPEND
+
+
+
+// pipeline.c — Iterative rANS + GF(2)/xs256 bias-reduction compressor
+// Compile: gcc -O2 -o pipeline pipeline.c -lm
+//
+// Each layer:
+//   1. rANS-compress current data  → payload
+//   2. GF(2)/xs256 bias-reduce payload in-place  → corrected payload
+//   3. Store {rANS header, seed} and loop on corrected payload
+//
+// File format:
+//   [ 2 bytes       ] number of layers
+//   [ 1064 × layers ] layer headers  (rANS info + xs256 seed each)
+//   [ remaining     ] final corrected payload
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <math.h>
+
+typedef uint8_t  u8;
+typedef uint16_t u16;
+typedef uint32_t u32;
+typedef uint64_t u64;
+
+// ── Tunable ────────────────────────────────────────────────────────────────
+static const char *INPUT_PATH  = "C:/Users/lukac/Documents/compressor/zorsh_Music.zip";
+static const char *OUTPUT_PATH = "C:/Users/lukac/Documents/compressor/pipeline.bin";
+
+#define N_CANDS    20000   // GF(2) random systems tried per layer
+#define MAX_LAYERS  65536   // hard cap on iterations
+
+// ── xorshift64 / xoshiro256 ────────────────────────────────────────────────
+static inline u64 xs64(u64 s) { s^=s<<13; s^=s>>7; s^=s<<17; return s; }
+
+static inline void xs256_step(u64 s[4]) {
+    u64 t = s[1] << 17;
+    s[2] ^= s[0]; s[3] ^= s[1];
+    s[1] ^= s[2]; s[0] ^= s[3];
+    s[2] ^= t;
+    s[3] = (s[3] << 45) | (s[3] >> 19);
+}
+
+// ── Byte entropy ────────────────────────────────────────────────────────────
+static float byte_entropy(const u8 *d, int n) {
+    int cnt[256] = {0};
+    for (int i = 0; i < n; i++) cnt[d[i]]++;
+    double e = 0.0;
+    for (int i = 0; i < 256; i++) {
+        if (!cnt[i]) continue;
+        double p = (double)cnt[i] / n;
+        e -= p * log2(p);
+    }
+    return (float)e;
+}
+
+// ── GF(2) matrix build: M[i] is 256-bit row, bit j = influence of seed bit j
+//    on xs256's bit-7 at step i ─────────────────────────────────────────────
+static void buildM(u64 (*M)[4], int N) {
+    memset(M, 0, (size_t)N * 4 * sizeof(u64));
+    for (int j = 0; j < 256; j++) {
+        u64 s[4] = {0,0,0,0};
+        s[j>>6] = 1ULL << (j & 63);
+        for (int i = 0; i < N; i++) {
+            xs256_step(s);
+            if ((s[0] >> 7) & 1)
+                M[i][j>>6] |= 1ULL << (j & 63);
+        }
+    }
+}
+
+// ── GF(2) Gaussian elimination on a 256×256 system ─────────────────────────
+static int gf2_solve256(u64 A[256][4], const u8 b[256], u64 x[4]) {
+    u64 aug[256][5];
+    for (int i = 0; i < 256; i++) {
+        aug[i][0]=A[i][0]; aug[i][1]=A[i][1];
+        aug[i][2]=A[i][2]; aug[i][3]=A[i][3];
+        aug[i][4]=b[i];
+    }
+    int pcol[256], pr = 0;
+    for (int col = 0; col < 256 && pr < 256; col++) {
+        int found = -1;
+        for (int r = pr; r < 256; r++)
+            if ((aug[r][col>>6] >> (col&63)) & 1) { found = r; break; }
+        if (found < 0) continue;
+        u64 tmp[5];
+        memcpy(tmp, aug[pr], 40); memcpy(aug[pr], aug[found], 40); memcpy(aug[found], tmp, 40);
+        pcol[pr] = col;
+        for (int r = 0; r < 256; r++) {
+            if (r == pr || !((aug[r][col>>6] >> (col&63)) & 1)) continue;
+            aug[r][0]^=aug[pr][0]; aug[r][1]^=aug[pr][1];
+            aug[r][2]^=aug[pr][2]; aug[r][3]^=aug[pr][3];
+            aug[r][4]^=aug[pr][4];
+        }
+        pr++;
+    }
+    if (pr < 256) return 0;
+    x[0]=x[1]=x[2]=x[3]=0;
+    for (int r = 0; r < 256; r++)
+        if (aug[r][4] & 1) x[pcol[r]>>6] |= 1ULL << (pcol[r]&63);
+    return 1;
+}
+
+static int evaluate256(const u64 seed[4], const u8 *bits, int N) {
+    u64 s[4] = {seed[0],seed[1],seed[2],seed[3]};
+    int m = 0;
+    for (int i = 0; i < N; i++) { xs256_step(s); m += (((s[0]>>7)&1) == bits[i]); }
+    return m;
+}
+
+// ── Bias reduction: find best xs256 seed, apply correction in-place ─────────
+// Returns number of bit matches achieved (out of n).
+static int bias_reduce(u8 *data, int n, u64 best_seed[4]) {
+    u8 *bits = malloc(n);
+    for (int i = 0; i < n; i++) bits[i] = (data[i] < 128) ? 1 : 0;
+
+    printf("    building %d×256 GF(2) matrix (~%.0f MB)...",
+           n, (double)n * 32 / 1e6);
+    fflush(stdout);
+
+    u64 (*M)[4] = malloc((size_t)n * 4 * sizeof(u64));
+    buildM(M, n);
+    printf(" done\n");
+
+    u8  *used  = calloc(n, 1);
+    int *idx   = malloc(256 * sizeof(int));
+    u64 (*A)[4]= malloc(256 * 4 * sizeof(u64));
+    u8  *b     = malloc(256);
+    u64  samp  = 0xFEDCBA9876543210ULL;
+    int  best  = 0;
+    memset(best_seed, 0, 32);
+
+    for (int c = 0; c < N_CANDS; c++) {
+        int nn = 0;
+        while (nn < 256) {
+            samp = xs64(samp);
+            int pos = (int)((samp >> 33) % (u64)n);
+            if (!used[pos]) { used[pos]=1; idx[nn++]=pos; }
+        }
+        for (int i = 0; i < 256; i++) {
+            A[i][0]=M[idx[i]][0]; A[i][1]=M[idx[i]][1];
+            A[i][2]=M[idx[i]][2]; A[i][3]=M[idx[i]][3];
+            b[i]=bits[idx[i]]; used[idx[i]]=0;
+        }
+        u64 cand[4];
+        if (!gf2_solve256(A, b, cand)) continue;
+        int m = evaluate256(cand, bits, n);
+        if (m > best) { best = m; memcpy(best_seed, cand, 32); }
+    }
+
+    u64 st[4]; memcpy(st, best_seed, 32);
+    for (int i = 0; i < n; i++) {
+        xs256_step(st);
+        if ((st[0] >> 7) & 1) { int v = data[i]+128; data[i] = v>255 ? 255 : (u8)v; }
+    }
+
+    free(M); free(bits); free(used); free(idx); free(A); free(b);
+    return best;
+}
+
+// ── rANS ───────────────────────────────────────────────────────────────────
+#define RANS_SCALE  14
+#define RANS_M      (1u << RANS_SCALE)
+#define RANS_L      (1u << 23)
+#define RANS_HDR    (4 + 256*4 + 4)   // n(4) + freq(1024) + state(4) = 1032
+
+typedef struct { u32 freq[256]; u32 cum[257]; u8 sym[RANS_M]; } RT;
+
+static void rt_build(RT *t, const u8 *d, int n) {
+    u32 raw[256]={0}; for(int i=0;i<n;i++) raw[d[i]]++;
+    u32 sum=0;
+    for(int s=0;s<256;s++){
+        if(!raw[s]){t->freq[s]=0;continue;}
+        t->freq[s]=(u32)(((u64)raw[s]*RANS_M)/n);
+        if(!t->freq[s]) t->freq[s]=1;
+        sum+=t->freq[s];
+    }
+    while(sum<RANS_M){ int b=0; for(int s=1;s<256;s++) if(t->freq[s]>t->freq[b]) b=s; t->freq[b]++;sum++;}
+    while(sum>RANS_M){ int b=-1; for(int s=0;s<256;s++) if(t->freq[s]>1&&(b<0||t->freq[s]>t->freq[b]))b=s; t->freq[b]--;sum--;}
+    t->cum[0]=0; for(int s=0;s<256;s++) t->cum[s+1]=t->cum[s]+t->freq[s];
+    for(int s=0;s<256;s++) for(u32 j=t->cum[s];j<t->cum[s+1];j++) t->sym[j]=(u8)s;
+}
+
+static void rt_from_freq(RT *t, const u32 freq[256]) {
+    memcpy(t->freq,freq,1024);
+    t->cum[0]=0; for(int s=0;s<256;s++) t->cum[s+1]=t->cum[s]+t->freq[s];
+    for(int s=0;s<256;s++) for(u32 j=t->cum[s];j<t->cum[s+1];j++) t->sym[j]=(u8)s;
+}
+
+static inline void renc(u32 *x, u8 **p, const RT *t, int s) {
+    u32 f=t->freq[s], xm=((RANS_L>>RANS_SCALE)<<8)*f;
+    while(*x>=xm){*--(*p)=(u8)(*x&0xFF);*x>>=8;}
+    *x=((*x/f)<<RANS_SCALE)+t->cum[s]+(*x%f);
+}
+
+static inline int rdec(u32 *x, const u8 **p, const u8 *end, const RT *t) {
+    u32 sl=*x&(RANS_M-1); int s=t->sym[sl];
+    *x=t->freq[s]*(*x>>RANS_SCALE)+sl-t->cum[s];
+    while(*x<RANS_L&&*p<end){*x=(*x<<8)|**p;(*p)++;}
+    return s;
+}
+
+// Returns malloc'd [RANS_HDR + payload]; sets *out_len.
+static u8 *rans_compress(const u8 *in, int n, int *out_len) {
+    RT t; rt_build(&t,in,n);
+    int cap=n+4096; u8 *buf=malloc(cap), *p=buf+cap; u32 x=RANS_L;
+    for(int i=n-1;i>=0;i--) renc(&x,&p,&t,in[i]);
+    int pay=(int)((buf+cap)-p);
+    *out_len=RANS_HDR+pay;
+    u8 *out=malloc(*out_len), *q=out;
+    memcpy(q,&n,4);q+=4; memcpy(q,t.freq,1024);q+=1024; memcpy(q,&x,4);q+=4;
+    memcpy(q,p,pay);
+    free(buf); return out;
+}
+
+// ── Layer header: everything needed to decompress one layer ─────────────────
+// Decompression order per layer: undo_bias(payload,seed) → rans_decompress
+typedef struct {
+    u32 rans_n;       // number of symbols rANS encoded
+    u32 freq[256];    // rANS frequency table
+    u32 rans_state;   // rANS initial decoder state
+    u64 seed[4];      // xs256 seed for bias correction
+} LayerHdr;           // 4 + 1024 + 4 + 32 = 1064 bytes
+
+#define LAYER_HDR  ((int)sizeof(LayerHdr))   // 1064
+
+// ── Pipeline compressor ─────────────────────────────────────────────────────
+u8 *pipeline_compress(const u8 *in, int n, int *out_len) {
+    u8 *cur = malloc(n);
+    memcpy(cur, in, n);
+    int cur_n = n;
+
+    LayerHdr *hdrs = NULL;
+    int nlayers = 0;
+
+    printf("Input: %d bytes  entropy %.4f bpb\n\n", n, byte_entropy(in, n));
+
+    for (int lay = 0; lay < MAX_LAYERS; lay++) {
+        if (cur_n < 512) {
+            printf("Layer %d: payload too small (%d bytes), stopping.\n", lay, cur_n);
+            break;
+        }
+
+        printf("─── Layer %d  [%d bytes, %.4f bpb] ───\n",
+               lay, cur_n, byte_entropy(cur, cur_n));
+
+        // Step 1: bias-reduce current data into a working copy
+        LayerHdr hdr;
+        u8 *biased = malloc(cur_n);
+        memcpy(biased, cur, cur_n);
+
+        float ent_before = byte_entropy(biased, cur_n);
+        printf("  Bias:  entropy %.4f →", ent_before);
+        fflush(stdout);
+
+        int match = bias_reduce(biased, cur_n, hdr.seed);
+
+        float ent_after = byte_entropy(biased, cur_n);
+        printf(" %.4f bpb  (match %.1f%%)\n", ent_after, 100.0f * match / cur_n);
+
+        // Step 2: rANS compress the bias-reduced data
+        int clen;
+        u8 *comp = rans_compress(biased, cur_n, &clen);
+        int pay_len = clen - RANS_HDR;
+        free(biased);
+
+        printf("  rANS:  %d → %d bytes payload  (%.2f%%)\n\n",
+               cur_n, pay_len, 100.0f * pay_len / cur_n);
+
+        // Stopping condition: header cost + payload must beat current size
+        if (LAYER_HDR + pay_len >= cur_n) {
+            printf("  Header cost (%d) + payload (%d) = %d >= input (%d). Stopping.\n",
+                   LAYER_HDR, pay_len, LAYER_HDR + pay_len, cur_n);
+            free(comp);
+            break;
+        }
+
+        // Parse rANS header into layer record
+        memcpy(&hdr.rans_n,     comp,           4);
+        memcpy(hdr.freq,        comp + 4,        1024);
+        memcpy(&hdr.rans_state, comp + 4 + 1024, 4);
+
+        // Next iteration operates on the raw rANS payload
+        u8 *payload = malloc(pay_len);
+        memcpy(payload, comp + RANS_HDR, pay_len);
+        free(comp);
+
+        // Commit layer
+        hdrs = realloc(hdrs, (nlayers + 1) * sizeof(LayerHdr));
+        hdrs[nlayers++] = hdr;
+
+        free(cur);
+        cur   = payload;
+        cur_n = pay_len;
+    }
+
+    // Assemble output: [2 bytes nlayers][headers][final payload]
+    int hdr_bytes = 2 + nlayers * LAYER_HDR;
+    *out_len = hdr_bytes + cur_n;
+    u8 *out = malloc(*out_len);
+
+    u16 nl16 = (u16)nlayers;
+    memcpy(out, &nl16, 2);
+    if (nlayers) memcpy(out + 2, hdrs, nlayers * LAYER_HDR);
+    memcpy(out + hdr_bytes, cur, cur_n);
+
+    printf("Layers: %d   Header overhead: %d bytes\n", nlayers, hdr_bytes);
+    printf("Output: %d bytes  (%.2f%% of input)\n", *out_len, 100.0f * (*out_len) / n);
+
+    free(cur);
+    free(hdrs);
+    return out;
+}
+
+// ── Main ───────────────────────────────────────────────────────────────────
+int main(void) {
+    FILE *f = fopen(INPUT_PATH, "rb");
+    if (!f) { fprintf(stderr, "Cannot open %s\n", INPUT_PATH); return 1; }
+    fseek(f, 0, SEEK_END); int n = (int)ftell(f); rewind(f);
+    u8 *data = malloc(n);
+    fread(data, 1, n, f); fclose(f);
+
+    int out_len;
+    u8 *out = pipeline_compress(data, n, &out_len);
+
+    FILE *fo = fopen(OUTPUT_PATH, "wb");
+    if (fo) { fwrite(out, 1, out_len, fo); fclose(fo); printf("Saved → %s\n", OUTPUT_PATH); }
+    else fprintf(stderr, "Could not write %s\n", OUTPUT_PATH);
+
+    free(data); free(out);
+    return 0;
+}
