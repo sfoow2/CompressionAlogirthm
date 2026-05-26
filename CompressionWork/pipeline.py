@@ -3,40 +3,56 @@ import os
 import zlib
 import numpy as np
 import constriction
+from concurrent.futures import ThreadPoolExecutor
 
 TRANSFORM_EXE = r"C:\Users\lukac\Documents\compressor\remake.exe"
 WORK_DIR      = r"C:\Users\lukac\Documents\compressor"
-ORIGINAL_PATH = r"C:\Users\lukac\Documents\compressor\test.zip"
+ORIGINAL_PATH = r"C:\Users\lukac\Documents\compressor\archive9"
 
 TMP_IN  = os.path.join(WORK_DIR, "pipe_in.bin")
 TMP_OUT = os.path.join(WORK_DIR, "pipe_out.bin")
 
 
+N_WORKERS = os.cpu_count() or 4
+
+
 def ans2nd_compress(data):
     symbols = np.frombuffer(data, dtype=np.uint8).astype(np.int32)
 
-    # compress the 256 context tables
-    all_ctx_raw = []
-    stream_bytes = 0
-    for ctx in range(256):
-        ctx_syms = symbols[1:][symbols[:-1] == ctx]
-        ctx_raw  = (np.bincount(ctx_syms, minlength=256).astype(np.int32)
-                    if len(ctx_syms) else np.zeros(256, dtype=np.int32))
-        all_ctx_raw.append(ctx_raw)
-        if len(ctx_syms) == 0:
-            continue
-        ctx_counts = ctx_raw.astype(np.float64) + 1
-        ctx_model  = constriction.stream.model.Categorical(
-            ctx_counts / ctx_counts.sum(), perfect=False)
-        ctx_coder  = constriction.stream.stack.AnsCoder()
-        ctx_coder.encode_reverse(ctx_syms.astype(np.int32), ctx_model)
-        stream_bytes += len(ctx_coder.get_compressed().tobytes())
+    chunk   = max(1, (256 + N_WORKERS - 1) // N_WORKERS)
+    batches = [range(i, min(i + chunk, 256)) for i in range(0, 256, chunk)]
 
-    tables_arr    = np.array(all_ctx_raw, dtype=np.int32)
+    def process_batch(ctx_range):
+        rows = []
+        stream_total = 0
+        for ctx in ctx_range:
+            ctx_syms = symbols[1:][symbols[:-1] == ctx]
+            ctx_raw  = (np.bincount(ctx_syms, minlength=256).astype(np.int32)
+                        if len(ctx_syms) else np.zeros(256, dtype=np.int32))
+            rows.append(ctx_raw)
+            if len(ctx_syms):
+                ctx_counts = ctx_raw.astype(np.float64) + 1
+                ctx_model  = constriction.stream.model.Categorical(
+                    ctx_counts / ctx_counts.sum(), perfect=False)
+                coder = constriction.stream.stack.AnsCoder()
+                coder.encode_reverse(ctx_syms.astype(np.int32), ctx_model)
+                stream_total += len(coder.get_compressed().tobytes())
+        return rows, stream_total
+
+    with ThreadPoolExecutor(max_workers=N_WORKERS) as ex:
+        futures = [ex.submit(process_batch, b) for b in batches]
+        all_rows     = []
+        total_stream = 0
+        for f in futures:
+            rows, s = f.result()
+            all_rows.extend(rows)
+            total_stream += s
+
+    tables_arr    = np.array(all_rows, dtype=np.int32)
     tables_deltas = np.diff(tables_arr, axis=1, prepend=tables_arr[:, :1]).astype(np.int32)
     table_overhead = len(zlib.compress(tables_deltas.tobytes(), level=9))
 
-    return stream_bytes + table_overhead
+    return total_stream + table_overhead
 
 
 def run_transform(input_path, output_path):
