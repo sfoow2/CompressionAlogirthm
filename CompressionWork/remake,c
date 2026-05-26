@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <math.h>
+#include <omp.h>
 
 typedef uint8_t  u8;
 typedef uint64_t u64;
@@ -109,8 +110,9 @@ int main(int argc, char **argv) {
         }
         printf("Bitstream: %d ones (%.2f%%)\n", ones, 100.0 * ones / size);
 
-        /* brute-force: all thresholds x 256 seeds per segment */
+        /* brute-force: all thresholds x 256 seeds per segment — parallel over segments */
         memset(thresh_totals, 0, N_THRESH * sizeof(int64_t));
+        #pragma omp parallel for schedule(static)
         for (int seg = 0; seg < SEED_BYTES; seg++) {
             int seg_start = (int)((int64_t)seg       * size / SEED_BYTES);
             int seg_end   = (int)((int64_t)(seg + 1) * size / SEED_BYTES);
@@ -127,8 +129,9 @@ int main(int argc, char **argv) {
                     }
                     if (m > best_m) { best_m = m; best_s = s; }
                 }
-                thresh_seeds[ti][seg]  = (u8)best_s;
-                thresh_totals[ti]     += best_m;
+                thresh_seeds[ti][seg] = (u8)best_s;
+                #pragma omp atomic
+                thresh_totals[ti]    += (int64_t)best_m;
             }
         }
 
@@ -141,15 +144,16 @@ int main(int argc, char **argv) {
                100.0 * (double)thresh_totals[best_ti] / size,
                THRESHOLDS[best_ti]);
 
-        /* apply transform in-place */
+        /* apply transform in-place — each segment is independent */
+        int best_thresh = THRESHOLDS[best_ti];
+        #pragma omp parallel for schedule(static)
         for (int seg = 0; seg < SEED_BYTES; seg++) {
             int seg_start = (int)((int64_t)seg       * size / SEED_BYTES);
             int seg_end   = (int)((int64_t)(seg + 1) * size / SEED_BYTES);
             DispGen g = { (u64)thresh_seeds[best_ti][seg] * 2654435761ULL
                           + 1442695040888963407ULL, 0 };
-            int thresh = THRESHOLDS[best_ti];
             for (int i = seg_start; i < seg_end; i++) {
-                if (disp_next_t(&g, thresh) == 1)
+                if (disp_next_t(&g, best_thresh) == 1)
                     work[i] |= 0x80;
             }
         }
