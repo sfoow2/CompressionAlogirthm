@@ -1,0 +1,197 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <math.h>
+
+typedef uint8_t  u8;
+typedef uint64_t u64;
+
+/* ---- disparity-controlled PRNG ------------------------------------ */
+/* thresh=0 → pure LCG (no balance constraint)                        */
+/* thresh>0 → force a corrective bit when imbalance exceeds threshold */
+
+typedef struct { u64 state; int disp; } DispGen;
+
+static inline int disp_next_t(DispGen *g, int thresh) {
+    g->state = g->state * 6364136223846793005ULL + 1442695040888963407ULL;
+    int b = (int)((g->state >> 33) & 1);
+    if (thresh > 0) {
+        if (g->disp >=  thresh) b = 0;
+        if (g->disp <= -thresh) b = 1;
+    }
+    g->disp += b ? 1 : -1;
+    return b;
+}
+
+/* thresholds to try during the search phase — 0 = pure LCG          */
+/* the winner gets hardcoded; nothing extra is stored in the output   */
+static const int THRESHOLDS[] = { 0, 1, 2, 3 };
+#define N_THRESH (int)(sizeof(THRESHOLDS)/sizeof(THRESHOLDS[0]))
+/* ------------------------------------------------------------------ */
+
+static float lowerBitsEntropy(const u8 *d, int n) {
+    int freq[128] = {0};
+    for (int i = 0; i < n; i++) freq[d[i] & 0x7F]++;
+    double e = 0.0;
+    for (int i = 0; i < 128; i++) {
+        if (!freq[i]) continue;
+        double p = (double)freq[i] / n;
+        e -= p * log2(p);
+    }
+    return (float)e;
+}
+
+static float byteEntropy(const u8 *d, int n) {
+    int freq[256] = {0};
+    for (int i = 0; i < n; i++) freq[d[i]]++;
+    double e = 0.0;
+    for (int i = 0; i < 256; i++) {
+        if (!freq[i]) continue;
+        double p = (double)freq[i] / n;
+        e -= p * log2(p);
+    }
+    return (float)e;
+}
+
+int main(int argc, char **argv) {
+    const char *FILE_PATH = argc >= 2 ? argv[1] : "C:/Users/lukac/Documents/compressor/test.zip";
+    const char *OUT_PATH  = argc >= 3 ? argv[2] : "C:/Users/lukac/Documents/compressor/transformed.bin";
+
+    #define TARGET_MATCH 0.75
+
+    FILE *f = fopen(FILE_PATH, "rb");
+    if (!f) { fprintf(stderr, "Cannot open %s\n", FILE_PATH); return 1; }
+    fseek(f, 0, SEEK_END);
+    int size = (int)ftell(f);
+    rewind(f);
+
+    u8 *data = malloc(size);
+    fread(data, 1, size, f);
+    fclose(f);
+
+    printf("Original entropy = %.6f\n", byteEntropy(data, size));
+
+    /* seed size — constant across passes since file size doesn't change */
+    double gain    = TARGET_MATCH - 0.5;
+    int SEED_BYTES = (int)ceil(gain * gain * 2.0 * size / log(256.0));
+    if (SEED_BYTES < 8) SEED_BYTES = 8;
+    printf("Target %.0f%% -> SEED_BYTES = %d\n\n",
+           TARGET_MATCH * 100.0, SEED_BYTES);
+
+    int bits_len = (size + 7) / 8;
+    u8 *bits     = malloc(bits_len);
+    u8 *work     = malloc(size);
+    memcpy(work, data, size);
+
+    u8      **thresh_seeds  = malloc(N_THRESH * sizeof(u8 *));
+    int64_t  *thresh_totals = malloc(N_THRESH * sizeof(int64_t));
+    for (int ti = 0; ti < N_THRESH; ti++)
+        thresh_seeds[ti] = malloc(SEED_BYTES);
+
+    int total_header = 0;
+
+    /* count initial bytes<128 so we can detect when a pass yields nothing */
+    int below_prev = 0;
+    for (int i = 0; i < size; i++) if (data[i] < 128) below_prev++;
+
+    for (int pass = 0; ; pass++) {
+        printf("--- Pass %d ---\n", pass + 1);
+
+        /* build bitstream from current work buffer */
+        memset(bits, 0, bits_len);
+        int ones = 0;
+        for (int i = 0; i < size; i++) {
+            if (work[i] < 128) {
+                bits[i / 8] |= (1 << (7 - (i % 8)));
+                ones++;
+            }
+        }
+        printf("Bitstream: %d ones (%.2f%%)\n", ones, 100.0 * ones / size);
+
+        /* brute-force: all thresholds x 256 seeds per segment */
+        memset(thresh_totals, 0, N_THRESH * sizeof(int64_t));
+        for (int seg = 0; seg < SEED_BYTES; seg++) {
+            int seg_start = (int)((int64_t)seg       * size / SEED_BYTES);
+            int seg_end   = (int)((int64_t)(seg + 1) * size / SEED_BYTES);
+
+            for (int ti = 0; ti < N_THRESH; ti++) {
+                int thresh = THRESHOLDS[ti];
+                int best_s = 0, best_m = -1;
+                for (int s = 0; s < 256; s++) {
+                    DispGen g = { (u64)s * 2654435761ULL + 1442695040888963407ULL, 0 };
+                    int m = 0;
+                    for (int i = seg_start; i < seg_end; i++) {
+                        int sb = (bits[i / 8] >> (7 - (i % 8))) & 1;
+                        if (disp_next_t(&g, thresh) == sb) m++;
+                    }
+                    if (m > best_m) { best_m = m; best_s = s; }
+                }
+                thresh_seeds[ti][seg]  = (u8)best_s;
+                thresh_totals[ti]     += best_m;
+            }
+        }
+
+        /* pick best threshold globally */
+        int best_ti = 0;
+        for (int ti = 1; ti < N_THRESH; ti++)
+            if (thresh_totals[ti] > thresh_totals[best_ti]) best_ti = ti;
+
+        printf("Match: %.4f%%  [thresh=%d]\n",
+               100.0 * (double)thresh_totals[best_ti] / size,
+               THRESHOLDS[best_ti]);
+
+        /* apply transform in-place */
+        for (int seg = 0; seg < SEED_BYTES; seg++) {
+            int seg_start = (int)((int64_t)seg       * size / SEED_BYTES);
+            int seg_end   = (int)((int64_t)(seg + 1) * size / SEED_BYTES);
+            DispGen g = { (u64)thresh_seeds[best_ti][seg] * 2654435761ULL
+                          + 1442695040888963407ULL, 0 };
+            int thresh = THRESHOLDS[best_ti];
+            for (int i = seg_start; i < seg_end; i++) {
+                if (disp_next_t(&g, thresh) == 1)
+                    work[i] |= 0x80;
+            }
+        }
+
+        /* per-pass stats */
+        int below = 0;
+        for (int i = 0; i < size; i++) if (work[i] < 128) below++;
+        printf("Entropy: %.6f   bytes<128: %d (%.2f%%)  improved: %d\n\n",
+               byteEntropy(work, size), below, 100.0 * below / size,
+               below_prev - below);
+
+        total_header += 1 + SEED_BYTES;   /* 1 thresh byte + seed array */
+
+        int improved = below_prev - below;
+        if (improved <= 1 + SEED_BYTES) {
+            printf("Header cost (%d) >= improvement (%d) — stopping after %d pass(es).\n\n",
+                   1 + SEED_BYTES, improved, pass + 1);
+            /* undo this pass's header cost since it wasn't worthwhile */
+            total_header -= 1 + SEED_BYTES;
+            break;
+        }
+        below_prev = below;
+    }
+
+    printf("Total header cost: %d bytes (%d pass(es) x (1 + %d))\n",
+           total_header, total_header / (1 + SEED_BYTES), SEED_BYTES);
+    printf("HEADER_BYTES=%d\n", total_header);
+
+    FILE *fout = fopen(OUT_PATH, "wb");
+    if (fout) {
+        fwrite(work, 1, size, fout);
+        fclose(fout);
+        printf("Wrote %d bytes -> %s\n", size, OUT_PATH);
+    } else {
+        fprintf(stderr, "Cannot write %s\n", OUT_PATH);
+    }
+
+    for (int ti = 0; ti < N_THRESH; ti++) free(thresh_seeds[ti]);
+    free(thresh_seeds);
+    free(thresh_totals);
+    free(bits);
+    free(work);
+    free(data);
+    return 0;
+}
