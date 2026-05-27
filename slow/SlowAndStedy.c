@@ -1,15 +1,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <string.h>
 #include <math.h>
 #include <omp.h>
 
 typedef uint8_t u8;
 
-#define ScrambeSizeBits    4
-#define ScanSizeBits       4
-#define AmplifierSizeBits  7
+#define ScrambeSizeBits     4
+#define ScanSizeBits        4
+#define AmplifierSizeBits   7
 #define MAX_SCRAMBLE_PASSES 8
+#define BLOCK_SIZE          (64 * 1024)
+#define BWT_OVERHEAD_BITS   32
 
 int ScrambleSize = (1 << ScrambeSizeBits);
 int ScanSize     = (1 << ScanSizeBits);
@@ -20,6 +23,8 @@ int FindNextBetter(u8 *Data, int size, u8 *amp, u8 *op);
 static const char *op_names[] = {"ADD", "XOR", "ROL", "MUL"};
 
 typedef struct { u8 seed, scan, amp, op; } ScrambleStep;
+
+// ── Core helpers ──────────────────────────────────────────────────────────────
 
 static double byteEntropy(const u8 *d, int n) {
     int freq[256] = {0};
@@ -33,11 +38,9 @@ static double byteEntropy(const u8 *d, int n) {
     return e;
 }
 
-// finds b such that (a * b) % 256 == 1; a must be odd
 static u8 mul_inverse_byte(u8 a) {
-    for (int b = 1; b <= 255; b += 2) {
+    for (int b = 1; b <= 255; b += 2)
         if ((u8)(a * b) == 1) return (u8)b;
-    }
     return 1;
 }
 
@@ -46,78 +49,71 @@ static void apply_op_inplace(u8 *Data, int size, int stride, u8 amp, u8 op) {
         switch (op) {
             case 0: Data[p] += amp; break;
             case 1: Data[p] ^= amp; break;
-            case 2: Data[p] = (u8)((Data[p] << amp) | (Data[p] >> (8 - amp))); break; // ROL
-            case 3: Data[p] = (u8)(Data[p] * amp); break;                              // MUL
+            case 2: Data[p] = (u8)((Data[p] << amp) | (Data[p] >> (8 - amp))); break;
+            case 3: Data[p] = (u8)(Data[p] * amp); break;
         }
     }
 }
 
 static void undo_op_inplace(u8 *Data, int size, int stride, u8 amp, u8 op) {
-    u8 inv = (op == 3) ? mul_inverse_byte(amp) : 0; // precompute once
+    u8 inv = (op == 3) ? mul_inverse_byte(amp) : 0;
     for (int p = 0; p < size; p += stride) {
         switch (op) {
             case 0: Data[p] -= amp; break;
             case 1: Data[p] ^= amp; break;
-            case 2: Data[p] = (u8)((Data[p] >> amp) | (Data[p] << (8 - amp))); break; // ROR
+            case 2: Data[p] = (u8)((Data[p] >> amp) | (Data[p] << (8 - amp))); break;
             case 3: Data[p] = (u8)(Data[p] * inv); break;
         }
     }
 }
 
-// bits needed to encode one transform step in the bitstream
 static int op_overhead(u8 op) {
     static const int amp_bits[] = {AmplifierSizeBits, AmplifierSizeBits, 3, AmplifierSizeBits};
-    return ScanSizeBits + 2 + amp_bits[op]; // 2 bits for op selector
+    return ScanSizeBits + 2 + amp_bits[op];
 }
+
+// ── Scramble ──────────────────────────────────────────────────────────────────
 
 void scramble_bytes(u8 *data, int size, u8 seed) {
     if (!data || size <= 1) return;
     srand(seed);
     for (int i = size - 1; i > 0; i--) {
         int j = rand() % (i + 1);
-        u8 tmp = data[i];
-        data[i] = data[j];
-        data[j] = tmp;
+        u8 tmp = data[i]; data[i] = data[j]; data[j] = tmp;
     }
 }
 
 void unscramble_bytes(u8 *data, int size, u8 seed) {
     if (!data || size <= 1) return;
     int *swaps = malloc(size * sizeof(int));
+    if (!swaps) return;
     srand(seed);
-    for (int i = size - 1; i > 0; i--)
-        swaps[i] = rand() % (i + 1);
+    for (int i = size - 1; i > 0; i--) swaps[i] = rand() % (i + 1);
     for (int i = 1; i < size; i++) {
-        u8 tmp = data[i];
-        data[i] = data[swaps[i]];
-        data[swaps[i]] = tmp;
+        u8 tmp = data[i]; data[i] = data[swaps[i]]; data[swaps[i]] = tmp;
     }
     free(swaps);
 }
 
+// ── Transform search ──────────────────────────────────────────────────────────
+
 void FindNextBestScramble(u8 *Data, int size, u8 *seed, u8 *Scan, u8 *amp, u8 *op) {
     u8 *Data2 = malloc(size);
+    if (!Data2) { *seed = *Scan = *amp = *op = 0; return; }
 
     double Topempt = byteEntropy(Data, size);
-    u8 BestSeed = 0;
-    u8 BestScan = 0;
-    u8 BestAmp  = 0;
-    u8 BestOp   = 0;
+    u8 BestSeed = 0, BestScan = 0, BestAmp = 0, BestOp = 0;
 
     for (int si = 0; si < ScrambleSize; si++) {
         for (int x = 0; x < size; x++) Data2[x] = Data[x];
         scramble_bytes(Data2, size, (u8)si);
 
-        u8 Lastamp = 0;
-        u8 Lastop  = 0;
+        u8 Lastamp = 0, Lastop = 0;
         u8 LastScan = FindNextBetter(Data2, size, &Lastamp, &Lastop);
 
-        if (LastScan > 0) {
-            apply_op_inplace(Data2, size, LastScan, Lastamp, Lastop);
-        }
+        if (LastScan > 0) apply_op_inplace(Data2, size, LastScan, Lastamp, Lastop);
 
         double empt = byteEntropy(Data2, size);
-
         if (empt < Topempt) {
             Topempt  = empt;
             BestSeed = (u8)si;
@@ -127,38 +123,26 @@ void FindNextBestScramble(u8 *Data, int size, u8 *seed, u8 *Scan, u8 *amp, u8 *o
         }
     }
 
-    *seed = BestSeed;
-    *Scan = BestScan;
-    *amp  = BestAmp;
-    *op   = BestOp;
-
+    *seed = BestSeed; *Scan = BestScan; *amp = BestAmp; *op = BestOp;
     free(Data2);
 }
 
 int FindNextBetter(u8 *Data, int size, u8 *amp, u8 *op) {
     double BestEmpt = byteEntropy(Data, size);
-    int BestScan = 0;
-    int BestAmp  = 0;
-    int BestOp   = 0;
+    int BestScan = 0, BestAmp = 0, BestOp = 0;
 
     #pragma omp parallel
     {
         u8 *Data2 = malloc(size);
-
-        // each thread tracks its own best; merged into globals at the end
         double localBestEmpt = BestEmpt;
         int localScan = 0, localAmp = 0, localOp = 0;
 
         if (Data2) {
             #pragma omp for schedule(dynamic, 1)
             for (int x = 1; x <= ScanSize; x++) {
-
-                // one copy per stride; all ops reuse by overwriting only strided positions
                 for (int s = 0; s < size; s++) Data2[s] = Data[s];
 
-                // ADD + XOR share the same amplitude range and the same copy
                 for (int a = 1; a <= AmpliferScan; a++) {
-
                     for (int p = 0; p < size; p += x) Data2[p] = (u8)(Data[p] + a);
                     double empt = byteEntropy(Data2, size);
                     if (empt < localBestEmpt) { localBestEmpt = empt; localScan = x; localAmp = a; localOp = 0; }
@@ -182,11 +166,9 @@ int FindNextBetter(u8 *Data, int size, u8 *amp, u8 *op) {
                     if (empt < localBestEmpt) { localBestEmpt = empt; localScan = x; localAmp = a; localOp = 3; }
                 }
             }
-
             free(Data2);
         }
 
-        // serialize the merge: one thread at a time updates the shared best
         #pragma omp critical
         {
             if (localBestEmpt < BestEmpt) {
@@ -198,68 +180,180 @@ int FindNextBetter(u8 *Data, int size, u8 *amp, u8 *op) {
         }
     }
 
-    *amp = (u8)BestAmp;
-    *op  = (u8)BestOp;
+    *amp = (u8)BestAmp; *op = (u8)BestOp;
     return BestScan;
 }
 
-int main(void) {
-    srand(5);
+// ── BWT ──────────────────────────────────────────────────────────────────────
+// Cyclic suffix array via prefix doubling (O(n log^2 n)).
+// Verified correct on "abcd" and "banana".
 
-    int size = 1024 * 1024;
-    u8 *Data = malloc(size);
-    if (!Data) return 1;
+typedef struct { int orig, r0, r1; } SuffixRank;
 
-    for (int x = 0; x < size; x++) Data[x] = rand() % 256;
+static int cmp_sr(const void *a, const void *b) {
+    const SuffixRank *x = a, *y = b;
+    if (x->r0 != y->r0) return (x->r0 > y->r0) - (x->r0 < y->r0);
+    return (x->r1 > y->r1) - (x->r1 < y->r1);
+}
 
-    double BaseEntropy = byteEntropy(Data, size);
-    printf("Base empt = %lf\n", BaseEntropy);
+static int *build_cyclic_suffix_array(const u8 *s, int n) {
+    if (n <= 0) return NULL;
+    if (n == 1) {
+        int *sa = malloc(sizeof(int));
+        if (sa) sa[0] = 0;
+        return sa;
+    }
 
-    int done = 0;
-    int totalOverhead = 0;
+    int *rank = malloc(n * sizeof(int));
+    int *tmp  = malloc(n * sizeof(int));
+    SuffixRank *sr = malloc(n * sizeof(SuffixRank));
+    if (!rank || !tmp || !sr) { free(rank); free(tmp); free(sr); return NULL; }
+
+    for (int i = 0; i < n; i++) rank[i] = s[i];
+
+    for (int k = 1; k < n; k <<= 1) {
+        for (int i = 0; i < n; i++) {
+            sr[i].orig = i;
+            sr[i].r0   = rank[i];
+            sr[i].r1   = rank[(i + k) % n];
+        }
+        qsort(sr, n, sizeof(SuffixRank), cmp_sr);
+
+        tmp[sr[0].orig] = 0;
+        for (int i = 1; i < n; i++)
+            tmp[sr[i].orig] = tmp[sr[i-1].orig] +
+                ((sr[i].r0 != sr[i-1].r0 || sr[i].r1 != sr[i-1].r1) ? 1 : 0);
+        for (int i = 0; i < n; i++) rank[i] = tmp[i];
+        if (rank[sr[n-1].orig] == n - 1) break;
+    }
+
+    int *sa = malloc(n * sizeof(int));
+    if (sa) for (int i = 0; i < n; i++) sa[i] = sr[i].orig;
+
+    free(rank); free(tmp); free(sr);
+    return sa;
+}
+
+// Replaces data[] with BWT last column; sets *primary_index to the row where
+// the original string starts (needed for inverse).
+static void bwt_forward(u8 *data, int n, int *primary_index) {
+    if (n <= 0) return;
+    if (n == 1) { *primary_index = 0; return; }
+
+    int *sa = build_cyclic_suffix_array(data, n);
+    u8  *L  = malloc(n);
+    if (!sa || !L) { free(sa); free(L); return; }
+
+    *primary_index = 0;
+    for (int i = 0; i < n; i++) {
+        L[i] = data[(sa[i] + n - 1) % n];
+        if (sa[i] == 0) *primary_index = i;
+    }
+    memcpy(data, L, n);
+    free(sa); free(L);
+}
+
+// LF-mapping inverse: reconstructs original from BWT last column + primary_index.
+static void bwt_inverse(u8 *data, int n, int primary_index) {
+    if (n <= 1) return;
+
+    int freq[256] = {0};
+    for (int i = 0; i < n; i++) freq[data[i]]++;
+
+    int first[256], acc = 0;
+    for (int c = 0; c < 256; c++) { first[c] = acc; acc += freq[c]; }
+
+    int *LF  = malloc(n * sizeof(int));
+    u8  *out = malloc(n);
+    if (!LF || !out) { free(LF); free(out); return; }
+
+    int occ[256] = {0};
+    for (int i = 0; i < n; i++)
+        LF[i] = first[data[i]] + occ[data[i]]++;
+
+    int row = primary_index;
+    for (int i = n - 1; i >= 0; i--) {
+        out[i] = data[row];
+        row = LF[row];
+    }
+    memcpy(data, out, n);
+    free(LF); free(out);
+}
+
+// ── MTF ──────────────────────────────────────────────────────────────────────
+
+static void mtf_forward(u8 *data, int n) {
+    u8 list[256];
+    for (int i = 0; i < 256; i++) list[i] = (u8)i;
+    for (int i = 0; i < n; i++) {
+        int pos = 0;
+        while (list[pos] != data[i]) pos++;
+        data[i] = (u8)pos;
+        u8 sym = list[pos];
+        memmove(list + 1, list, pos);
+        list[0] = sym;
+    }
+}
+
+static void mtf_inverse(u8 *data, int n) {
+    u8 list[256];
+    for (int i = 0; i < 256; i++) list[i] = (u8)i;
+    for (int i = 0; i < n; i++) {
+        int pos = data[i];
+        u8  sym = list[pos];
+        data[i] = sym;
+        memmove(list + 1, list, pos);
+        list[0] = sym;
+    }
+}
+
+// ── Block processing ──────────────────────────────────────────────────────────
+
+static void compressBlock(u8 *data, int bsize, int blockIdx) {
+    double baseEntropy = byteEntropy(data, bsize);
+    printf("\n=== Block %d (%d bytes)  base=%.4f bits/byte ===\n",
+           blockIdx, bsize, baseEntropy);
+
+    // BWT + MTF as pre-processing step
+    int primary_index = 0;
+    bwt_forward(data, bsize, &primary_index);
+    double afterBWT = byteEntropy(data, bsize);
+    mtf_forward(data, bsize);
+    double afterMTF = byteEntropy(data, bsize);
+
+    printf("  BWT: %.4f -> %.4f   MTF: -> %.4f   gain=%.1f bits  overhead=%d bits\n",
+           baseEntropy, afterBWT, afterMTF,
+           (baseEntropy - afterMTF) * bsize, BWT_OVERHEAD_BITS);
+
+    int totalOverhead         = BWT_OVERHEAD_BITS;
     int totalScrambleOverhead = 0;
-
-    double Starting    = BaseEntropy;
-    double LastEntropy = Starting;
-
-    int nThreads = omp_get_max_threads() - 1;
-    if (nThreads < 1) nThreads = 1;
-    omp_set_num_threads(nThreads);
-    printf("Using %d threads\n", nThreads);
-
-    srand(88);
-    int ScrambleCount = 0;
+    double LastEntropy        = afterMTF;
+    int done = 0;
 
     while (!done) {
-        u8 amp = 0;
-        u8 op  = 0;
-        int v = FindNextBetter(Data, size, &amp, &op);
+        u8 amp = 0, op = 0;
+        int v = FindNextBetter(data, bsize, &amp, &op);
 
         if (v == 0) {
-            printf("\nfound nothing\n");
+            printf("  no better transform\n");
             done = 1;
         } else {
-            apply_op_inplace(Data, size, v, amp, op);
-
-            double empt = byteEntropy(Data, size);
-            printf("new empt = %lf  [%s stride=%d amp=%d]\n", empt, op_names[op], v, amp);
-
+            apply_op_inplace(data, bsize, v, amp, op);
+            double empt = byteEntropy(data, bsize);
             int overhead = op_overhead(op);
-            double Difference = ((LastEntropy * size) - (empt * size) - overhead);
-            printf("profit of %lf bits\n", Difference);
+            double Difference = (LastEntropy - empt) * bsize - overhead;
+            printf("  [%s stride=%d amp=%d] entropy=%.4f  profit=%.1f\n",
+                   op_names[op], v, amp, empt, Difference);
 
             int tryScramble = 0;
-
             if (Difference <= 0) {
-                undo_op_inplace(Data, size, v, amp, op);
+                undo_op_inplace(data, bsize, v, amp, op);
                 empt = LastEntropy;
                 tryScramble = 1;
             } else {
                 totalOverhead += overhead;
                 LastEntropy = empt;
-                if (Difference <= overhead) {
-                    tryScramble = 1;
-                }
+                if (Difference <= overhead) tryScramble = 1;
             }
 
             if (tryScramble) {
@@ -270,37 +364,37 @@ int main(void) {
 
                 while (nPasses < MAX_SCRAMBLE_PASSES) {
                     u8 seed, scan, scrAmp, scrOp;
-                    FindNextBestScramble(Data, size, &seed, &scan, &scrAmp, &scrOp);
-                    scramble_bytes(Data, size, seed);
-                    if (scan > 0) apply_op_inplace(Data, size, scan, scrAmp, scrOp);
+                    FindNextBestScramble(data, bsize, &seed, &scan, &scrAmp, &scrOp);
+                    scramble_bytes(data, bsize, seed);
+                    if (scan > 0) apply_op_inplace(data, bsize, scan, scrAmp, scrOp);
+                    double scrEmpt = byteEntropy(data, bsize);
+                    int passOverhead = ScrambeSizeBits + (scan > 0 ? op_overhead(scrOp) : 0);
+                    double passGain  = (currentEntropy - scrEmpt) * bsize;
 
-                    double scrEmpt = byteEntropy(Data, size);
-
-                    if (scrEmpt >= currentEntropy) {
-                        if (scan > 0) undo_op_inplace(Data, size, scan, scrAmp, scrOp);
-                        unscramble_bytes(Data, size, seed);
+                    if (passGain <= passOverhead) {
+                        if (scan > 0) undo_op_inplace(data, bsize, scan, scrAmp, scrOp);
+                        unscramble_bytes(data, bsize, seed);
                         break;
                     }
-
                     passes[nPasses++] = (ScrambleStep){seed, scan, scrAmp, scrOp};
                     currentEntropy = scrEmpt;
                 }
 
                 if (nPasses == 0) {
-                    printf("\nnot profitable\n");
+                    printf("  scramble not profitable\n");
                     done = 1;
                 } else {
                     int chainOverhead = 0;
                     for (int i = 0; i < nPasses; i++)
-                        chainOverhead += ScrambeSizeBits + (passes[i].scan > 0 ? op_overhead(passes[i].op) : 0);
-                    double ScrDiff = (((before * size) - (currentEntropy * size)) - chainOverhead);
-                    printf("Scramble chain x%d  ScrDiff=%lf\n", nPasses, ScrDiff);
+                        chainOverhead += ScrambeSizeBits +
+                            (passes[i].scan > 0 ? op_overhead(passes[i].op) : 0);
+                    double ScrDiff = (before - currentEntropy) * bsize - chainOverhead;
+                    printf("  Scramble x%d  ScrDiff=%.1f bits\n", nPasses, ScrDiff);
                     for (int i = 0; i < nPasses; i++)
-                        printf("  pass %d: seed=%d [%s stride=%d amp=%d]\n", i + 1,
+                        printf("    pass %d: seed=%d [%s stride=%d amp=%d]\n", i + 1,
                                passes[i].seed,
                                passes[i].scan > 0 ? op_names[passes[i].op] : "NONE",
                                passes[i].scan, passes[i].amp);
-                    ScrambleCount += nPasses;
                     totalScrambleOverhead += chainOverhead;
                     LastEntropy = currentEntropy;
                 }
@@ -308,9 +402,50 @@ int main(void) {
         }
     }
 
-    double ending     = byteEntropy(Data, size);
-    double Difference = (((Starting * size) - (ending * size)) - totalOverhead - totalScrambleOverhead);
-    printf("Total Difference of %lf bits\n", Difference);
+    double ending  = byteEntropy(data, bsize);
+    double netGain = (baseEntropy - ending) * bsize - totalOverhead - totalScrambleOverhead;
+    printf("  Block %d done: %.4f -> %.4f  net_gain=%.1f bits"
+           "  (overhead %d + %d scramble = %d bits)\n",
+           blockIdx, baseEntropy, ending, netGain,
+           totalOverhead, totalScrambleOverhead,
+           totalOverhead + totalScrambleOverhead);
+}
+
+int main(void) {
+    srand(5);
+
+    int size = 1024 * 1024;
+    u8 *Data = malloc(size);
+    if (!Data) return 1;
+    for (int x = 0; x < size; x++) Data[x] = rand() % 256;
+
+    double BaseEntropy = byteEntropy(Data, size);
+    printf("Data: %d bytes  global entropy=%.4f bits/byte\n", size, BaseEntropy);
+
+    int nThreads = omp_get_max_threads() - 1;
+    if (nThreads < 1) nThreads = 1;
+    omp_set_num_threads(nThreads);
+    printf("Using %d threads\n", nThreads);
+
+    int numBlocks = (size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    printf("Blocks: %d x %d bytes\n", numBlocks, BLOCK_SIZE);
+
+    double totalBitsBefore = 0.0, totalBitsAfter = 0.0;
+
+    for (int b = 0; b < numBlocks; b++) {
+        int offset = b * BLOCK_SIZE;
+        int bsize  = (offset + BLOCK_SIZE <= size) ? BLOCK_SIZE : (size - offset);
+        u8 *block  = Data + offset;
+
+        totalBitsBefore += byteEntropy(block, bsize) * bsize;
+        compressBlock(block, bsize, b);
+        totalBitsAfter  += byteEntropy(block, bsize) * bsize;
+    }
+
+    printf("\n=== Summary ===\n");
+    printf("Total bits before: %.0f\n", totalBitsBefore);
+    printf("Total bits after:  %.0f\n", totalBitsAfter);
+    printf("Total reduction:   %.0f bits\n", totalBitsBefore - totalBitsAfter);
 
     free(Data);
     return 0;
