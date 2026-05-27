@@ -553,22 +553,40 @@ static double compressBlock(u8 *data, int bsize, int blockIdx) {
     printf("\n=== Block %d (%d bytes)  base=%.4f bits/byte ===\n",
            blockIdx, bsize, baseEntropy);
 
-    // BWT + MTF as pre-processing step
+    // BWT + MTF: try on a temp copy first; only apply if the gain beats the overhead.
+    // On random data many blocks gain less than 32 bits from BWT — applying it
+    // would be a net loss. The "no BWT" decision costs 0 extra bits in this model
+    // (flag can be folded into the per-block header).
     printHistStats(data, bsize, "base");
-    int primary_index = 0;
-    bwt_forward(data, bsize, &primary_index);
-    double afterBWT = byteEntropy(data, bsize);
-    mtf_forward(data, bsize);
-    double afterMTF = byteEntropy(data, bsize);
-    printHistStats(data, bsize, "BWT+MTF");
+    double startEntropy = baseEntropy;
+    int    totalOverhead = 0;
+    {
+        u8 *tmp = malloc(bsize);
+        if (tmp) {
+            memcpy(tmp, data, bsize);
+            int pi = 0;
+            bwt_forward(tmp, bsize, &pi);
+            double eBWT = byteEntropy(tmp, bsize);
+            mtf_forward(tmp, bsize);
+            double eMTF = byteEntropy(tmp, bsize);
+            double bwtGain = (baseEntropy - eMTF) * bsize;
+            if (bwtGain > BWT_OVERHEAD_BITS) {
+                memcpy(data, tmp, bsize);
+                startEntropy = eMTF;
+                totalOverhead = BWT_OVERHEAD_BITS;
+                printHistStats(data, bsize, "BWT+MTF");
+                printf("  BWT: %.4f -> %.4f   MTF: -> %.4f   gain=%.1f bits  overhead=%d bits  [applied]\n",
+                       baseEntropy, eBWT, eMTF, bwtGain, BWT_OVERHEAD_BITS);
+            } else {
+                printf("  BWT+MTF: gain=%.1f bits < overhead=%d bits  [skipped]\n",
+                       bwtGain, BWT_OVERHEAD_BITS);
+            }
+            free(tmp);
+        }
+    }
 
-    printf("  BWT: %.4f -> %.4f   MTF: -> %.4f   gain=%.1f bits  overhead=%d bits\n",
-           baseEntropy, afterBWT, afterMTF,
-           (baseEntropy - afterMTF) * bsize, BWT_OVERHEAD_BITS);
-
-    int totalOverhead         = BWT_OVERHEAD_BITS;
     int totalScrambleOverhead = 0;
-    double LastEntropy        = afterMTF;
+    double LastEntropy        = startEntropy;
     int done = 0;
 
     while (!done) {
