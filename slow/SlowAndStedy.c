@@ -14,9 +14,11 @@ typedef uint8_t u8;
 #define BLOCK_SIZE          (64 * 1024)
 #define BWT_OVERHEAD_BITS   32
 
-int ScrambleSize = (1 << ScrambeSizeBits);
-int ScanSize     = (1 << ScanSizeBits);
-int AmpliferScan = (1 << AmplifierSizeBits);
+int ScrambleSize     = (1 << ScrambeSizeBits);
+int ScanSize         = (1 << ScanSizeBits);
+int AmpliferScan     = (1 << AmplifierSizeBits);
+int ScanSizeBitsG    = ScanSizeBits;    // runtime-tunable
+int ScrambeSizeBitsG = ScrambeSizeBits; // runtime-tunable
 
 int FindNextBetter(u8 *Data, int size, u8 *amp, u8 *op);
 
@@ -95,7 +97,7 @@ static void undo_op_inplace(u8 *Data, int size, int stride, u8 amp, u8 op) {
 static int op_overhead(u8 op) {
     // ADD/XOR: 8-bit amp (1-255); ROL: 3-bit (1-7); MUL: 7-bit index into odd values 3-255
     static const int amp_bits[] = {8, 8, 3, AmplifierSizeBits};
-    return ScanSizeBits + 2 + amp_bits[op];
+    return ScanSizeBitsG + 2 + amp_bits[op];
 }
 
 // ── Scramble ──────────────────────────────────────────────────────────────────
@@ -333,6 +335,143 @@ static void mtf_inverse(u8 *data, int n) {
     }
 }
 
+// ── Parameter tuning ─────────────────────────────────────────────────────────
+// Probes ScanBits and ScrambeBits on the first block to find the combination
+// that yields the most net gain. Runs once at startup; sets ScanSizeBitsG,
+// ScrambeSizeBitsG, ScanSize, ScrambleSize for the whole file.
+
+static void tuneParams(const u8 *data, int size) {
+    // Phase 1 sample: BLOCK_SIZE/4 (16 KB) — large enough to capture compounding,
+    // small enough for 20 FindNextBetter calls to finish in a few seconds.
+    int sample = BLOCK_SIZE / 4;
+    if (sample > size) sample = size;
+    if (sample < 1024) sample = 1024;
+
+    // Phase 2 sample: BLOCK_SIZE/8 (8 KB) — ScrambleSize search is slower per call.
+    int scrSample = BLOCK_SIZE / 8;
+    if (scrSample > size) scrSample = size;
+    if (scrSample < 512) scrSample = 512;
+
+    printf("Tuning on %d bytes (scramble probe: %d bytes)...\n", sample, scrSample);
+
+    // Build BWT+MTF base once — all Phase 1 probes start from the same state.
+    u8 *base = malloc(sample);
+    if (!base) return;
+    memcpy(base, data, sample);
+    {
+        int pi = 0;
+        bwt_forward(base, sample, &pi);
+        mtf_forward(base, sample);
+    }
+    double baseE = byteEntropy(base, sample);
+
+    // ── Phase 1: tune ScanBits with 5-iteration multi-step probe ─────────────
+    // A single-step probe is noisy: 1-bit difference in first-step gain means
+    // nothing. Running 5 iterations captures the compounding effect — a larger
+    // ScanSize unlocks more strides per block and its advantage grows with each
+    // subsequent FindNextBetter call.
+    int bestScanBits = ScanSizeBitsG;
+    double bestScanGain = -1e18;
+
+    printf("  ScanSize (5-iter probe, BWT+MTF base):\n");
+    for (int sb = 2; sb <= 5; sb++) {
+        u8 *copy = malloc(sample);
+        if (!copy) continue;
+        memcpy(copy, base, sample);
+
+        ScanSizeBitsG = sb;
+        ScanSize      = 1 << sb;
+
+        double curE   = baseE;
+        int    totalOH = 0;
+
+        for (int iter = 0; iter < 5; iter++) {
+            u8 amp = 0, op = 0;
+            int v = FindNextBetter(copy, sample, &amp, &op);
+            if (v == 0) break;
+            apply_op_inplace(copy, sample, v, amp, op);
+            double newE = byteEntropy(copy, sample);
+            int    oh   = op_overhead(op);
+            if ((curE - newE) * sample <= oh) {
+                undo_op_inplace(copy, sample, v, amp, op);
+                break;
+            }
+            totalOH += oh;
+            curE     = newE;
+        }
+
+        double netGain = (baseE - curE) * sample - totalOH;
+        printf("    ScanSize=%2d (bits=%d): net_gain=%.1f bits%s\n",
+               1 << sb, sb, netGain, sb == ScanSizeBits ? " [default]" : "");
+        if (netGain > bestScanGain) { bestScanGain = netGain; bestScanBits = sb; }
+        free(copy);
+    }
+    ScanSizeBitsG = bestScanBits;
+    ScanSize      = 1 << bestScanBits;
+    printf("    => ScanSize=%d (bits=%d)\n", ScanSize, ScanSizeBitsG);
+    free(base);
+
+    // ── Phase 2: tune ScrambeBits ─────────────────────────────────────────────
+    // Build BWT+MTF, apply up to 5 transform steps with the tuned ScanBits to
+    // get a realistic post-transform state, then probe each ScrambleSize.
+    u8 *post = malloc(scrSample);
+    if (post) {
+        memcpy(post, data, scrSample);
+        {
+            int pi = 0;
+            bwt_forward(post, scrSample, &pi);
+            mtf_forward(post, scrSample);
+        }
+        for (int iter = 0; iter < 5; iter++) {
+            u8 amp = 0, op = 0;
+            int v = FindNextBetter(post, scrSample, &amp, &op);
+            if (v == 0) break;
+            double eBefore = byteEntropy(post, scrSample);
+            apply_op_inplace(post, scrSample, v, amp, op);
+            double eAfter  = byteEntropy(post, scrSample);
+            if ((eBefore - eAfter) * scrSample <= op_overhead(op)) {
+                undo_op_inplace(post, scrSample, v, amp, op);
+                break;
+            }
+        }
+        double postE = byteEntropy(post, scrSample);
+
+        int    bestScrBits = ScrambeSizeBitsG;
+        double bestScrGain = -1e18;
+
+        printf("  ScrambleSize (post-transform state):\n");
+        for (int scb = 2; scb <= 5; scb++) {
+            ScrambeSizeBitsG = scb;
+            ScrambleSize     = 1 << scb;
+
+            u8 *scopy = malloc(scrSample);
+            if (!scopy) continue;
+            memcpy(scopy, post, scrSample);
+
+            u8 seed, scan, scrAmp, scrOp;
+            FindNextBestScramble(scopy, scrSample, &seed, &scan, &scrAmp, &scrOp);
+            scramble_bytes(scopy, scrSample, seed);
+            if (scan > 0) apply_op_inplace(scopy, scrSample, scan, scrAmp, scrOp);
+
+            double scrE = byteEntropy(scopy, scrSample);
+            int    oh   = ScrambeSizeBitsG + (scan > 0 ? op_overhead(scrOp) : 0);
+            double gain = (postE - scrE) * scrSample - oh;
+
+            printf("    ScrambleSize=%2d (bits=%d): gain=%.1f bits%s\n",
+                   1 << scb, scb, gain, scb == ScrambeSizeBits ? " [default]" : "");
+            if (gain > bestScrGain) { bestScrGain = gain; bestScrBits = scb; }
+            free(scopy);
+        }
+        ScrambeSizeBitsG = bestScrBits;
+        ScrambleSize     = 1 << bestScrBits;
+        printf("    => ScrambleSize=%d (bits=%d)\n", ScrambleSize, ScrambeSizeBitsG);
+        free(post);
+    }
+
+    printf("Tuned: ScanSize=%d (bits=%d)  ScrambleSize=%d (bits=%d)\n\n",
+           ScanSize, ScanSizeBitsG, ScrambleSize, ScrambeSizeBitsG);
+}
+
 // ── Block processing ──────────────────────────────────────────────────────────
 
 static double compressBlock(u8 *data, int bsize, int blockIdx) {
@@ -397,7 +536,7 @@ static double compressBlock(u8 *data, int bsize, int blockIdx) {
                     scramble_bytes(data, bsize, seed);
                     if (scan > 0) apply_op_inplace(data, bsize, scan, scrAmp, scrOp);
                     double scrEmpt = byteEntropy(data, bsize);
-                    int passOverhead = ScrambeSizeBits + (scan > 0 ? op_overhead(scrOp) : 0);
+                    int passOverhead = ScrambeSizeBitsG + (scan > 0 ? op_overhead(scrOp) : 0);
                     double passGain  = (currentEntropy - scrEmpt) * bsize;
 
                     if (passGain <= passOverhead) {
@@ -415,7 +554,7 @@ static double compressBlock(u8 *data, int bsize, int blockIdx) {
                 } else {
                     int chainOverhead = 0;
                     for (int i = 0; i < nPasses; i++)
-                        chainOverhead += ScrambeSizeBits +
+                        chainOverhead += ScrambeSizeBitsG +
                             (passes[i].scan > 0 ? op_overhead(passes[i].op) : 0);
                     double ScrDiff = (before - currentEntropy) * bsize - chainOverhead;
                     printf("  Scramble x%d  ScrDiff=%.1f bits\n", nPasses, ScrDiff);
@@ -457,6 +596,8 @@ int main(void) {
     if (nThreads < 1) nThreads = 1;
     omp_set_num_threads(nThreads);
     printf("Using %d threads\n", nThreads);
+
+    tuneParams(Data, size);
 
     int numBlocks = (size + BLOCK_SIZE - 1) / BLOCK_SIZE;
     printf("Blocks: %d x %d bytes\n", numBlocks, BLOCK_SIZE);
