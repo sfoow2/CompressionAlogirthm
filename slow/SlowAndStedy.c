@@ -501,9 +501,15 @@ static double compressBlock(u8 *data, int bsize, int blockIdx) {
         u8 amp = 0, op = 0;
         int v = FindNextBetter(data, bsize, &amp, &op);
 
+        // 0 = no transform improved entropy at all; mandatory scramble-or-stop.
+        // 1 = transform is unprofitable after overhead; mandatory scramble-or-stop.
+        // 2 = profitable but small gain; try scramble as bonus, keep going even if fails.
+        // 3 = profitable and large gain; no scramble needed, loop immediately.
+        int scrambleMode = 3;
+
         if (v == 0) {
             printf("  no better transform\n");
-            done = 1;
+            scrambleMode = 0;
         } else {
             apply_op_inplace(data, bsize, v, amp, op);
             double empt = byteEntropy(data, bsize);
@@ -513,59 +519,60 @@ static double compressBlock(u8 *data, int bsize, int blockIdx) {
                    op_names[op], v, amp, empt, Difference);
             printHistStats(data, bsize, op_names[op]);
 
-            int tryScramble = 0;
             if (Difference <= 0) {
                 undo_op_inplace(data, bsize, v, amp, op);
-                empt = LastEntropy;
-                tryScramble = 1;
+                scrambleMode = 1;  // mandatory
             } else {
                 totalOverhead += overhead;
                 LastEntropy = empt;
-                if (Difference <= overhead) tryScramble = 1;
+                // Small gain: try scramble as bonus — don't stop if it fails
+                if (Difference < overhead) scrambleMode = 2;
+            }
+        }
+
+        if (scrambleMode <= 2) {
+            double before = byteEntropy(data, bsize);
+            ScrambleStep passes[MAX_SCRAMBLE_PASSES];
+            int nPasses = 0;
+            double currentEntropy = before;
+
+            while (nPasses < MAX_SCRAMBLE_PASSES) {
+                u8 seed, scan, scrAmp, scrOp;
+                FindNextBestScramble(data, bsize, &seed, &scan, &scrAmp, &scrOp);
+                scramble_bytes(data, bsize, seed);
+                if (scan > 0) apply_op_inplace(data, bsize, scan, scrAmp, scrOp);
+                double scrEmpt = byteEntropy(data, bsize);
+                int passOverhead = ScrambeSizeBitsG + (scan > 0 ? op_overhead(scrOp) : 0);
+                double passGain  = (currentEntropy - scrEmpt) * bsize;
+
+                if (passGain <= passOverhead) {
+                    if (scan > 0) undo_op_inplace(data, bsize, scan, scrAmp, scrOp);
+                    unscramble_bytes(data, bsize, seed);
+                    break;
+                }
+                passes[nPasses++] = (ScrambleStep){seed, scan, scrAmp, scrOp};
+                currentEntropy = scrEmpt;
             }
 
-            if (tryScramble) {
-                double before = empt;
-                ScrambleStep passes[MAX_SCRAMBLE_PASSES];
-                int nPasses = 0;
-                double currentEntropy = before;
-
-                while (nPasses < MAX_SCRAMBLE_PASSES) {
-                    u8 seed, scan, scrAmp, scrOp;
-                    FindNextBestScramble(data, bsize, &seed, &scan, &scrAmp, &scrOp);
-                    scramble_bytes(data, bsize, seed);
-                    if (scan > 0) apply_op_inplace(data, bsize, scan, scrAmp, scrOp);
-                    double scrEmpt = byteEntropy(data, bsize);
-                    int passOverhead = ScrambeSizeBitsG + (scan > 0 ? op_overhead(scrOp) : 0);
-                    double passGain  = (currentEntropy - scrEmpt) * bsize;
-
-                    if (passGain <= passOverhead) {
-                        if (scan > 0) undo_op_inplace(data, bsize, scan, scrAmp, scrOp);
-                        unscramble_bytes(data, bsize, seed);
-                        break;
-                    }
-                    passes[nPasses++] = (ScrambleStep){seed, scan, scrAmp, scrOp};
-                    currentEntropy = scrEmpt;
-                }
-
-                if (nPasses == 0) {
-                    printf("  scramble not profitable\n");
-                    done = 1;
-                } else {
-                    int chainOverhead = 0;
-                    for (int i = 0; i < nPasses; i++)
-                        chainOverhead += ScrambeSizeBitsG +
-                            (passes[i].scan > 0 ? op_overhead(passes[i].op) : 0);
-                    double ScrDiff = (before - currentEntropy) * bsize - chainOverhead;
-                    printf("  Scramble x%d  ScrDiff=%.1f bits\n", nPasses, ScrDiff);
-                    for (int i = 0; i < nPasses; i++)
-                        printf("    pass %d: seed=%d [%s stride=%d amp=%d]\n", i + 1,
-                               passes[i].seed,
-                               passes[i].scan > 0 ? op_names[passes[i].op] : "NONE",
-                               passes[i].scan, passes[i].amp);
-                    totalScrambleOverhead += chainOverhead;
-                    LastEntropy = currentEntropy;
-                }
+            if (nPasses == 0) {
+                printf("  scramble not profitable\n");
+                // Only stop if we had no profitable direct transform (modes 0 and 1).
+                // Mode 2 means a profitable transform already ran — keep looping.
+                if (scrambleMode <= 1) done = 1;
+            } else {
+                int chainOverhead = 0;
+                for (int i = 0; i < nPasses; i++)
+                    chainOverhead += ScrambeSizeBitsG +
+                        (passes[i].scan > 0 ? op_overhead(passes[i].op) : 0);
+                double ScrDiff = (before - currentEntropy) * bsize - chainOverhead;
+                printf("  Scramble x%d  ScrDiff=%.1f bits\n", nPasses, ScrDiff);
+                for (int i = 0; i < nPasses; i++)
+                    printf("    pass %d: seed=%d [%s stride=%d amp=%d]\n", i + 1,
+                           passes[i].seed,
+                           passes[i].scan > 0 ? op_names[passes[i].op] : "NONE",
+                           passes[i].scan, passes[i].amp);
+                totalScrambleOverhead += chainOverhead;
+                LastEntropy = currentEntropy;
             }
         }
     }
