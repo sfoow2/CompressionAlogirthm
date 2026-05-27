@@ -476,13 +476,17 @@ int main(void) {
     double rawDrop = totalBitsBefore - totalBitsAfter;
     double overhead = rawDrop - totalNetGain;
     double withInstructions = totalBitsAfter + overhead;
+    double sz = (double)size;
     printf("\n=== Summary ===\n");
-    printf("  %-32s %10.0f bits  (%10.2f bytes)\n",
-           "Original (no reduction):", totalBitsBefore, totalBitsBefore / 8.0);
-    printf("  %-32s %10.0f bits  (%10.2f bytes)\n",
-           "Reduced (data only):", totalBitsAfter, totalBitsAfter / 8.0);
-    printf("  %-32s %10.0f bits  (%10.2f bytes)\n",
-           "Reduced + instructions:", withInstructions, withInstructions / 8.0);
+    printf("  %-32s %10.0f bits  (%10.2f bytes)  %.6f bits/byte\n",
+           "Original (no reduction):", totalBitsBefore, totalBitsBefore / 8.0,
+           totalBitsBefore / sz);
+    printf("  %-32s %10.0f bits  (%10.2f bytes)  %.6f bits/byte\n",
+           "Reduced (data only):", totalBitsAfter, totalBitsAfter / 8.0,
+           totalBitsAfter / sz);
+    printf("  %-32s %10.0f bits  (%10.2f bytes)  %.6f bits/byte\n",
+           "Reduced + instructions:", withInstructions, withInstructions / 8.0,
+           withInstructions / sz);
     printf("  %-32s %10.0f bits  (%10.2f bytes)\n",
            "Net saved:", totalNetGain, totalNetGain / 8.0);
 
