@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <math.h>
+#include <omp.h>
 
 typedef uint8_t u8;
 
@@ -135,51 +136,68 @@ void FindNextBestScramble(u8 *Data, int size, u8 *seed, u8 *Scan, u8 *amp, u8 *o
 }
 
 int FindNextBetter(u8 *Data, int size, u8 *amp, u8 *op) {
-    u8 *Data2 = malloc(size);
-    if (!Data2) { *op = 0; return 0; }
-
     double BestEmpt = byteEntropy(Data, size);
     int BestScan = 0;
     int BestAmp  = 0;
     int BestOp   = 0;
 
-    for (int x = 1; x <= ScanSize; x++) {
+    #pragma omp parallel
+    {
+        u8 *Data2 = malloc(size);
 
-        // one copy per stride; all ops reuse by overwriting only strided positions
-        for (int s = 0; s < size; s++) Data2[s] = Data[s];
+        // each thread tracks its own best; merged into globals at the end
+        double localBestEmpt = BestEmpt;
+        int localScan = 0, localAmp = 0, localOp = 0;
 
-        // ADD + XOR share the same amplitude range and the same copy
-        for (int a = 1; a <= AmpliferScan; a++) {
+        if (Data2) {
+            #pragma omp for schedule(dynamic, 1)
+            for (int x = 1; x <= ScanSize; x++) {
 
-            // ADD
-            for (int p = 0; p < size; p += x) Data2[p] = (u8)(Data[p] + a);
-            double empt = byteEntropy(Data2, size);
-            if (empt < BestEmpt) { BestEmpt = empt; BestScan = x; BestAmp = a; BestOp = 0; }
+                // one copy per stride; all ops reuse by overwriting only strided positions
+                for (int s = 0; s < size; s++) Data2[s] = Data[s];
 
-            // XOR: overwrite only strided positions; non-strided still hold Data[s]
-            for (int p = 0; p < size; p += x) Data2[p] = Data[p] ^ (u8)a;
-            empt = byteEntropy(Data2, size);
-            if (empt < BestEmpt) { BestEmpt = empt; BestScan = x; BestAmp = a; BestOp = 1; }
+                // ADD + XOR share the same amplitude range and the same copy
+                for (int a = 1; a <= AmpliferScan; a++) {
+
+                    for (int p = 0; p < size; p += x) Data2[p] = (u8)(Data[p] + a);
+                    double empt = byteEntropy(Data2, size);
+                    if (empt < localBestEmpt) { localBestEmpt = empt; localScan = x; localAmp = a; localOp = 0; }
+
+                    for (int p = 0; p < size; p += x) Data2[p] = Data[p] ^ (u8)a;
+                    empt = byteEntropy(Data2, size);
+                    if (empt < localBestEmpt) { localBestEmpt = empt; localScan = x; localAmp = a; localOp = 1; }
+                }
+
+                for (int r = 1; r <= 7; r++) {
+                    for (int p = 0; p < size; p += x)
+                        Data2[p] = (u8)((Data[p] << r) | (Data[p] >> (8 - r)));
+                    double empt = byteEntropy(Data2, size);
+                    if (empt < localBestEmpt) { localBestEmpt = empt; localScan = x; localAmp = r; localOp = 2; }
+                }
+
+                for (int a = 3; a <= 255; a += 2) {
+                    for (int p = 0; p < size; p += x)
+                        Data2[p] = (u8)(Data[p] * a);
+                    double empt = byteEntropy(Data2, size);
+                    if (empt < localBestEmpt) { localBestEmpt = empt; localScan = x; localAmp = a; localOp = 3; }
+                }
+            }
+
+            free(Data2);
         }
 
-        // ROL: rotation amounts 1..7 (only 3 bits of overhead)
-        for (int r = 1; r <= 7; r++) {
-            for (int p = 0; p < size; p += x)
-                Data2[p] = (u8)((Data[p] << r) | (Data[p] >> (8 - r)));
-            double empt = byteEntropy(Data2, size);
-            if (empt < BestEmpt) { BestEmpt = empt; BestScan = x; BestAmp = r; BestOp = 2; }
-        }
-
-        // MUL: odd multipliers 3,5,...,255 (skip 1 = identity; all have inverses mod 256)
-        for (int a = 3; a <= 255; a += 2) {
-            for (int p = 0; p < size; p += x)
-                Data2[p] = (u8)(Data[p] * a);
-            double empt = byteEntropy(Data2, size);
-            if (empt < BestEmpt) { BestEmpt = empt; BestScan = x; BestAmp = a; BestOp = 3; }
+        // serialize the merge: one thread at a time updates the shared best
+        #pragma omp critical
+        {
+            if (localBestEmpt < BestEmpt) {
+                BestEmpt = localBestEmpt;
+                BestScan = localScan;
+                BestAmp  = localAmp;
+                BestOp   = localOp;
+            }
         }
     }
 
-    free(Data2);
     *amp = (u8)BestAmp;
     *op  = (u8)BestOp;
     return BestScan;
@@ -203,6 +221,11 @@ int main(void) {
 
     double Starting    = BaseEntropy;
     double LastEntropy = Starting;
+
+    int nThreads = omp_get_max_threads() - 1;
+    if (nThreads < 1) nThreads = 1;
+    omp_set_num_threads(nThreads);
+    printf("Using %d threads\n", nThreads);
 
     srand(88);
     int ScrambleCount = 0;
