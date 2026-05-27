@@ -129,12 +129,35 @@ static void undo_op_inplace(u8 *Data, int size, int stride, u8 amp, u8 op) {
     }
 }
 
+// Paired transforms: split stride-x positions into even {0,2x,4x,...} and odd {x,3x,5x,...},
+// apply op(amp1) to even, op(amp2) to odd. Creates 3 overlapping distributions.
+// Only ADD (0) and XOR (1) are supported (same op for both phases).
+static void apply_paired_op(u8 *Data, int size, int stride, u8 amp1, u8 amp2, u8 op) {
+    for (int p = 0;      p < size; p += 2*stride)
+        Data[p] = (op == 0) ? (u8)(Data[p] + amp1) : Data[p] ^ amp1;
+    for (int p = stride; p < size; p += 2*stride)
+        Data[p] = (op == 0) ? (u8)(Data[p] + amp2) : Data[p] ^ amp2;
+}
+
+static void undo_paired_op(u8 *Data, int size, int stride, u8 amp1, u8 amp2, u8 op) {
+    for (int p = 0;      p < size; p += 2*stride)
+        Data[p] = (op == 0) ? (u8)(Data[p] - amp1) : Data[p] ^ amp1;
+    for (int p = stride; p < size; p += 2*stride)
+        Data[p] = (op == 0) ? (u8)(Data[p] - amp2) : Data[p] ^ amp2;
+}
+
 static int op_overhead(u8 op) {
     // Opcode is now 3 bits (8 ops).
     // ADD/XOR: 8-bit amp; ROL: 3-bit; MUL: 7-bit (odd 3-255);
     // ADDHI/ADDLO: 4-bit amp (1-15); SWXOR: 8-bit (0-255); GFMUL: 8-bit (2-255).
     static const int amp_bits[] = {8, 8, 3, AmplifierSizeBits, 4, 4, 8, 8};
     return ScanSizeBitsG + 3 + amp_bits[op];
+}
+
+static int paired_op_overhead(u8 op) {
+    // Same as op_overhead but with two amp fields (amp1 + amp2) and 1 bit for paired flag.
+    // Only ADD (8-bit amp) and XOR (8-bit amp) are used in paired mode.
+    return ScanSizeBitsG + 3 + 8 + 8 + 1; // stride + opcode + amp1 + amp2 + paired_flag
 }
 
 // ── Scramble ──────────────────────────────────────────────────────────────────
@@ -284,6 +307,78 @@ int FindNextBetter(u8 *Data, int size, u8 *amp, u8 *op) {
 
     *amp = (u8)BestAmp; *op = (u8)BestOp;
     return BestScan;
+}
+
+// Greedy 2-pass paired search: for each stride x and op in {ADD, XOR}:
+//   Pass 1 — find best amp1 for even-indexed stride positions {0, 2x, 4x, ...}
+//   Pass 2 — fix amp1, find best amp2 for odd-indexed positions {x, 3x, 5x, ...}
+// Returns base stride x (or 0 if nothing beats current entropy).
+// Called as a fallback when FindNextBetter fails to find a profitable transform.
+int FindNextBetterPaired(u8 *Data, int size, u8 *amp1_out, u8 *amp2_out, u8 *op_out) {
+    double BestEmpt = byteEntropy(Data, size);
+    int BestStride = 0, BestAmp1 = 0, BestAmp2 = 0, BestOp = 0;
+
+    #pragma omp parallel
+    {
+        u8 *D2 = malloc(size);
+        double localBestEmpt = BestEmpt;
+        int localStride = 0, localAmp1 = 0, localAmp2 = 0, localOp = 0;
+
+        if (D2) {
+            #pragma omp for schedule(dynamic, 1)
+            for (int x = 1; x <= ScanSize; x++) {
+                for (int op = 0; op <= 1; op++) { // ADD and XOR
+                    for (int s = 0; s < size; s++) D2[s] = Data[s];
+
+                    // Pass 1: find best amp1 for even-indexed positions {0,2x,4x,...}
+                    // Odd-indexed positions remain at original values during this pass.
+                    double p1bestE = localBestEmpt;
+                    int p1bestA = 0;
+                    for (int a1 = 1; a1 <= 255; a1++) {
+                        for (int p = 0; p < size; p += 2*x)
+                            D2[p] = (op == 0) ? (u8)(Data[p] + a1) : Data[p] ^ (u8)a1;
+                        double e = byteEntropy(D2, size);
+                        if (e < p1bestE) { p1bestE = e; p1bestA = a1; }
+                    }
+                    if (!p1bestA) continue;
+
+                    // Fix even positions with best amp1
+                    for (int p = 0; p < size; p += 2*x)
+                        D2[p] = (op == 0) ? (u8)(Data[p] + p1bestA) : Data[p] ^ (u8)p1bestA;
+
+                    // Pass 2: find best amp2 for odd-indexed positions {x,3x,5x,...}
+                    // amp2=0 is valid: means only even positions are transformed (like a
+                    // stride-2x single transform, reaching strides beyond ScanSize).
+                    for (int a2 = 0; a2 <= 255; a2++) {
+                        for (int p = x; p < size; p += 2*x)
+                            D2[p] = (op == 0) ? (u8)(Data[p] + a2) : Data[p] ^ (u8)a2;
+                        double e = byteEntropy(D2, size);
+                        if (e < localBestEmpt) {
+                            localBestEmpt = e; localStride = x;
+                            localAmp1 = p1bestA; localAmp2 = a2; localOp = op;
+                        }
+                    }
+                }
+            }
+            free(D2);
+        }
+
+        #pragma omp critical
+        {
+            if (localBestEmpt < BestEmpt) {
+                BestEmpt   = localBestEmpt;
+                BestStride = localStride;
+                BestAmp1   = localAmp1;
+                BestAmp2   = localAmp2;
+                BestOp     = localOp;
+            }
+        }
+    }
+
+    *amp1_out = (u8)BestAmp1;
+    *amp2_out = (u8)BestAmp2;
+    *op_out   = (u8)BestOp;
+    return BestStride;
 }
 
 // ── BWT ──────────────────────────────────────────────────────────────────────
@@ -619,6 +714,31 @@ static double compressBlock(u8 *data, int bsize, int blockIdx) {
                 LastEntropy = empt;
                 // Small gain: try scramble as bonus — don't stop if it fails
                 if (Difference < overhead) scrambleMode = 2;
+            }
+        }
+
+        // When the single transform failed (modes 0 and 1), try a paired transform
+        // before resorting to scramble. Paired applies different amplitudes to the
+        // even- and odd-indexed positions within the stride, creating 3 overlapping
+        // distributions instead of 2 — potentially bigger histogram peaks.
+        if (scrambleMode <= 1) {
+            u8 pa1 = 0, pa2 = 0, pop = 0;
+            int pv = FindNextBetterPaired(data, bsize, &pa1, &pa2, &pop);
+            if (pv > 0) {
+                apply_paired_op(data, bsize, pv, pa1, pa2, pop);
+                double pempt = byteEntropy(data, bsize);
+                int poh = paired_op_overhead(pop);
+                double pDiff = (LastEntropy - pempt) * bsize - poh;
+                printf("  [%s* stride=%d amp1=%d amp2=%d] entropy=%.4f  profit=%.1f\n",
+                       pop == 0 ? "ADD" : "XOR", pv, pa1, pa2, pempt, pDiff);
+                if (pDiff <= 0) {
+                    undo_paired_op(data, bsize, pv, pa1, pa2, pop);
+                    // scrambleMode stays ≤ 1; proceeds to scramble below
+                } else {
+                    totalOverhead += poh;
+                    LastEntropy    = pempt;
+                    scrambleMode   = (pDiff < poh) ? 2 : 3;
+                }
             }
         }
 
