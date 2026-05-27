@@ -22,7 +22,34 @@ int ScrambeSizeBitsG = ScrambeSizeBits; // runtime-tunable
 
 int FindNextBetter(u8 *Data, int size, u8 *amp, u8 *op);
 
-static const char *op_names[] = {"ADD", "XOR", "ROL", "MUL"};
+// GF(256) tables — primitive polynomial 0x1B (x^8+x^4+x^3+x+1, AES field).
+// gf_exp[i] = generator^i; gf_log[x] = discrete log; gf_inv[x] = 1/x.
+// Initialized once by init_gf256() before any compression.
+static u8 gf_exp[512]; // doubled to avoid mod-255 in multiply
+static u8 gf_log[256];
+static u8 gf_inv[256];
+
+static void init_gf256(void) {
+    u8 x = 1;
+    for (int i = 0; i < 255; i++) {
+        gf_exp[i] = x;
+        gf_log[x] = (u8)i;
+        u8 xhi = (x & 0x80) ? ((x << 1) ^ 0x1B) : (x << 1); // x * 2
+        x = xhi ^ x; // x * 3 (generator)
+    }
+    for (int i = 255; i < 512; i++) gf_exp[i] = gf_exp[i - 255];
+    gf_log[0] = 0; // undefined; never used in mul (zero stays zero)
+    gf_inv[0] = 0;
+    gf_inv[1] = 1;
+    for (int a = 2; a < 256; a++) gf_inv[a] = gf_exp[255 - gf_log[a]];
+}
+
+static inline u8 gf_mul(u8 a, u8 b) {
+    if (!a || !b) return 0;
+    return gf_exp[(int)gf_log[a] + gf_log[b]];
+}
+
+static const char *op_names[] = {"ADD", "XOR", "ROL", "MUL", "ADDHI", "ADDLO", "SWXOR", "GFMUL"};
 
 typedef struct { u8 seed, scan, amp, op; } ScrambleStep;
 
@@ -78,26 +105,36 @@ static void apply_op_inplace(u8 *Data, int size, int stride, u8 amp, u8 op) {
             case 1: Data[p] ^= amp; break;
             case 2: Data[p] = (u8)((Data[p] << amp) | (Data[p] >> (8 - amp))); break;
             case 3: Data[p] = (u8)(Data[p] * amp); break;
+            case 4: Data[p] = (u8)((((Data[p] >> 4) + amp) & 0xF) << 4 | (Data[p] & 0x0F)); break;
+            case 5: Data[p] = (u8)((Data[p] & 0xF0) | ((Data[p] + amp) & 0x0F)); break;
+            case 6: { u8 s = (Data[p] << 4) | (Data[p] >> 4); Data[p] = s ^ amp; } break;
+            case 7: Data[p] = gf_mul(Data[p], amp); break;
         }
     }
 }
 
 static void undo_op_inplace(u8 *Data, int size, int stride, u8 amp, u8 op) {
-    u8 inv = (op == 3) ? mul_inverse_byte(amp) : 0;
+    u8 inv = (op == 3) ? mul_inverse_byte(amp) : (op == 7) ? gf_inv[amp] : 0;
     for (int p = 0; p < size; p += stride) {
         switch (op) {
             case 0: Data[p] -= amp; break;
             case 1: Data[p] ^= amp; break;
             case 2: Data[p] = (u8)((Data[p] >> amp) | (Data[p] << (8 - amp))); break;
             case 3: Data[p] = (u8)(Data[p] * inv); break;
+            case 4: Data[p] = (u8)((((Data[p] >> 4) - amp) & 0xF) << 4 | (Data[p] & 0x0F)); break;
+            case 5: Data[p] = (u8)((Data[p] & 0xF0) | ((Data[p] - amp) & 0x0F)); break;
+            case 6: { u8 t = Data[p] ^ amp; Data[p] = (t << 4) | (t >> 4); } break;
+            case 7: Data[p] = gf_mul(Data[p], inv); break;
         }
     }
 }
 
 static int op_overhead(u8 op) {
-    // ADD/XOR: 8-bit amp (1-255); ROL: 3-bit (1-7); MUL: 7-bit index into odd values 3-255
-    static const int amp_bits[] = {8, 8, 3, AmplifierSizeBits};
-    return ScanSizeBitsG + 2 + amp_bits[op];
+    // Opcode is now 3 bits (8 ops).
+    // ADD/XOR: 8-bit amp; ROL: 3-bit; MUL: 7-bit (odd 3-255);
+    // ADDHI/ADDLO: 4-bit amp (1-15); SWXOR: 8-bit (0-255); GFMUL: 8-bit (2-255).
+    static const int amp_bits[] = {8, 8, 3, AmplifierSizeBits, 4, 4, 8, 8};
+    return ScanSizeBitsG + 3 + amp_bits[op];
 }
 
 // ── Scramble ──────────────────────────────────────────────────────────────────
@@ -192,6 +229,43 @@ int FindNextBetter(u8 *Data, int size, u8 *amp, u8 *op) {
                         Data2[p] = (u8)(Data[p] * a);
                     double empt = byteEntropy(Data2, size);
                     if (empt < localBestEmpt) { localBestEmpt = empt; localScan = x; localAmp = a; localOp = 3; }
+                }
+
+                // Op 4: ADDHI — add amp (1-15) to high nibble only
+                for (int a = 1; a <= 15; a++) {
+                    for (int p = 0; p < size; p += x)
+                        Data2[p] = (u8)((((Data[p] >> 4) + a) & 0xF) << 4 | (Data[p] & 0x0F));
+                    double empt = byteEntropy(Data2, size);
+                    if (empt < localBestEmpt) { localBestEmpt = empt; localScan = x; localAmp = a; localOp = 4; }
+                }
+
+                // Op 5: ADDLO — add amp (1-15) to low nibble only
+                for (int a = 1; a <= 15; a++) {
+                    for (int p = 0; p < size; p += x)
+                        Data2[p] = (u8)((Data[p] & 0xF0) | ((Data[p] + a) & 0x0F));
+                    double empt = byteEntropy(Data2, size);
+                    if (empt < localBestEmpt) { localBestEmpt = empt; localScan = x; localAmp = a; localOp = 5; }
+                }
+
+                // Op 6: SWXOR — swap nibbles then XOR amp (0-255); amp=0 is pure nibble swap
+                for (int a = 0; a <= 255; a++) {
+                    for (int p = 0; p < size; p += x)
+                        Data2[p] = (u8)(((Data[p] << 4) | (Data[p] >> 4)) ^ a);
+                    double empt = byteEntropy(Data2, size);
+                    if (empt < localBestEmpt) { localBestEmpt = empt; localScan = x; localAmp = a; localOp = 6; }
+                }
+
+                // Op 7: GFMUL — GF(256) multiply by amp (2-255, skip 1=identity)
+                {
+                    u8 lut[256];
+                    for (int a = 2; a <= 255; a++) {
+                        lut[0] = 0;
+                        for (int v = 1; v < 256; v++)
+                            lut[v] = gf_exp[(int)gf_log[v] + gf_log[a]];
+                        for (int p = 0; p < size; p += x) Data2[p] = lut[Data[p]];
+                        double empt = byteEntropy(Data2, size);
+                        if (empt < localBestEmpt) { localBestEmpt = empt; localScan = x; localAmp = a; localOp = 7; }
+                    }
                 }
             }
             free(Data2);
@@ -589,6 +663,7 @@ static double compressBlock(u8 *data, int bsize, int blockIdx) {
 }
 
 int main(void) {
+    init_gf256();
     srand(5);
 
     int size = 1024 * 1024;
