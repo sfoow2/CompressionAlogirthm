@@ -38,6 +38,31 @@ static double byteEntropy(const u8 *d, int n) {
     return e;
 }
 
+// Prints histogram shape: zero buckets, peak height, and top-5 most frequent values.
+// Reveals how "collisions" concentrate the distribution.
+static void printHistStats(const u8 *d, int n, const char *label) {
+    int freq[256] = {0};
+    for (int i = 0; i < n; i++) freq[d[i]]++;
+
+    int zeros = 0, maxFreq = 0;
+    for (int i = 0; i < 256; i++) {
+        if (!freq[i]) zeros++;
+        if (freq[i] > maxFreq) maxFreq = freq[i];
+    }
+
+    int used[256] = {0};
+    printf("  hist[%s] zeros=%d  peak=%d(%.2fx mean)  top5:", label, zeros, maxFreq,
+           maxFreq * 256.0 / n);
+    for (int k = 0; k < 5; k++) {
+        int best = 0, bestF = -1;
+        for (int i = 0; i < 256; i++)
+            if (!used[i] && freq[i] > bestF) { bestF = freq[i]; best = i; }
+        printf(" %02X:%d", best, bestF);
+        used[best] = 1;
+    }
+    printf("\n");
+}
+
 static u8 mul_inverse_byte(u8 a) {
     for (int b = 1; b <= 255; b += 2)
         if ((u8)(a * b) == 1) return (u8)b;
@@ -68,7 +93,8 @@ static void undo_op_inplace(u8 *Data, int size, int stride, u8 amp, u8 op) {
 }
 
 static int op_overhead(u8 op) {
-    static const int amp_bits[] = {AmplifierSizeBits, AmplifierSizeBits, 3, AmplifierSizeBits};
+    // ADD/XOR: 8-bit amp (1-255); ROL: 3-bit (1-7); MUL: 7-bit index into odd values 3-255
+    static const int amp_bits[] = {8, 8, 3, AmplifierSizeBits};
     return ScanSizeBits + 2 + amp_bits[op];
 }
 
@@ -142,7 +168,7 @@ int FindNextBetter(u8 *Data, int size, u8 *amp, u8 *op) {
             for (int x = 1; x <= ScanSize; x++) {
                 for (int s = 0; s < size; s++) Data2[s] = Data[s];
 
-                for (int a = 1; a <= AmpliferScan; a++) {
+                for (int a = 1; a <= 255; a++) {
                     for (int p = 0; p < size; p += x) Data2[p] = (u8)(Data[p] + a);
                     double empt = byteEntropy(Data2, size);
                     if (empt < localBestEmpt) { localBestEmpt = empt; localScan = x; localAmp = a; localOp = 0; }
@@ -309,17 +335,19 @@ static void mtf_inverse(u8 *data, int n) {
 
 // ── Block processing ──────────────────────────────────────────────────────────
 
-static void compressBlock(u8 *data, int bsize, int blockIdx) {
+static double compressBlock(u8 *data, int bsize, int blockIdx) {
     double baseEntropy = byteEntropy(data, bsize);
     printf("\n=== Block %d (%d bytes)  base=%.4f bits/byte ===\n",
            blockIdx, bsize, baseEntropy);
 
     // BWT + MTF as pre-processing step
+    printHistStats(data, bsize, "base");
     int primary_index = 0;
     bwt_forward(data, bsize, &primary_index);
     double afterBWT = byteEntropy(data, bsize);
     mtf_forward(data, bsize);
     double afterMTF = byteEntropy(data, bsize);
+    printHistStats(data, bsize, "BWT+MTF");
 
     printf("  BWT: %.4f -> %.4f   MTF: -> %.4f   gain=%.1f bits  overhead=%d bits\n",
            baseEntropy, afterBWT, afterMTF,
@@ -344,6 +372,7 @@ static void compressBlock(u8 *data, int bsize, int blockIdx) {
             double Difference = (LastEntropy - empt) * bsize - overhead;
             printf("  [%s stride=%d amp=%d] entropy=%.4f  profit=%.1f\n",
                    op_names[op], v, amp, empt, Difference);
+            printHistStats(data, bsize, op_names[op]);
 
             int tryScramble = 0;
             if (Difference <= 0) {
@@ -404,11 +433,13 @@ static void compressBlock(u8 *data, int bsize, int blockIdx) {
 
     double ending  = byteEntropy(data, bsize);
     double netGain = (baseEntropy - ending) * bsize - totalOverhead - totalScrambleOverhead;
+    printHistStats(data, bsize, "final");
     printf("  Block %d done: %.4f -> %.4f  net_gain=%.1f bits"
            "  (overhead %d + %d scramble = %d bits)\n",
            blockIdx, baseEntropy, ending, netGain,
            totalOverhead, totalScrambleOverhead,
            totalOverhead + totalScrambleOverhead);
+    return netGain;
 }
 
 int main(void) {
@@ -430,7 +461,7 @@ int main(void) {
     int numBlocks = (size + BLOCK_SIZE - 1) / BLOCK_SIZE;
     printf("Blocks: %d x %d bytes\n", numBlocks, BLOCK_SIZE);
 
-    double totalBitsBefore = 0.0, totalBitsAfter = 0.0;
+    double totalBitsBefore = 0.0, totalBitsAfter = 0.0, totalNetGain = 0.0;
 
     for (int b = 0; b < numBlocks; b++) {
         int offset = b * BLOCK_SIZE;
@@ -438,14 +469,22 @@ int main(void) {
         u8 *block  = Data + offset;
 
         totalBitsBefore += byteEntropy(block, bsize) * bsize;
-        compressBlock(block, bsize, b);
+        totalNetGain    += compressBlock(block, bsize, b);
         totalBitsAfter  += byteEntropy(block, bsize) * bsize;
     }
 
+    double rawDrop = totalBitsBefore - totalBitsAfter;
+    double overhead = rawDrop - totalNetGain;
+    double withInstructions = totalBitsAfter + overhead;
     printf("\n=== Summary ===\n");
-    printf("Total bits before: %.0f\n", totalBitsBefore);
-    printf("Total bits after:  %.0f\n", totalBitsAfter);
-    printf("Total reduction:   %.0f bits\n", totalBitsBefore - totalBitsAfter);
+    printf("  %-32s %10.0f bits  (%10.2f bytes)\n",
+           "Original (no reduction):", totalBitsBefore, totalBitsBefore / 8.0);
+    printf("  %-32s %10.0f bits  (%10.2f bytes)\n",
+           "Reduced (data only):", totalBitsAfter, totalBitsAfter / 8.0);
+    printf("  %-32s %10.0f bits  (%10.2f bytes)\n",
+           "Reduced + instructions:", withInstructions, withInstructions / 8.0);
+    printf("  %-32s %10.0f bits  (%10.2f bytes)\n",
+           "Net saved:", totalNetGain, totalNetGain / 8.0);
 
     free(Data);
     return 0;
