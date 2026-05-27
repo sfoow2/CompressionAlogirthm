@@ -543,7 +543,7 @@ static void tuneParams(const u8 *data, int size) {
     double bestScanGain = -1e18;
 
     printf("  ScanSize (5-iter probe, BWT+MTF base):\n");
-    for (int sb = 2; sb <= 5; sb++) {
+    for (int sb = 2; sb <= 8; sb++) {
         u8 *copy = malloc(sample);
         if (!copy) continue;
         memcpy(copy, base, sample);
@@ -570,14 +570,14 @@ static void tuneParams(const u8 *data, int size) {
         }
 
         double netGain = (baseE - curE) * sample - totalOH;
-        printf("    ScanSize=%2d (bits=%d): net_gain=%.1f bits%s\n",
+        printf("    ScanSize=%3d (bits=%d): net_gain=%.1f bits%s\n",
                1 << sb, sb, netGain, sb == ScanSizeBits ? " [default]" : "");
         if (netGain > bestScanGain) { bestScanGain = netGain; bestScanBits = sb; }
         free(copy);
     }
     ScanSizeBitsG = bestScanBits;
     ScanSize      = 1 << bestScanBits;
-    printf("    => ScanSize=%d (bits=%d)\n", ScanSize, ScanSizeBitsG);
+    printf("    => ScanSize=%3d (bits=%d)\n", ScanSize, ScanSizeBitsG);
     free(base);
 
     // ── Phase 2: tune ScrambeBits ─────────────────────────────────────────────
@@ -609,7 +609,7 @@ static void tuneParams(const u8 *data, int size) {
         double bestScrGain = -1e18;
 
         printf("  ScrambleSize (post-transform state):\n");
-        for (int scb = 2; scb <= 5; scb++) {
+        for (int scb = 2; scb <= 8; scb++) {
             ScrambeSizeBitsG = scb;
             ScrambleSize     = 1 << scb;
 
@@ -626,14 +626,14 @@ static void tuneParams(const u8 *data, int size) {
             int    oh   = ScrambeSizeBitsG + (scan > 0 ? op_overhead(scrOp) : 0);
             double gain = (postE - scrE) * scrSample - oh;
 
-            printf("    ScrambleSize=%2d (bits=%d): gain=%.1f bits%s\n",
+            printf("    ScrambleSize=%3d (bits=%d): gain=%.1f bits%s\n",
                    1 << scb, scb, gain, scb == ScrambeSizeBits ? " [default]" : "");
             if (gain > bestScrGain) { bestScrGain = gain; bestScrBits = scb; }
             free(scopy);
         }
         ScrambeSizeBitsG = bestScrBits;
         ScrambleSize     = 1 << bestScrBits;
-        printf("    => ScrambleSize=%d (bits=%d)\n", ScrambleSize, ScrambeSizeBitsG);
+        printf("    => ScrambleSize=%3d (bits=%d)\n", ScrambleSize, ScrambeSizeBitsG);
         free(post);
     }
 
