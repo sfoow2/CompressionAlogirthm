@@ -9,7 +9,7 @@ typedef uint8_t u8;
 
 #define ScrambeSizeBits     4
 #define ScanSizeBits        4
-#define AmplifierSizeBits   7
+#define AmplifierSizeBits   8
 #define MAX_SCRAMBLE_PASSES 8
 #define BLOCK_SIZE          (64 * 1024)
 #define BWT_OVERHEAD_BITS   32
@@ -69,6 +69,7 @@ typedef struct {
 } BlockEvent;
 
 typedef struct {
+    u8  delta_applied;
     u8  bwt_applied;
     int bwt_pi;
     int n_events;
@@ -707,6 +708,392 @@ static void write_instructions_to_file(FILE *f, BlockRecord *records, int numBlo
     }
 }
 
+// ── BitWriter / BitReader ─────────────────────────────────────────────────────
+// LSB-first packing: bw_put writes bit0 of val first, bw_get reads bit0 first.
+
+typedef struct { u8 *buf; int cap, nbytes, bit; } BitWriter;
+typedef struct { const u8 *buf; int len, pos, bit; } BitReader;
+
+static void bw_init(BitWriter *bw) {
+    bw->cap = 65536; bw->nbytes = 0; bw->bit = 0;
+    bw->buf = malloc(bw->cap);
+    if (bw->buf) bw->buf[0] = 0;
+}
+
+static void bw_put(BitWriter *bw, uint32_t val, int nbits) {
+    for (int i = 0; i < nbits; i++) {
+        if (bw->bit == 0) {
+            if (bw->nbytes + 2 >= bw->cap) {
+                bw->cap *= 2;
+                bw->buf = realloc(bw->buf, bw->cap);
+            }
+            bw->buf[bw->nbytes] = 0;
+        }
+        bw->buf[bw->nbytes] |= ((val >> i) & 1) << bw->bit;
+        if (++bw->bit == 8) { bw->nbytes++; bw->bit = 0; }
+    }
+}
+
+static int bw_finish(BitWriter *bw) {
+    if (bw->bit > 0) bw->nbytes++;
+    return bw->nbytes;
+}
+
+static void br_init(BitReader *br, const u8 *buf, int len) {
+    br->buf = buf; br->len = len; br->pos = 0; br->bit = 0;
+}
+
+static uint32_t br_get(BitReader *br, int nbits) {
+    uint32_t val = 0;
+    for (int i = 0; i < nbits; i++) {
+        if (br->pos >= br->len) break;
+        val |= ((uint32_t)(br->buf[br->pos] >> br->bit) & 1) << i;
+        if (++br->bit == 8) { br->bit = 0; br->pos++; }
+    }
+    return val;
+}
+
+// Peek up to 15 bits without advancing (for Huffman decode LUT lookup)
+static uint32_t br_peek15(const BitReader *br) {
+    uint32_t v = 0; int bits = 0;
+    int pos = br->pos, bit = br->bit;
+    while (bits < 15 && pos < br->len) {
+        v |= (uint32_t)((br->buf[pos] >> bit) & 1) << bits++;
+        if (++bit == 8) { bit = 0; pos++; }
+    }
+    return v;
+}
+
+static void br_skip(BitReader *br, int nbits) {
+    int total = br->bit + nbits;
+    br->pos += total / 8;
+    br->bit  = total % 8;
+}
+
+// ── Huffman ───────────────────────────────────────────────────────────────────
+
+#define MAX_HUFF_LEN 15
+
+typedef struct { int code_len[256]; uint32_t code[256]; } HuffTable;
+typedef struct { u8 sym; u8 len; } HuffEntry;
+
+// Sort by (code_len, sym) and assign canonical codes (LSB-first).
+// Symbols with code_len==0 are skipped (but we ensure all 256 have len>0).
+static void huff_assign_canonical(HuffTable *h, const int cl[256]) {
+    int order[256];
+    for (int i = 0; i < 256; i++) order[i] = i;
+    for (int i = 1; i < 256; i++) {
+        int k = order[i], j = i - 1;
+        while (j >= 0 && (cl[order[j]] > cl[k] ||
+               (cl[order[j]] == cl[k] && order[j] > k)))
+            { order[j+1] = order[j]; j--; }
+        order[j+1] = k;
+    }
+    uint32_t code = 0; int prev = 0;
+    for (int i = 0; i < 256; i++) {
+        int s = order[i], l = cl[s];
+        h->code_len[s] = l;
+        if (l == 0) { h->code[s] = 0; continue; }
+        code <<= (l - prev);
+        // Bit-reverse the canonical (MSB-first) code for LSB-first bit packing.
+        // bw_put writes bit0 first; without reversal, short codes become prefixes
+        // of longer codes in the stream, breaking the prefix-free property.
+        uint32_t c = code, rev = 0;
+        for (int b = 0; b < l; b++) rev |= ((c >> b) & 1) << (l - 1 - b);
+        h->code[s] = rev;
+        code++;
+        prev = l;
+    }
+}
+
+static void huff_build(HuffTable *h, const u8 *data, int n) {
+    int freq[256] = {0};
+    for (int i = 0; i < n; i++) freq[data[i]]++;
+
+    // Build Huffman tree using 512-node pool, O(n^2) merge (n=256 — fine).
+    typedef struct { int freq, sym, left, right; } HN;
+    static HN   nd[512];
+    static int  ac[512];
+    int nn = 0, nact = 0;
+    for (int i = 0; i < 256; i++) {
+        nd[nn] = (HN){freq[i] ? freq[i] : 1, i, -1, -1};
+        ac[nn++] = 1; nact++;
+    }
+    int root = 0;
+    while (nact > 1) {
+        int m1 = -1, m2 = -1;
+        for (int i = 0; i < nn; i++) {
+            if (!ac[i]) continue;
+            if (m1 < 0 || nd[i].freq < nd[m1].freq) { m2 = m1; m1 = i; }
+            else if (m2 < 0 || nd[i].freq < nd[m2].freq) m2 = i;
+        }
+        nd[nn] = (HN){nd[m1].freq + nd[m2].freq, -1, m1, m2};
+        ac[m1] = ac[m2] = 0; ac[nn] = 1; root = nn++; nact--;
+    }
+    // Iterative DFS to compute code lengths
+    int cl[256] = {0};
+    static int stk[512], dep[512]; int sp = 0;
+    stk[sp] = root; dep[sp++] = 0;
+    while (sp > 0) {
+        int node = stk[--sp], d = dep[sp];
+        if (nd[node].sym >= 0) { cl[nd[node].sym] = d; continue; }
+        if (nd[node].left  >= 0) { stk[sp] = nd[node].left;  dep[sp++] = d+1; }
+        if (nd[node].right >= 0) { stk[sp] = nd[node].right; dep[sp++] = d+1; }
+    }
+    // If any code exceeds MAX_HUFF_LEN, fall back to flat 8-bit codes.
+    for (int i = 0; i < 256; i++) if (cl[i] > MAX_HUFF_LEN) {
+        for (int j = 0; j < 256; j++) cl[j] = 8; break;
+    }
+    huff_assign_canonical(h, cl);
+}
+
+static void huff_write_table(const HuffTable *h, BitWriter *bw) {
+    for (int i = 0; i < 256; i++) bw_put(bw, (uint32_t)h->code_len[i], 4);
+}
+
+static void huff_read_table(HuffTable *h, BitReader *br) {
+    int cl[256];
+    for (int i = 0; i < 256; i++) cl[i] = (int)br_get(br, 4);
+    huff_assign_canonical(h, cl);
+}
+
+// Build a 2^MAX_HUFF_LEN lookup table for O(1) decode.
+// For a symbol with code c of length l, fill lut[c|(j<<l)] for j=0..2^(MAX-l)-1.
+static void huff_build_lut(const HuffTable *h, HuffEntry lut[1 << MAX_HUFF_LEN]) {
+    memset(lut, 0, (1 << MAX_HUFF_LEN) * sizeof(HuffEntry));
+    for (int s = 0; s < 256; s++) {
+        int l = h->code_len[s];
+        if (l == 0 || l > MAX_HUFF_LEN) continue;
+        int fill = 1 << (MAX_HUFF_LEN - l);
+        uint32_t base = h->code[s];
+        for (int j = 0; j < fill; j++)
+            lut[base | ((uint32_t)j << l)] = (HuffEntry){(u8)s, (u8)l};
+    }
+}
+
+static void huff_encode(const HuffTable *h, const u8 *data, int n, BitWriter *bw) {
+    for (int i = 0; i < n; i++) bw_put(bw, h->code[data[i]], h->code_len[data[i]]);
+}
+
+static int huff_decode(const HuffTable *h, BitReader *br, u8 *out, int n) {
+    static HuffEntry lut[1 << MAX_HUFF_LEN];
+    huff_build_lut(h, lut);
+    for (int i = 0; i < n; i++) {
+        uint32_t peek = br_peek15(br);
+        HuffEntry e = lut[peek];
+        if (e.len == 0) return 0;
+        out[i] = e.sym;
+        br_skip(br, e.len);
+    }
+    return 1;
+}
+
+// Expected encoded bit count (excluding table overhead)
+static int huff_encoded_bits(const HuffTable *h, const u8 *data, int n) {
+    int freq[256] = {0}, total = 0;
+    for (int i = 0; i < n; i++) freq[data[i]]++;
+    for (int i = 0; i < 256; i++) total += freq[i] * h->code_len[i];
+    return total;
+}
+
+// ── Delta filter ──────────────────────────────────────────────────────────────
+// Sequential difference: data[i] -= data[i-1] (mod 256).
+// Excellent for audio, counters, sequential values. Zero cost on random data.
+
+static void delta_fwd(u8 *d, int n) { for (int i=n-1;i>0;i--) d[i]=(u8)(d[i]-d[i-1]); }
+static void delta_inv(u8 *d, int n) { for (int i=1;i<n;i++) d[i]=(u8)(d[i]+d[i-1]); }
+
+// ── Instruction bit-packing ───────────────────────────────────────────────────
+
+static const int _abits[8] = {8, 8, 3, AmplifierSizeBits, 4, 4, 8, 8};
+
+static void write_instr(BitWriter *bw, const BlockRecord *rec) {
+    bw_put(bw, rec->delta_applied, 1);
+    bw_put(bw, rec->bwt_applied, 1);
+    if (rec->bwt_applied) bw_put(bw, (uint32_t)rec->bwt_pi, 16);
+    bw_put(bw, (uint32_t)rec->n_events, 8);
+    for (int i = 0; i < rec->n_events; i++) {
+        const BlockEvent *ev = &rec->events[i];
+        bw_put(bw, ev->type, 1);
+        if (ev->type == EVENT_TRANSFORM) {
+            bw_put(bw, ev->is_paired, 1);
+            bw_put(bw, (uint32_t)(ev->stride - 1), ScanSizeBitsG);
+            bw_put(bw, ev->op, 3);
+            bw_put(bw, ev->amp, _abits[ev->op]);
+            if (ev->is_paired) bw_put(bw, ev->amp2, 8);
+        } else {
+            bw_put(bw, (uint32_t)ev->n_passes, 4);
+            for (int j = 0; j < ev->n_passes; j++) {
+                const ScrambleStep *p = &ev->passes[j];
+                bw_put(bw, p->seed, ScrambeSizeBitsG);
+                bw_put(bw, p->scan > 0 ? 1u : 0u, 1);
+                if (p->scan > 0) {
+                    bw_put(bw, (uint32_t)(p->scan - 1), ScanSizeBitsG);
+                    bw_put(bw, p->op, 3);
+                    bw_put(bw, p->amp, _abits[p->op]);
+                }
+            }
+        }
+    }
+}
+
+static void read_instr(BitReader *br, BlockRecord *rec) {
+    memset(rec, 0, sizeof(*rec));
+    rec->delta_applied = (u8)br_get(br, 1);
+    rec->bwt_applied   = (u8)br_get(br, 1);
+    if (rec->bwt_applied) rec->bwt_pi = (int)br_get(br, 16);
+    rec->n_events = (int)br_get(br, 8);
+    for (int i = 0; i < rec->n_events; i++) {
+        BlockEvent *ev = &rec->events[i];
+        ev->type = (u8)br_get(br, 1);
+        if (ev->type == EVENT_TRANSFORM) {
+            ev->is_paired = (u8)br_get(br, 1);
+            ev->stride = (int)br_get(br, ScanSizeBitsG) + 1;
+            ev->op  = (u8)br_get(br, 3);
+            ev->amp = (u8)br_get(br, _abits[ev->op]);
+            if (ev->is_paired) ev->amp2 = (u8)br_get(br, 8);
+        } else {
+            ev->n_passes = (int)br_get(br, 4);
+            for (int j = 0; j < ev->n_passes; j++) {
+                ScrambleStep *p = &ev->passes[j];
+                p->seed = (u8)br_get(br, ScrambeSizeBitsG);
+                if (br_get(br, 1)) {
+                    p->scan = (u8)(br_get(br, ScanSizeBitsG) + 1);
+                    p->op   = (u8)br_get(br, 3);
+                    p->amp  = (u8)br_get(br, _abits[p->op]);
+                }
+            }
+        }
+    }
+}
+
+// ── Undo block transforms ─────────────────────────────────────────────────────
+
+static void undo_block(u8 *data, int bsize, const BlockRecord *rec) {
+    // Undo events in reverse application order
+    for (int i = rec->n_events - 1; i >= 0; i--) {
+        const BlockEvent *ev = &rec->events[i];
+        if (ev->type == EVENT_TRANSFORM) {
+            if (ev->is_paired)
+                undo_paired_op(data, bsize, ev->stride, ev->amp, ev->amp2, ev->op);
+            else
+                undo_op_inplace(data, bsize, ev->stride, ev->amp, ev->op);
+        } else {
+            // Scramble chain: undo passes in reverse
+            for (int j = ev->n_passes - 1; j >= 0; j--) {
+                const ScrambleStep *p = &ev->passes[j];
+                if (p->scan > 0) undo_op_inplace(data, bsize, p->scan, p->amp, p->op);
+                unscramble_bytes(data, bsize, p->seed);
+            }
+        }
+    }
+    if (rec->bwt_applied) { mtf_inverse(data, bsize); bwt_inverse(data, bsize, rec->bwt_pi); }
+    if (rec->delta_applied) delta_inv(data, bsize);
+}
+
+// ── Compress / Decompress ─────────────────────────────────────────────────────
+// File format:
+//   "CPR\x01" (4 bytes magic+version)
+//   numBlocks: uint16_le
+//   total_size: uint32_le
+//   ScanSizeBitsG: uint8
+//   ScrambeSizeBitsG: uint8
+//   [global bitstream: all blocks concatenated, bit-packed]
+//     Per block:
+//       [bit-packed instructions]
+//       use_huffman: 1 bit
+//       if huffman: [256×4-bit table][huffman-encoded data]
+//       else:       [raw data bytes × 8 bits]
+
+#define CPR_MAGIC "CPR\x01"
+
+static long compress_to_file(const char *fn, const u8 *reduced, int total_size,
+                              const BlockRecord *records, int numBlocks) {
+    BitWriter bw; bw_init(&bw);
+    HuffTable ht;
+
+    for (int b = 0; b < numBlocks; b++) {
+        int off   = b * BLOCK_SIZE;
+        int bsize = (off + BLOCK_SIZE <= total_size) ? BLOCK_SIZE : (total_size - off);
+        const u8 *blk = reduced + off;
+
+        write_instr(&bw, &records[b]);
+
+        huff_build(&ht, blk, bsize);
+        int hbits  = huff_encoded_bits(&ht, blk, bsize);
+        int use_hf = (hbits + 256*4 < bsize * 8) ? 1 : 0;
+
+        bw_put(&bw, (uint32_t)use_hf, 1);
+        if (use_hf) {
+            huff_write_table(&ht, &bw);
+            huff_encode(&ht, blk, bsize, &bw);
+        } else {
+            for (int i = 0; i < bsize; i++) bw_put(&bw, blk[i], 8);
+        }
+    }
+
+    int stream_bytes = bw_finish(&bw);
+    FILE *f = fopen(fn, "wb");
+    if (!f) { free(bw.buf); return -1; }
+    fwrite(CPR_MAGIC, 4, 1, f);
+    uint16_t nb = (uint16_t)numBlocks; fwrite(&nb, 2, 1, f);
+    uint32_t ts = (uint32_t)total_size; fwrite(&ts, 4, 1, f);
+    u8 ssb = (u8)ScanSizeBitsG, scb = (u8)ScrambeSizeBitsG;
+    fwrite(&ssb, 1, 1, f); fwrite(&scb, 1, 1, f);
+    fwrite(bw.buf, 1, stream_bytes, f);
+    long file_size = ftell(f);
+    fclose(f);
+    free(bw.buf);
+    return file_size;
+}
+
+static int decompress_from_file(const char *fn, u8 *out, int expected_size) {
+    FILE *f = fopen(fn, "rb");
+    if (!f) return 0;
+    char magic[4]; fread(magic, 4, 1, f);
+    if (memcmp(magic, CPR_MAGIC, 4) != 0) { fclose(f); return 0; }
+    uint16_t nb; fread(&nb, 2, 1, f);
+    uint32_t ts; fread(&ts, 4, 1, f);
+    u8 ssb, scb; fread(&ssb, 1, 1, f); fread(&scb, 1, 1, f);
+
+    // Save and restore tuning params
+    int sv_scan = ScanSizeBitsG, sv_scr = ScrambeSizeBitsG;
+    ScanSizeBitsG = (int)ssb; ScrambeSizeBitsG = (int)scb;
+
+    long hdr_end = ftell(f);
+    fseek(f, 0, SEEK_END);
+    int stream_len = (int)(ftell(f) - hdr_end);
+    fseek(f, hdr_end, SEEK_SET);
+    u8 *stream = malloc(stream_len);
+    if (!stream) { fclose(f); return 0; }
+    fread(stream, 1, stream_len, f);
+    fclose(f);
+
+    BitReader br; br_init(&br, stream, stream_len);
+    HuffTable ht; BlockRecord rec;
+    int ok = 1;
+
+    for (int b = 0; b < (int)nb && ok; b++) {
+        int off   = b * BLOCK_SIZE;
+        int bsize = (off + BLOCK_SIZE <= (int)ts) ? BLOCK_SIZE : ((int)ts - off);
+        u8 *blk   = out + off;
+
+        read_instr(&br, &rec);
+        int use_hf = (int)br_get(&br, 1);
+        if (use_hf) {
+            huff_read_table(&ht, &br);
+            ok = huff_decode(&ht, &br, blk, bsize);
+        } else {
+            for (int i = 0; i < bsize; i++) blk[i] = (u8)br_get(&br, 8);
+        }
+        if (ok) undo_block(blk, bsize, &rec);
+    }
+
+    free(stream);
+    ScanSizeBitsG = sv_scan; ScrambeSizeBitsG = sv_scr;
+    return ok;
+}
+
 // ── Block processing ──────────────────────────────────────────────────────────
 
 static double compressBlock(u8 *data, int bsize, int blockIdx, BlockRecord *rec) {
@@ -714,6 +1101,26 @@ static double compressBlock(u8 *data, int bsize, int blockIdx, BlockRecord *rec)
     double baseEntropy = byteEntropy(data, bsize);
     printf("\n=== Block %d (%d bytes)  base=%.4f bits/byte ===\n",
            blockIdx, bsize, baseEntropy);
+
+    // Try delta filter first — sequential differences help audio/image data.
+    // On random data entropy won't decrease; overhead is just 1 bit (the flag).
+    {
+        u8 *tmp = malloc(bsize);
+        if (tmp) {
+            memcpy(tmp, data, bsize);
+            delta_fwd(tmp, bsize);
+            double dE = byteEntropy(tmp, bsize);
+            if (dE < baseEntropy - 1.0 / bsize) {
+                memcpy(data, tmp, bsize);
+                rec->delta_applied = 1;
+                printf("  Delta: %.4f -> %.4f  [applied]\n", baseEntropy, dE);
+                baseEntropy = dE;
+            } else {
+                printf("  Delta: %.4f -> %.4f  [skipped]\n", baseEntropy, dE);
+            }
+            free(tmp);
+        }
+    }
 
     // BWT + MTF: try on a temp copy first; only apply if the gain beats the overhead.
     // On random data many blocks gain less than 32 bits from BWT — applying it
@@ -976,6 +1383,24 @@ int main(void) {
             long sz2 = ftell(f);
             fclose(f);
             printf("  out_reduced_with_instructions.bin  %ld bytes  (instructions + data)\n", sz2);
+        }
+    }
+
+    // ── Compress to .cpr and verify round-trip ────────────────────────────────
+    {
+        long cpr_size = compress_to_file("output.cpr", Data, size, records, numBlocks);
+        if (cpr_size < 0) {
+            printf("  output.cpr                WRITE FAILED\n");
+        } else {
+            printf("  output.cpr                %ld bytes  (bit-packed compressed)\n", cpr_size);
+        }
+
+        u8 *recon = malloc(size);
+        if (recon) {
+            int ok = decompress_from_file("output.cpr", recon, size);
+            int match = ok && (memcmp(origData, recon, size) == 0);
+            printf("Round-trip: %s\n", match ? "PASS" : "FAIL");
+            free(recon);
         }
     }
 
