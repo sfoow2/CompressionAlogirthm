@@ -53,6 +53,28 @@ static const char *op_names[] = {"ADD", "XOR", "ROL", "MUL", "ADDHI", "ADDLO", "
 
 typedef struct { u8 seed, scan, amp, op; } ScrambleStep;
 
+#define EVENT_TRANSFORM     0
+#define EVENT_SCRAMBLE      1
+#define MAX_EVENTS_PER_BLOCK 128
+
+typedef struct {
+    u8  type;
+    u8  is_paired;
+    int stride;
+    u8  op;
+    u8  amp;
+    u8  amp2;
+    int n_passes;
+    ScrambleStep passes[MAX_SCRAMBLE_PASSES];
+} BlockEvent;
+
+typedef struct {
+    u8  bwt_applied;
+    int bwt_pi;
+    int n_events;
+    BlockEvent events[MAX_EVENTS_PER_BLOCK];
+} BlockRecord;
+
 // ── Core helpers ──────────────────────────────────────────────────────────────
 
 static double byteEntropy(const u8 *d, int n) {
@@ -641,9 +663,54 @@ static void tuneParams(const u8 *data, int size) {
            ScanSize, ScanSizeBitsG, ScrambleSize, ScrambeSizeBitsG);
 }
 
+// ── File output ───────────────────────────────────────────────────────────────
+
+static void write_instructions_to_file(FILE *f, BlockRecord *records, int numBlocks) {
+    fwrite("COMPR", 5, 1, f);
+    uint32_t nb = (uint32_t)numBlocks;
+    fwrite(&nb, 4, 1, f);
+    u8 ssb = (u8)ScanSizeBitsG, scb = (u8)ScrambeSizeBitsG;
+    fwrite(&ssb, 1, 1, f);
+    fwrite(&scb, 1, 1, f);
+
+    for (int b = 0; b < numBlocks; b++) {
+        BlockRecord *rec = &records[b];
+        fwrite(&rec->bwt_applied, 1, 1, f);
+        if (rec->bwt_applied) {
+            uint32_t pi = (uint32_t)rec->bwt_pi;
+            fwrite(&pi, 4, 1, f);
+        }
+        uint32_t ne = (uint32_t)rec->n_events;
+        fwrite(&ne, 4, 1, f);
+        for (int i = 0; i < rec->n_events; i++) {
+            BlockEvent *ev = &rec->events[i];
+            fwrite(&ev->type, 1, 1, f);
+            if (ev->type == EVENT_TRANSFORM) {
+                fwrite(&ev->is_paired, 1, 1, f);
+                uint16_t st = (uint16_t)ev->stride;
+                fwrite(&st, 2, 1, f);
+                fwrite(&ev->op, 1, 1, f);
+                fwrite(&ev->amp, 1, 1, f);
+                if (ev->is_paired) fwrite(&ev->amp2, 1, 1, f);
+            } else {
+                u8 np = (u8)ev->n_passes;
+                fwrite(&np, 1, 1, f);
+                for (int j = 0; j < ev->n_passes; j++) {
+                    fwrite(&ev->passes[j].seed, 1, 1, f);
+                    uint16_t sc = (uint16_t)ev->passes[j].scan;
+                    fwrite(&sc, 2, 1, f);
+                    fwrite(&ev->passes[j].amp, 1, 1, f);
+                    fwrite(&ev->passes[j].op, 1, 1, f);
+                }
+            }
+        }
+    }
+}
+
 // ── Block processing ──────────────────────────────────────────────────────────
 
-static double compressBlock(u8 *data, int bsize, int blockIdx) {
+static double compressBlock(u8 *data, int bsize, int blockIdx, BlockRecord *rec) {
+    memset(rec, 0, sizeof(*rec));
     double baseEntropy = byteEntropy(data, bsize);
     printf("\n=== Block %d (%d bytes)  base=%.4f bits/byte ===\n",
            blockIdx, bsize, baseEntropy);
@@ -669,6 +736,8 @@ static double compressBlock(u8 *data, int bsize, int blockIdx) {
                 memcpy(data, tmp, bsize);
                 startEntropy = eMTF;
                 totalOverhead = BWT_OVERHEAD_BITS;
+                rec->bwt_applied = 1;
+                rec->bwt_pi = pi;
                 printHistStats(data, bsize, "BWT+MTF");
                 printf("  BWT: %.4f -> %.4f   MTF: -> %.4f   gain=%.1f bits  overhead=%d bits  [applied]\n",
                        baseEntropy, eBWT, eMTF, bwtGain, BWT_OVERHEAD_BITS);
@@ -712,6 +781,11 @@ static double compressBlock(u8 *data, int bsize, int blockIdx) {
             } else {
                 totalOverhead += overhead;
                 LastEntropy = empt;
+                if (rec->n_events < MAX_EVENTS_PER_BLOCK) {
+                    BlockEvent *ev = &rec->events[rec->n_events++];
+                    ev->type = EVENT_TRANSFORM; ev->is_paired = 0;
+                    ev->stride = v; ev->op = op; ev->amp = amp;
+                }
                 // Small gain: try scramble as bonus — don't stop if it fails
                 if (Difference < overhead) scrambleMode = 2;
             }
@@ -737,6 +811,11 @@ static double compressBlock(u8 *data, int bsize, int blockIdx) {
                 } else {
                     totalOverhead += poh;
                     LastEntropy    = pempt;
+                    if (rec->n_events < MAX_EVENTS_PER_BLOCK) {
+                        BlockEvent *ev = &rec->events[rec->n_events++];
+                        ev->type = EVENT_TRANSFORM; ev->is_paired = 1;
+                        ev->stride = pv; ev->op = pop; ev->amp = pa1; ev->amp2 = pa2;
+                    }
                     scrambleMode   = (pDiff < poh) ? 2 : 3;
                 }
             }
@@ -785,6 +864,12 @@ static double compressBlock(u8 *data, int bsize, int blockIdx) {
                            passes[i].scan, passes[i].amp);
                 totalScrambleOverhead += chainOverhead;
                 LastEntropy = currentEntropy;
+                if (rec->n_events < MAX_EVENTS_PER_BLOCK) {
+                    BlockEvent *ev = &rec->events[rec->n_events++];
+                    ev->type = EVENT_SCRAMBLE;
+                    ev->n_passes = nPasses;
+                    memcpy(ev->passes, passes, nPasses * sizeof(ScrambleStep));
+                }
             }
         }
     }
@@ -809,6 +894,10 @@ int main(void) {
     if (!Data) return 1;
     for (int x = 0; x < size; x++) Data[x] = rand() % 256;
 
+    u8 *origData = malloc(size);
+    if (!origData) { free(Data); return 1; }
+    memcpy(origData, Data, size);
+
     double BaseEntropy = byteEntropy(Data, size);
     printf("Data: %d bytes  global entropy=%.4f bits/byte\n", size, BaseEntropy);
 
@@ -822,6 +911,9 @@ int main(void) {
     int numBlocks = (size + BLOCK_SIZE - 1) / BLOCK_SIZE;
     printf("Blocks: %d x %d bytes\n", numBlocks, BLOCK_SIZE);
 
+    BlockRecord *records = calloc(numBlocks, sizeof(BlockRecord));
+    if (!records) { free(Data); free(origData); return 1; }
+
     double totalBitsBefore = 0.0, totalBitsAfter = 0.0, totalNetGain = 0.0;
 
     for (int b = 0; b < numBlocks; b++) {
@@ -830,7 +922,7 @@ int main(void) {
         u8 *block  = Data + offset;
 
         totalBitsBefore += byteEntropy(block, bsize) * bsize;
-        totalNetGain    += compressBlock(block, bsize, b);
+        totalNetGain    += compressBlock(block, bsize, b, &records[b]);
         totalBitsAfter  += byteEntropy(block, bsize) * bsize;
     }
 
@@ -851,6 +943,44 @@ int main(void) {
     printf("  %-32s %10.0f bits  (%10.2f bytes)\n",
            "Net saved:", totalNetGain, totalNetGain / 8.0);
 
+    // ── Write output files ────────────────────────────────────────────────────
+    printf("\n--- Writing output files ---\n");
+
+    {
+        FILE *f = fopen("out_original.bin", "wb");
+        if (f) { fwrite(origData, 1, size, f); fclose(f); }
+        printf("  out_original.bin          %d bytes  (raw input)\n", size);
+    }
+
+    {
+        FILE *f = fopen("out_reduced.bin", "wb");
+        if (f) { fwrite(Data, 1, size, f); fclose(f); }
+        printf("  out_reduced.bin           %d bytes  (entropy-reduced data)\n", size);
+    }
+
+    {
+        FILE *f = fopen("out_instructions.bin", "wb");
+        if (f) {
+            write_instructions_to_file(f, records, numBlocks);
+            long sz2 = ftell(f);
+            fclose(f);
+            printf("  out_instructions.bin      %ld bytes  (transform metadata)\n", sz2);
+        }
+    }
+
+    {
+        FILE *f = fopen("out_reduced_with_instructions.bin", "wb");
+        if (f) {
+            write_instructions_to_file(f, records, numBlocks);
+            fwrite(Data, 1, size, f);
+            long sz2 = ftell(f);
+            fclose(f);
+            printf("  out_reduced_with_instructions.bin  %ld bytes  (instructions + data)\n", sz2);
+        }
+    }
+
+    free(origData);
+    free(records);
     free(Data);
     return 0;
 }
