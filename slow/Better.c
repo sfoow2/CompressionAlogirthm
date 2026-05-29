@@ -14,7 +14,7 @@ typedef uint8_t u8;
 #define N_OPS       6
 #define N_GSHAPES   10
 #define N_PSHAPES   8
-#define N_PATTERNS  14
+#define N_PATTERNS  19
 
 // ── GF(256) ───────────────────────────────────────────────────────────────────
 static u8 gf_exp[512], gf_log[256];
@@ -106,16 +106,21 @@ typedef struct {
 //  9  PRNG-JUMP:       seed(8)+maxstep(4)+op(3)+amp(8)  = 28
 // 10  MODULAR-MASK:    P(3)+mask(8)+op(3)+amp(8)        = 27
 // 11  STRIDE-NEIGHBOR: stride(6)+op(3)                  = 14
+// 11  DELTA:           op_type(1)                       =  8  (5 ID + 3 op_type: SUB or XOR)
 // 12  COND-PREV:       k(3)+op(3)+2^k*8 amps            = 27 min (k=1), up to 2059 (k=8)
 // 13  COND-NEXT:       k(2)+op(3)+2^k*8 amps            = 26 min (k=1, dynamic)
 // 14  COND-DELTA:      k(2)+op(3)+2^k*8 amps            = 26 min (k=1, dynamic)
-static const int PAT_OH[] = {22,22,30,27,20,25,21,20,11,28,27,14,27,26,26};
+// 15  STRIDE-DELTA:    N(6)+op_type(1)                  = 12  (stride-N difference/XOR)
+// 16  THRESH-MAP:      T(8)+amp(8)                      = 21  (rotate [T..255] by amp positions)
+// 17  BIT-ROTATE:      k(3)                             =  8  (rotate each byte's bits by k)
+// 18  GRAY:            dir(1)                           =  6  (Gray encode or Gray decode)
+static const int PAT_OH[] = {22,22,30,27,20,25,21,20,11,28,27, 8,27,26,26,12,21,8,6};
 
 // ── Apply a SearchResult in-place ─────────────────────────────────────────────
 static void apply_sr(u8 *blk, int n, const SR *r) {
     int x,op,amp,seed,P,N,shape;
     u8 *orig=NULL;
-    if(r->id==11||r->id==12||r->id==14){  // STRIDE-NEIGHBOR, COND-PREV, COND-DELTA need orig
+    if(r->id==12||r->id==14){  // COND-PREV and COND-DELTA need orig
         orig=malloc(n); if(orig) memcpy(orig,blk,n);
     }
     switch(r->id){
@@ -154,18 +159,30 @@ static void apply_sr(u8 *blk, int n, const SR *r) {
             while(pos<n){blk[pos]=op_byte(blk[pos],(u8)amp,op);pos+=(int)(lcg_byte(&st)%ms)+1;}} break;
         case 10: P=r->p[0];{int mask=r->p[1];op=r->p[2];amp=r->p[3]; // MODULAR-MASK
             for(int i=0;i<n;i++) if((mask>>(i%P))&1) blk[i]=op_byte(blk[i],(u8)amp,op);} break;
-        case 11: x=r->p[0];op=r->p[1]; // STRIDE-NEIGHBOR
-            if(orig){int cnt=0;for(int p=0;p<n;p+=x)cnt++;
-                int *pos=malloc(cnt*sizeof(int));if(!pos)break;
-                int k=0;for(int p=0;p<n;p+=x)pos[k++]=p;
-                for(int j=0;j<cnt;j++) blk[pos[j]]=op_byte(orig[pos[j]],orig[pos[(j+1)%cnt]],op);
-                free(pos);} break;
+        case 11: {int ot=r->p[0]; // DELTA: byte[i] -= byte[i-1], applied right-to-left
+            if(ot==0) for(int i=n-1;i>=1;i--) blk[i]=(u8)(blk[i]-blk[i-1]);
+            else      for(int i=n-1;i>=1;i--) blk[i]^=blk[i-1];} break;
         case 12: {int k=r->p[0];op=r->p[1]; // COND-PREV: amp keyed by high k bits of previous byte
             if(orig) for(int i=1;i<n;i++) blk[i]=op_byte(blk[i],r->amps[orig[i-1]>>(8-k)],op);} break;
         case 13: {int k=r->p[0];op=r->p[1]; // COND-NEXT: amp keyed by high k bits of next byte
             for(int i=0;i<n-1;i++) blk[i]=op_byte(blk[i],r->amps[blk[i+1]>>(8-k)],op);} break;
         case 14: {int k=r->p[0];op=r->p[1]; // COND-DELTA: amp keyed by high k bits of (prev XOR pprev)
             if(orig) for(int i=2;i<n;i++) blk[i]=op_byte(blk[i],r->amps[(orig[i-1]^orig[i-2])>>(8-k)],op);} break;
+        case 15: {int N=r->p[0];int ot=r->p[1]; // STRIDE-DELTA: b'[i] = b[i] OP b[i-N], right-to-left
+            if(ot==0) for(int i=n-1;i>=N;i--) blk[i]=(u8)(blk[i]-blk[i-N]);
+            else       for(int i=n-1;i>=N;i--) blk[i]^=blk[i-N];} break;
+        case 16: {int T=r->p[0]; int amp=r->p[1]; int M=256-T; // THRESH-MAP: rotate [T..255] by amp
+            // Reversible: inverse applies rotation by M-(amp%M) within [T..255]
+            for(int i=0;i<n;i++)
+                if(blk[i]>=(u8)T) blk[i]=(u8)(T+(blk[i]-T+amp)%M);} break;
+        case 17: {int k=r->p[0]; // BIT-ROTATE: rotate all bytes left by k bits
+            // Reversible: inverse rotates by (8-k)
+            for(int i=0;i<n;i++) blk[i]=(u8)((blk[i]<<k)|(blk[i]>>(8-k)));} break;
+        case 18: {int dir=r->p[0]; // GRAY: dir=0 encode (b^(b>>1)), dir=1 decode
+            // Encode and decode are each other's inverse
+            if(dir==0){for(int i=0;i<n;i++) blk[i]^=(blk[i]>>1);}
+            else{for(int i=0;i<n;i++){u8 v=blk[i];v^=(v>>4);v^=(v>>2);v^=(v>>1);blk[i]=v;}}
+            } break;
     }
     free(orig);
 }
@@ -465,21 +482,24 @@ static SR search_modular_mask(const u8*blk,int n,double base){
     return r;
 }
 
-static SR search_stride_neighbor(const u8*blk,int n,double base){
+// DELTA: encode b[i] as (b[i] - b[i-1]) mod 256, or (b[i] XOR b[i-1]).
+// Apply right-to-left so b[i-1] is always the original value when read.
+// Invert left-to-right (standard scan reconstruction).
+// For smooth/correlated data (audio, images) consecutive bytes are similar,
+// so differences cluster near 0 — causing real collisions in the output histogram.
+static SR search_delta(const u8*blk,int n,double base){
     SR r; memset(&r,0,sizeof(r)); r.id=11; r.entropy=base; r.overhead=PAT_OH[11];
-    int bfreq[256]={0};for(int i=0;i<n;i++)bfreq[blk[i]]++;
-    double be=base;int bx=0,bop=0;
-    for(int op=0;op<N_OPS;op++)for(int x=1;x<=MAX_STRIDE;x++){
-        int cnt=0;for(int p=0;p<n;p+=x)cnt++;
-        int *pos=malloc(cnt*sizeof(int));if(!pos)continue;
-        int k=0;for(int p=0;p<n;p+=x)pos[k++]=p;
-        int sf[256]={0},sfo[256]={0};
-        for(int j=0;j<cnt;j++){sf[op_byte(blk[pos[j]],blk[pos[(j+1)%cnt]],op)]++;sfo[blk[pos[j]]]++;}
-        int ff[256];for(int v=0;v<256;v++)ff[v]=(bfreq[v]-sfo[v])+sf[v];
-        free(pos);
-        double e=entropy_from_hist(ff,n);if(e<be){be=e;bx=x;bop=op;}}
-    r.entropy=be;r.p[0]=bx;r.p[1]=bop;
-    snprintf(r.name,sizeof(r.name),"STRIDE-NBR %s s=%d",opname[bop],bx);
+    double be=base; int bot=0;
+    // try SUB delta
+    {int ff[256]={0}; ff[blk[0]]++;
+     for(int i=1;i<n;i++) ff[(u8)(blk[i]-blk[i-1])]++;
+     double e=entropy_from_hist(ff,n); if(e<be){be=e;bot=0;}}
+    // try XOR delta
+    {int ff[256]={0}; ff[blk[0]]++;
+     for(int i=1;i<n;i++) ff[blk[i]^blk[i-1]]++;
+     double e=entropy_from_hist(ff,n); if(e<be){be=e;bot=1;}}
+    r.entropy=be; r.p[0]=bot;
+    snprintf(r.name,sizeof(r.name),"DELTA %s",bot?"XOR":"SUB");
     return r;
 }
 
@@ -582,6 +602,91 @@ static SR search_cond_delta(const u8*blk,int n,double base){
     return r;
 }
 
+// STRIDE-DELTA: b'[i] = b[i] - b[i-N]  (or XOR), applied right-to-left.
+// Right-to-left guarantees b[i-N] is always original when read — no orig[] needed.
+// Invert: left-to-right scan reconstruction (b[i] += b[i-N] or b[i] ^= b[i-N]).
+// Equivalent to: deinterleave N channels, apply DELTA within each channel, leave interleaved.
+// For real multi-channel data (stereo N=2, RGB N=3, RGBA N=4, etc.) this finds
+// within-channel correlations that stride-1 DELTA misses.
+static SR search_stride_delta(const u8*blk,int n,double base){
+    SR r; memset(&r,0,sizeof(r)); r.id=15; r.entropy=base; r.overhead=PAT_OH[15];
+    double be=base; int bN=2,bot=0;
+    for(int N=2;N<=MAX_STRIDE;N++){
+        // SUB delta at stride N
+        {int ff[256]={0};
+         for(int i=0;i<N&&i<n;i++) ff[blk[i]]++;
+         for(int i=N;i<n;i++) ff[(u8)(blk[i]-blk[i-N])]++;
+         double e=entropy_from_hist(ff,n); if(e<be){be=e;bN=N;bot=0;}}
+        // XOR delta at stride N
+        {int ff[256]={0};
+         for(int i=0;i<N&&i<n;i++) ff[blk[i]]++;
+         for(int i=N;i<n;i++) ff[blk[i]^blk[i-N]]++;
+         double e=entropy_from_hist(ff,n); if(e<be){be=e;bN=N;bot=1;}}
+    }
+    r.entropy=be; r.p[0]=bN; r.p[1]=bot;
+    snprintf(r.name,sizeof(r.name),"STRIDE-DELTA N=%d %s",bN,bot?"XOR":"SUB");
+    return r;
+}
+
+// THRESH-MAP: rotate the value range [T..255] by amp positions (mod 256-T).
+// Bytes < T are unchanged. Bytes >= T are mapped to T + (v-T+amp)%(256-T).
+// This is always a bijection: rotation within a closed set.
+// Inverse: rotation by (256-T - amp%(256-T)).
+static SR search_thresh_map(const u8*blk, int n, double base){
+    SR r; memset(&r,0,sizeof(r)); r.id=16; r.entropy=base; r.overhead=PAT_OH[16];
+    int bfreq[256]={0}; for(int i=0;i<n;i++) bfreq[blk[i]]++;
+    double be=base; int bT=0,bamp=0;
+    #pragma omp parallel
+    {double le=base; int lT=0,lamp=0;
+     #pragma omp for schedule(dynamic,4)
+     for(int T=0;T<=254;T++){
+         int M=256-T;
+         int ff[256];
+         for(int amp=1;amp<M;amp++){
+             for(int v=0;v<T;v++) ff[v]=bfreq[v];
+             for(int v=T;v<256;v++) ff[T+(v-T+amp)%M]=bfreq[v];
+             double e=entropy_from_hist(ff,n);
+             if(e<le){le=e;lT=T;lamp=amp;}
+         }
+     }
+     #pragma omp critical
+     if(le<be){be=le;bT=lT;bamp=lamp;}}
+    r.entropy=be; r.p[0]=bT; r.p[1]=bamp;
+    snprintf(r.name,sizeof(r.name),"THRESH-MAP T=%d a=%d",bT,bamp);
+    return r;
+}
+
+// BIT-ROTATE: rotate every byte left by k bits (k=1..7).
+// Inverse: rotate right by k, i.e. rotate left by (8-k).
+static SR search_bit_rotate(const u8*blk, int n, double base){
+    SR r; memset(&r,0,sizeof(r)); r.id=17; r.entropy=base; r.overhead=PAT_OH[17];
+    double be=base; int bk=0;
+    for(int k=1;k<=7;k++){
+        int ff[256]={0};
+        for(int i=0;i<n;i++) ff[(u8)((blk[i]<<k)|(blk[i]>>(8-k)))]++;
+        double e=entropy_from_hist(ff,n); if(e<be){be=e;bk=k;}
+    }
+    r.entropy=be; r.p[0]=bk;
+    snprintf(r.name,sizeof(r.name),"BIT-ROTATE k=%d",bk);
+    return r;
+}
+
+// GRAY: apply Gray encoding (b^(b>>1)) or Gray decoding to every byte.
+// Encode and decode are each other's inverse, so both are self-consistently reversible.
+static SR search_gray(const u8*blk, int n, double base){
+    SR r; memset(&r,0,sizeof(r)); r.id=18; r.entropy=base; r.overhead=PAT_OH[18];
+    double be=base; int bdir=0;
+    {int ff[256]={0};
+     for(int i=0;i<n;i++) ff[blk[i]^(blk[i]>>1)]++;
+     double e=entropy_from_hist(ff,n); if(e<be){be=e;bdir=0;}}
+    {int ff[256]={0};
+     for(int i=0;i<n;i++){u8 v=blk[i];v^=(v>>4);v^=(v>>2);v^=(v>>1);ff[v]++;}
+     double e=entropy_from_hist(ff,n); if(e<be){be=e;bdir=1;}}
+    r.entropy=be; r.p[0]=bdir;
+    snprintf(r.name,sizeof(r.name),"GRAY %s",bdir?"decode":"encode");
+    return r;
+}
+
 // ── Run all searches ──────────────────────────────────────────────────────────
 static void run_all(const u8 *blk, int n, double base, SR *out) {
     out[0]  = search_stride_const    (blk,n,base);
@@ -595,10 +700,14 @@ static void run_all(const u8 *blk, int n, double base, SR *out) {
     out[8]  = search_nway_stride     (blk,n,base);
     out[9]  = search_prng_jump       (blk,n,base);
     out[10] = search_modular_mask    (blk,n,base);
-    out[11] = search_stride_neighbor (blk,n,base);
+    out[11] = search_delta           (blk,n,base);
     out[12] = search_cond_prev       (blk,n,base);
     out[13] = search_cond_next       (blk,n,base);
     out[14] = search_cond_delta      (blk,n,base);
+    out[15] = search_stride_delta    (blk,n,base);
+    out[16] = search_thresh_map      (blk,n,base);
+    out[17] = search_bit_rotate      (blk,n,base);
+    out[18] = search_gray            (blk,n,base);
 }
 
 // ── Byte dump ────────────────────────────────────────────────────────────────
@@ -606,6 +715,65 @@ static void print_bytes(const u8 *data, int len, const char *label) {
     printf("\n=== %s (%d bytes) ===\n", label, len);
     for(int i=0;i<len;i++) printf("%d ", data[i]);
     printf("\n");
+}
+
+// ── BWT fallback ──────────────────────────────────────────────────────────────
+// Called when every regular transform gives negative net.
+// Applies Burrows-Wheeler Transform and re-runs all searches on the result.
+// BWT groups identical contexts together, making COND-* and DELTA patterns
+// far more effective on structured data that stumped the per-byte searches.
+// Overhead: 5 (pattern id) + 16 (row index, since BLOCK_SIZE = 2^16) = 21 bits.
+#define BWT_OH 21
+
+static const u8 *g_bwt_src;
+static int       g_bwt_n;
+static int bwt_cmp(const void *a, const void *b){
+    int ia=*(const int*)a, ib=*(const int*)b;
+    const u8 *s=g_bwt_src; int n=g_bwt_n;
+    for(int len=n;len--;){
+        int d=(int)s[ia]-(int)s[ib]; if(d) return d;
+        if(++ia==n) ia=0; if(++ib==n) ib=0;
+    }
+    return 0;
+}
+
+// Forward BWT of blk[0..n-1] in-place using cyclic rotations.
+// Returns the row index of the original string (needed for inverse), or -1 on alloc failure.
+static int bwt_forward(u8 *blk, int n){
+    int *sa=malloc(n*sizeof(int)); u8 *out=malloc(n);
+    if(!sa||!out){free(sa);free(out);return -1;}
+    for(int i=0;i<n;i++) sa[i]=i;
+    g_bwt_src=blk; g_bwt_n=n;
+    qsort(sa,n,sizeof(int),bwt_cmp);
+    int idx=-1;
+    for(int i=0;i<n;i++){out[i]=blk[sa[i]?sa[i]-1:n-1]; if(!sa[i]) idx=i;}
+    memcpy(blk,out,n); free(sa); free(out);
+    return idx;
+}
+
+static int try_bwt(u8*blk,int n,double*base,int pass,double*tnet){
+    printf("  (stuck — trying BWT)\n"); fflush(stdout);
+    u8 *tmp=malloc(n); if(!tmp) return 0;
+    memcpy(tmp,blk,n);
+    int idx=bwt_forward(tmp,n);
+    if(idx<0){free(tmp);return 0;}
+    SR res[N_PATTERNS];
+    run_all(tmp,n,*base,res);
+    int best_i=-1; double best_net=0;
+    for(int i=0;i<N_PATTERNS;i++){
+        double net=(*base-res[i].entropy)*n-BWT_OH-res[i].overhead;
+        if(net>best_net){best_net=net;best_i=i;}
+    }
+    if(best_i<0){printf("  (BWT did not improve — done)\n");free(tmp);return 0;}
+    memcpy(blk,tmp,n); free(tmp);
+    double before=*base;
+    apply_sr(blk,n,&res[best_i]);
+    *base=byte_entropy(blk,n);
+    *tnet+=best_net;
+    printf("Pass %d: BWT(idx=%d)+%s  entropy %.6f->%.6f  (net=%.1f)\n",
+           pass,idx,res[best_i].name,before,*base,best_net);
+    fflush(stdout);
+    return 1;
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -623,7 +791,7 @@ int main(void) {
         u8 *blk=malloc(BLOCK_SIZE);
         if(!blk||!fill_random(blk,BLOCK_SIZE)){free(blk);continue;}
 
-        print_bytes(blk, 128, "BEFORE transforms");
+        print_bytes(blk, 256 * 5, "BEFORE transforms");
 
         double base=byte_entropy(blk,BLOCK_SIZE);
         double start_entropy=base;
@@ -640,7 +808,10 @@ int main(void) {
                 double net=(base-results[i].entropy)*BLOCK_SIZE-results[i].overhead;
                 if(net>best_net){best_net=net;best_idx=i;}
             }
-            if(best_net<=0||best_idx<0) break;
+            if(best_net<=0||best_idx<0){
+                if(!try_bwt(blk,BLOCK_SIZE,&base,pass,&total_net)) break;
+                continue;  // loop: run_all again on BWT'd data
+            }
 
             double before=base;
             apply_sr(blk,BLOCK_SIZE,&results[best_idx]);
@@ -654,7 +825,7 @@ int main(void) {
         printf("\nSummary: entropy %.6f -> %.6f  total net=%.1f bits\n",
                start_entropy, base, total_net);
 
-        print_bytes(blk, 128, "AFTER transforms");
+        print_bytes(blk, 256 * 5, "AFTER transforms");
         free(blk);
     }
 
