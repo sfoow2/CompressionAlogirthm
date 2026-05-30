@@ -43,7 +43,6 @@ static void hist_transform(const int in[256],int out[256],int op,int amp){
     memset(out,0,256*sizeof(int));for(int v=0;v<256;v++)if(in[v])out[op_byte((u8)v,(u8)amp,op)]+=in[v];
 }
 // ops: 0=ADD  1=XOR  2=MUL  3=ADDLO  4=SWXOR  5=GFMUL
-static const char *opname[]={"ADD","XOR","MUL","ADDLO","SWXOR","GFMUL"};
 
 
 // ── Search result struct ──────────────────────────────────────────────────────
@@ -53,44 +52,44 @@ typedef struct {
     double entropy;
     int    overhead;
     int    p[8];
-    u8     amps[256];  // large enough for COND-PREV k=8 (256 groups)
+    u8     amps[256];     // per-group amplitude (2^k entries used)
+    u8     grp_ops[256];  // per-group op (2^k entries used)
 } SR;
 
-// Overhead bits = 5 (ID) + parameter bits.  Only active IDs listed.
-// 12  COND-PREV:  k(3)+op(3)+2^k*8 amps  = 27 min (k=1) .. 2059 max (k=8)
-//     Context = high k bits of b[i-1].  k capped at 4 (k=5..8 overhead > block gain).
-// 13  COND-NEXT:  k(3)+op(3)+2^k*8 amps  = 26 min (k=1, dynamic)
+// Overhead bits = 5 (ID) + parameter bits.  Per-group ops: each group stores (op 3b + amp 8b) = 11b.
+// 12  COND-PREV:  k(3) + 2^k*(op(3)+amp(8))  = 30 min (k=1,N=2)  ..  184 (k=4,N=16)
+//     Context = high k bits of b[i-1].  Each of the 2^k groups has its own op+amp.
+// 13  COND-NEXT:  k(3) + 2^k*(op(3)+amp(8))  = 30 min (k=1)
 //     Context = high k bits of b[i+1].  Uses original unmodified next byte.
-// 14  COND-DELTA: k(3)+op(3)+2^k*8 amps  = 26 min (k=1, dynamic)
+// 14  COND-DELTA: k(3) + 2^k*(op(3)+amp(8))  = 30 min (k=1)
 //     Context = high k bits of (b[i-1] XOR b[i-2]).  Tracks local difference trend.
 //
-// Why these three dominate: they partition the block into 2^k context groups and
-// independently optimize an op+amplitude per group via cond_greedy().  Even on
-// random data, finite-sample histogram variance (~sqrt(16) per 256-value bucket on
-// 4KB blocks) gives ~100-bit net gain with only 27 bits of overhead.  On structured
-// data (source code, images) where bytes genuinely correlate with neighbors, gains
-// are much larger.  All three are fully reversible: store k, op, and the 2^k amps.
+// Per-group ops: instead of one shared op for all groups, cond_greedy_flex() independently
+// picks the best (op, amp) per group.  A group whose sub-histogram responds to XOR gets XOR;
+// another gets ADD; etc.  Net gain improves significantly with minimal overhead increase.
 static const int PAT_OH[] = {
     0,0,0,0,0,0,0,0,0,0,0,0,  // IDs 0-11 unused
-    27,                         // 12 COND-PREV
-    26,                         // 13 COND-NEXT
-    26,                         // 14 COND-DELTA
+    30,                         // 12 COND-PREV  (k=1 min; dynamic per best k found)
+    30,                         // 13 COND-NEXT
+    30,                         // 14 COND-DELTA
 };
 
 // ── Apply a SearchResult in-place ─────────────────────────────────────────────
 static void apply_sr(u8 *blk, int n, const SR *r) {
-    int op;
     u8 *orig=NULL;
-    if(r->id==12||r->id==14){  // COND-PREV and COND-DELTA need orig
+    if(r->id==12||r->id==14){  // COND-PREV and COND-DELTA need a snapshot of the input
         orig=malloc(n); if(orig) memcpy(orig,blk,n);
     }
     switch(r->id){
-        case 12: {int k=r->p[0];op=r->p[1]; // COND-PREV: amp keyed by high k bits of previous byte
-            if(orig) for(int i=1;i<n;i++) blk[i]=op_byte(blk[i],r->amps[orig[i-1]>>(8-k)],op);} break;
-        case 13: {int k=r->p[0];op=r->p[1]; // COND-NEXT: amp keyed by high k bits of next byte
-            for(int i=0;i<n-1;i++) blk[i]=op_byte(blk[i],r->amps[blk[i+1]>>(8-k)],op);} break;
-        case 14: {int k=r->p[0];op=r->p[1]; // COND-DELTA: amp keyed by high k bits of (prev XOR pprev)
-            if(orig) for(int i=2;i<n;i++) blk[i]=op_byte(blk[i],r->amps[(orig[i-1]^orig[i-2])>>(8-k)],op);} break;
+        case 12: {int k=r->p[0],flex=r->p[2],op=r->p[1]; // COND-PREV
+            if(orig) for(int i=1;i<n;i++){int g=orig[i-1]>>(8-k);
+                blk[i]=op_byte(blk[i],r->amps[g],flex?r->grp_ops[g]:op);}} break;
+        case 13: {int k=r->p[0],flex=r->p[2],op=r->p[1]; // COND-NEXT
+            for(int i=0;i<n-1;i++){int g=blk[i+1]>>(8-k);
+                blk[i]=op_byte(blk[i],r->amps[g],flex?r->grp_ops[g]:op);}} break;
+        case 14: {int k=r->p[0],flex=r->p[2],op=r->p[1]; // COND-DELTA
+            if(orig) for(int i=2;i<n;i++){int g=(orig[i-1]^orig[i-2])>>(8-k);
+                blk[i]=op_byte(blk[i],r->amps[g],flex?r->grp_ops[g]:op);}} break;
     }
     free(orig);
 }
@@ -103,11 +102,10 @@ static void apply_sr(u8 *blk, int n, const SR *r) {
 
 // ── Search functions ──────────────────────────────────────────────────────────
 
-// Shared greedy search core used by all COND-* patterns.
-// gh[g][0..255] = input histogram for group g.  N = number of groups.
-// unchanged_val = byte value of the one byte that has no context (counted outside groups).
-static double cond_greedy(const int (*gh)[256],int N,int n,int unchanged_val,
-                          int op,u8 *amps_out){
+// Shared-op greedy: all groups use the same op, 2 refinement passes.
+// Overhead when using this: 5 + 3 + 3 + N*8 bits (k + op + N*amp).
+static double cond_greedy(const int (*gh)[256], int N, int n, int unchanged_val,
+                           int op, u8 *amps_out) {
     OP_RANGE(op,alo,ahi)
     u8 amps[256]; for(int g=0;g<N;g++) amps[g]=(u8)alo;
     int combined[256]={0}; combined[unchanged_val]++;
@@ -127,65 +125,110 @@ static double cond_greedy(const int (*gh)[256],int N,int n,int unchanged_val,
     return entropy_from_hist(combined,n);
 }
 
+// Per-group-op greedy: each group picks its own (op, amp), 3 refinement passes.
+// Overhead when using this: 5 + 3 + N*11 bits (k + N*(op+amp)).
+// Strictly more general than cond_greedy — wins on structured data where groups differ.
+static double cond_greedy_flex(const int (*gh)[256], int N, int n, int unchanged_val,
+                                u8 *amps_out, u8 *ops_out) {
+    u8 amps[256], ops[256];
+    for(int g=0;g<N;g++){amps[g]=1; ops[g]=0;}  // start: ADD, amp=1
+    int combined[256]={0}; combined[unchanged_val]++;
+    for(int g=0;g<N;g++){int tf[256];hist_transform(gh[g],tf,ops[g],amps[g]);for(int v=0;v<256;v++)combined[v]+=tf[v];}
+    for(int pass=0;pass<3;pass++) for(int g=0;g<N;g++){
+        int tc[256],wk[256]; hist_transform(gh[g],tc,ops[g],amps[g]);
+        for(int v=0;v<256;v++) wk[v]=combined[v]-tc[v];
+        double bge=1e30; u8 bga=amps[g]; u8 bgo=ops[g];
+        for(int op=0;op<N_OPS;op++){OP_RANGE(op,alo,ahi)
+            for(int amp=alo;amp<=ahi;amp++){SKIP_OP(op,amp)
+                int tf[256],ff[256]; hist_transform(gh[g],tf,op,amp);
+                for(int v=0;v<256;v++) ff[v]=wk[v]+tf[v];
+                double e=entropy_from_hist(ff,n); if(e<bge){bge=e;bga=(u8)amp;bgo=(u8)op;}}}
+        int tn[256]; hist_transform(gh[g],tn,bgo,bga);
+        for(int v=0;v<256;v++) combined[v]=wk[v]+tn[v];
+        amps[g]=bga; ops[g]=bgo;}
+    for(int g=0;g<N;g++){amps_out[g]=amps[g]; ops_out[g]=ops[g];}
+    return entropy_from_hist(combined,n);
+}
+
 static SR search_cond_prev(const u8*blk,int n,double base){
     SR r; memset(&r,0,sizeof(r)); r.id=12; r.entropy=base; r.overhead=PAT_OH[12];
-    double be=base; int bk=1,bop=0; u8 bamps[256]={0};
-    // k=5..8 have overhead 267..2059 bits — never profitable on 4KB blocks
+    double best_net=-1e30; int bk=1,bflex=0; u8 bamps[256]={0}, bops[256]={0};
     for(int k=1;k<=4;k++){
         int N=1<<k;
         int (*gh)[256]=malloc(N*256*sizeof(int)); if(!gh) continue;
         memset(gh,0,N*256*sizeof(int));
         for(int i=1;i<n;i++) gh[blk[i-1]>>(8-k)][blk[i]]++;
+        // shared op (cheaper overhead)
         for(int op=0;op<N_OPS;op++){
-            u8 amps[256]={0};
+            u8 amps[256]={0}; int oh=5+3+3+N*8;
             double e=cond_greedy(gh,N,n,blk[0],op,amps);
-            if(e<be){be=e;bk=k;bop=op;memcpy(bamps,amps,N*sizeof(u8));}}
+            double net=(base-e)*n-oh;
+            if(net>best_net){best_net=net;bk=k;bflex=0;r.entropy=e;r.overhead=oh;r.p[1]=op;
+                memcpy(bamps,amps,N);}}
+        // per-group ops (higher overhead, better fit on structured data)
+        {u8 amps[256]={0},ops[256]={0}; int oh=5+3+N*11;
+         double e=cond_greedy_flex(gh,N,n,blk[0],amps,ops);
+         double net=(base-e)*n-oh;
+         if(net>best_net){best_net=net;bk=k;bflex=1;r.entropy=e;r.overhead=oh;
+             memcpy(bamps,amps,N);memcpy(bops,ops,N);}}
         free(gh);}
-    r.entropy=be; r.p[0]=bk; r.p[1]=bop;
-    {int N=1<<bk; memcpy(r.amps,bamps,N*sizeof(u8)); r.overhead=5+3+3+N*8;}
-    snprintf(r.name,sizeof(r.name),"COND-PREV k=%d %s",bk,opname[bop]);
+    r.p[0]=bk; r.p[2]=bflex;
+    {int N=1<<bk; memcpy(r.amps,bamps,N); if(bflex) memcpy(r.grp_ops,bops,N);}
+    snprintf(r.name,sizeof(r.name),"COND-PREV k=%d%s",bk,bflex?"-F":"");
     return r;
 }
 
-// COND-NEXT: amp keyed by high k bits of the NEXT byte (reads original, left-to-right scan).
-// Inverse: same context (next byte already decoded, going right-to-left) with inverse op.
+// COND-NEXT: op+amp keyed by high k bits of b[i+1] (unmodified next byte).
 static SR search_cond_next(const u8*blk,int n,double base){
     SR r; memset(&r,0,sizeof(r)); r.id=13; r.entropy=base; r.overhead=PAT_OH[13];
-    double be=base; int bk=1,bop=0; u8 bamps[256]={0};
+    double best_net=-1e30; int bk=1,bflex=0; u8 bamps[256]={0}, bops[256]={0};
     for(int k=1;k<=4;k++){
         int N=1<<k;
         int (*gh)[256]=malloc(N*256*sizeof(int)); if(!gh) continue;
         memset(gh,0,N*256*sizeof(int));
         for(int i=0;i<n-1;i++) gh[blk[i+1]>>(8-k)][blk[i]]++;
         for(int op=0;op<N_OPS;op++){
-            u8 amps[256]={0};
+            u8 amps[256]={0}; int oh=5+3+3+N*8;
             double e=cond_greedy(gh,N,n,blk[n-1],op,amps);
-            if(e<be){be=e;bk=k;bop=op;memcpy(bamps,amps,N*sizeof(u8));}}
+            double net=(base-e)*n-oh;
+            if(net>best_net){best_net=net;bk=k;bflex=0;r.entropy=e;r.overhead=oh;r.p[1]=op;
+                memcpy(bamps,amps,N);}}
+        {u8 amps[256]={0},ops[256]={0}; int oh=5+3+N*11;
+         double e=cond_greedy_flex(gh,N,n,blk[n-1],amps,ops);
+         double net=(base-e)*n-oh;
+         if(net>best_net){best_net=net;bk=k;bflex=1;r.entropy=e;r.overhead=oh;
+             memcpy(bamps,amps,N);memcpy(bops,ops,N);}}
         free(gh);}
-    r.entropy=be; r.p[0]=bk; r.p[1]=bop;
-    {int N=1<<bk; memcpy(r.amps,bamps,N*sizeof(u8)); r.overhead=5+3+3+N*8;}
-    snprintf(r.name,sizeof(r.name),"COND-NEXT k=%d %s",bk,opname[bop]);
+    r.p[0]=bk; r.p[2]=bflex;
+    {int N=1<<bk; memcpy(r.amps,bamps,N); if(bflex) memcpy(r.grp_ops,bops,N);}
+    snprintf(r.name,sizeof(r.name),"COND-NEXT k=%d%s",bk,bflex?"-F":"");
     return r;
 }
 
-// COND-DELTA: amp keyed by high k bits of (b[i-1] XOR b[i-2]) — local difference as context.
-// Inverse: same context (b[i-1], b[i-2] already decoded) with inverse op, left-to-right.
+// COND-DELTA: op+amp keyed by high k bits of (b[i-1] XOR b[i-2]).
 static SR search_cond_delta(const u8*blk,int n,double base){
     SR r; memset(&r,0,sizeof(r)); r.id=14; r.entropy=base; r.overhead=PAT_OH[14];
-    double be=base; int bk=1,bop=0; u8 bamps[256]={0};
+    double best_net=-1e30; int bk=1,bflex=0; u8 bamps[256]={0}, bops[256]={0};
     for(int k=1;k<=4;k++){
         int N=1<<k;
         int (*gh)[256]=malloc(N*256*sizeof(int)); if(!gh) continue;
         memset(gh,0,N*256*sizeof(int));
         for(int i=2;i<n;i++) gh[(blk[i-1]^blk[i-2])>>(8-k)][blk[i]]++;
         for(int op=0;op<N_OPS;op++){
-            u8 amps[256]={0};
+            u8 amps[256]={0}; int oh=5+3+3+N*8;
             double e=cond_greedy(gh,N,n,blk[0],op,amps);
-            if(e<be){be=e;bk=k;bop=op;memcpy(bamps,amps,N*sizeof(u8));}}
+            double net=(base-e)*n-oh;
+            if(net>best_net){best_net=net;bk=k;bflex=0;r.entropy=e;r.overhead=oh;r.p[1]=op;
+                memcpy(bamps,amps,N);}}
+        {u8 amps[256]={0},ops[256]={0}; int oh=5+3+N*11;
+         double e=cond_greedy_flex(gh,N,n,blk[0],amps,ops);
+         double net=(base-e)*n-oh;
+         if(net>best_net){best_net=net;bk=k;bflex=1;r.entropy=e;r.overhead=oh;
+             memcpy(bamps,amps,N);memcpy(bops,ops,N);}}
         free(gh);}
-    r.entropy=be; r.p[0]=bk; r.p[1]=bop;
-    {int N=1<<bk; memcpy(r.amps,bamps,N*sizeof(u8)); r.overhead=5+3+3+N*8;}
-    snprintf(r.name,sizeof(r.name),"COND-DELTA k=%d %s",bk,opname[bop]);
+    r.p[0]=bk; r.p[2]=bflex;
+    {int N=1<<bk; memcpy(r.amps,bamps,N); if(bflex) memcpy(r.grp_ops,bops,N);}
+    snprintf(r.name,sizeof(r.name),"COND-DELTA k=%d%s",bk,bflex?"-F":"");
     return r;
 }
 
@@ -201,7 +244,7 @@ static void run_all(const u8 *blk, int n, double base, SR *out) {
 typedef struct {
     char   name[32];   // base op name (no params), fixed at startup
     long   count;      // total times this slot won across all blocks
-    long   opt_count;  // times in top-3 p  rofitable but not chosen
+    long   opt_count;  // times in top-3 profitable but not chosen
     double sum_net;
     double min_net;
     double max_net;
