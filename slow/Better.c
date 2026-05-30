@@ -9,12 +9,10 @@
 
 typedef uint8_t u8;
 
-#define BLOCK_SIZE  (64 * 1024)
+#define BLOCK_SIZE  (4 * 1024)
 #define MAX_STRIDE  64
 #define N_OPS       6
-#define N_GSHAPES   10
-#define N_PSHAPES   8
-#define N_PATTERNS  19
+#define N_PATTERNS  23
 
 // ── GF(256) ───────────────────────────────────────────────────────────────────
 static u8 gf_exp[512], gf_log[256];
@@ -49,39 +47,6 @@ static void hist_transform(const int in[256],int out[256],int op,int amp){
 // ops: 0=ADD  1=XOR  2=MUL  3=ADDLO  4=SWXOR  5=GFMUL
 static const char *opname[]={"ADD","XOR","MUL","ADDLO","SWXOR","GFMUL"};
 
-// ── Amplitude shapes ──────────────────────────────────────────────────────────
-static inline u8 global_amp(int s,int i,int n,int A){
-    long long v=0,d,h;
-    switch(s){
-        case 0:v=(long long)i*A/(n-1);break;
-        case 1:v=A-(long long)i*A/(n-1);break;
-        case 2:v=(long long)i*i*A/((long long)(n-1)*(n-1));break;
-        case 3:v=A-(long long)i*i*A/((long long)(n-1)*(n-1));break;
-        case 4:d=(i<n/2)?i:(n-1-i);v=d*2*A/(n-1);break;
-        case 5:d=(i<n/2)?i:(n-1-i);v=A-d*2*A/(n-1);break;
-        case 6:v=(long long)(i/(n/4))*A/3;break;
-        case 7:v=A-(long long)(i/(n/4))*A/3;break;
-        case 8:h=(n-1)/2;d=i-h;v=A-d*d*A/(h*h+1);break;
-        case 9:{long long t=(long long)i*256/(n-1);v=t*t*(3*256-2*t)*A/(256LL*256*256);}break;
-    }
-    if(v<0)v=0;if(v>255)v=255;return(u8)v;
-}
-static const char *gshape_name[]={"ramp-up","ramp-dn","quad-up","quad-dn","pyramid","valley","stair-up","stair-dn","gauss","s-curve"};
-static inline u8 periodic_amp(int s,int q,int P,int A){
-    int v=0,h=P/2?P/2:1;
-    switch(s){
-        case 0:v=(P>1)?q*A/(P-1):0;break;
-        case 1:v=(P>1)?A-q*A/(P-1):A;break;
-        case 2:v=(q<h)?(q*A/h):((P-1-q)*A/h);break;
-        case 3:v=(q<h)?A:0;break;
-        case 4:v=(q<P/4)?A:0;break;
-        case 5:v=(q==0)?A:0;break;
-        case 6:v=(q==h)?A:0;break;
-        case 7:v=(int)(A*sin(M_PI*(double)q/P)+0.5);break;
-    }
-    if(v<0)v=0;if(v>255)v=255;return(u8)v;
-}
-static const char *pshape_name[]={"saw-up","saw-dn","triangle","sq-50%","sq-25%","impulse-0","impulse-mid","half-sine"};
 
 // ── Search result struct ──────────────────────────────────────────────────────
 typedef struct {
@@ -103,7 +68,7 @@ typedef struct {
 //  6  SPARSE-INDEX:    set_id(5)+op(3)+amp(8)           = 21
 //  7  PRNG+GRADIENT:   shape(4)+seed(8)+op(3)           = 20
 //  8  NWAY-STRIDE:     N(3)+op(3)+(N*8 for amps)        = 11+N*8 (dynamic)
-//  9  PRNG-JUMP:       seed(8)+maxstep(4)+op(3)+amp(8)  = 28
+//  9  PRNG-JUMP:       seed(9)+maxstep(4)+op(3)+amp(8)  = 29  (seed 0..511)
 // 10  MODULAR-MASK:    P(3)+mask(8)+op(3)+amp(8)        = 27
 // 11  STRIDE-NEIGHBOR: stride(6)+op(3)                  = 14
 // 11  DELTA:           op_type(1)                       =  8  (5 ID + 3 op_type: SUB or XOR)
@@ -114,75 +79,194 @@ typedef struct {
 // 16  THRESH-MAP:      T(8)+amp(8)                      = 21  (rotate [T..255] by amp positions)
 // 17  BIT-ROTATE:      k(3)                             =  8  (rotate each byte's bits by k)
 // 18  GRAY:            dir(1)                           =  6  (Gray encode or Gray decode)
-static const int PAT_OH[] = {22,22,30,27,20,25,21,20,11,28,27, 8,27,26,26,12,21,8,6};
+// 19  DELTA-2:         (none)                           =  5  (second-order SUB delta: b[i]-2b[i-1]+b[i-2])
+// 20  PRNG-WALK:       seed(8)+op(3)+amp(8)             = 24  (full LCG byte as step, ~n/128 visits)
+// 21  MIN-SUB:         type(3)+params+min(8)              = 21 min (stride/walk/prng-sel/mod-mask/sparse)
+// 22  POS-ADD:         step(8)                           = 13
+// 23  POS-XOR:         step(8)                           = 13
+// 24  NIBBLE-DELTA:    (none)                            =  5
+// 25  ACCUM-XOR:       seed(8)                           = 13
+// 26  ACCUM-ADD:       seed(8)                           = 13
+// 27  HI-NIB-ADD:      amp(4)                            =  9
+// 28  LO-NIB-ADD:      amp(4)                            =  9
+// 29  HI-NIB-XOR:      amp(4)                            =  9
+// 30  LO-NIB-XOR:      amp(4)                            =  9
+// 31  BIT-REVERSE:     (none)                            =  5
+// 32  PRNG-BITROT:     seed(8)                           = 13  per-byte PRNG rotation amount
+// 33  PRNG-NIBSWAP:    seed(8)+thr(3)                    = 16  PRNG-gated nibble swap
+// 34  PRNG-GRAY:       seed(8)+thr(3)+dir(1)             = 17  PRNG-gated Gray encode/decode
+// 35  PRNG-HINIB-ADD:  seed(8)+thr(3)+amp(4)             = 20  PRNG-gated high-nibble rotate
+// 36  PRNG-LONIB-ADD:  seed(8)+thr(3)+amp(4)             = 20  PRNG-gated low-nibble rotate
+// 37  PRNG-BITREV:     seed(8)+thr(3)                    = 16  PRNG-gated bit reversal
+// 38  PRNG-DELTA-GATE: seed(8)+thr(3)                    = 16  PRNG-gated delta subtraction
+// 39  PRNG-HINIB-XOR:  seed(8)+thr(3)+amp(4)             = 20  PRNG-gated high-nibble XOR
+// 40  PRNG-LONIB-XOR:  seed(8)+thr(3)+amp(4)             = 20  PRNG-gated low-nibble XOR
+// 41  NWAY-PRNG-AMP:    N(3)+seed(8)+op(3)               = 19  N interleaved per-channel PRNGs
+// 42  PRNG-STRD-DELTA:  N(6)+seed(8)+thr(3)             = 22  PRNG-gated stride delta
+// 43  PRNG-DUAL-STRIDE: stride(6)+seed(8)+op(3)         = 22  dual stride with PRNG amps
+// 44  PRNG-NIB-DELTA:   seed(8)+thr(3)                  = 16  PRNG-gated nibble delta
+// 45  BLOCK-FOLD-XOR:   (none)                          =  5  XOR first half with second half
+// 46  STRIDE-DELTA-2:   N(6)                            = 11  second-order stride delta
+// 47  ROLLING-XOR-K:    k(6)                            = 11  b[i]^=b[i-k]^b[i-2k]
+// 48  STRIDE-ACCUM:     stride(6)+seed(8)               = 19  ACCUM-XOR within each stride group
+// 49  NIB-CROSS-DELTA:  (none)                          =  5  cross-delta between nibble streams
+// 50  PRNG-CTXT-PREV:   k(3)+op(3)+seed(8)             = 19  PRNG-amp context-keyed by prev byte
+// 51  PRNG-GFMUL-STRD:  stride(6)+seed(8)              = 19  PRNG GF256 coeff at stride positions
+// 52  STRIDE-ACCUM-ADD: stride(6)+seed(8)              = 19  ACCUM-ADD within each stride group
+// 53  POS-MOD-OP:       P(6)+op(3)                    = 14  amp=i%P, apply op(b[i], i%P)
+// 54  PRNG-COMPLEMENT:  seed(8)+thr(3)                 = 16  PRNG-gated byte complement (255-v)
+// 55  PRNG-STRD-XDELTA: N(6)+seed(8)+thr(3)           = 22  PRNG-gated XOR stride delta
+// 56  PRNG-GFMUL-ALL:   seed(8)                        = 13  PRNG GF256 coeff per byte
+// 57  STRIDE-NEG:       stride(6)                      = 11  complement (255-v) at stride positions
+// 58  GF-STRIDE-FIXED:  stride(6)+alpha(8)             = 19  fixed-alpha GF256 at stride positions
+// 59  PRNG-XOR-PREV:    seed(8)+thr(3)                 = 16  PRNG-gated XOR-with-previous-byte
+// 60  DUAL-DELTA:       (none)                         =  5  b[i]-=b[i-1]+b[i-2], right-to-left
+// 61  STRIDE-CROSS-XOR: stride(6)                      = 11  XOR pairs within stride-2s groups
+// 62  STRIDE-NIBSWAP:   stride(6)                      = 11  nibble-swap at stride positions
+// 63  GF-RAMP:          alpha(8)                        = 13  multiply b[i] by alpha^i in GF256
+// 64  PRNG-PERIOD-AMP:  P(6)+seed(8)+op(3)             = 22  PRNG-derived per-position amps (periodic)
+// 65  MOD-COMPLEMENT:   P(3)+r(3)                      = 11  complement bytes where i%P==r
+// 66  VALUE-BKT-ROTATE: log2M(3)+amp(8)                = 16  rotate value within M-size buckets
+// 67  BIT-SWAP-PAIRS:   (none)                         =  5  swap adjacent bit pairs in every byte
+// 68  BIT-ROT-STRIDE:   stride(6)+k(3)                 = 14  fixed bit-rotation at stride positions
+// 69  PRNG-HASH-CTXT:   seed(8)+op(3)                  = 16  context=b[i-1]^b[i-2], PRNG-amp
+// 70  QUAD-DELTA:       (none)                         =  5  b[i]-=b[i-1]-b[i-2]+b[i-3]
+// 71  PRNG-STRD-BITROT: stride(6)+seed(8)              = 19  per-position PRNG bit-rotation at stride
+// 72  TWO-STRD-DELTA:   N1(6)+N2(6)                   = 17  b[i]-=b[i-N1]+b[i-N2]
+// 73  STRIDED-GRAY:     stride(6)+dir(1)               = 12  Gray encode/decode at stride positions
+// 74  NIBBLE-ACCUM:     seed(8)                        = 13  XOR nibble accumulator (self-inverse)
+// 75  PRNG-POS-SCALE:   seed(8)                        = 13  b[i]+=(prng_i*(u8)i)%256
+// 76  PRNG-STRD-COMP:   stride(6)+seed(8)+thr(3)       = 22  PRNG-gated complement at stride pos
+// 77  PRNG-SPARSE-PRNG: set_id(5)+seed(8)+op(3)        = 21  sparse selection + PRNG amp per pos
+// 78  STRD-COMPL-ALT:   stride(6)                      = 11  complement alternating stride groups
+// 79  PRNG-BITSWAP:     seed(8)+thr(3)                 = 16  PRNG-gated bit-swap-pairs
+// 80  STRIDE-GRP-AMP:   stride(6)+op(3)               = 14  amp=(i/stride)%256, group-index amp
+// 81  DUAL-GRAY:        (none)                         =  5  encode first half, decode second half
+// 82  FIBONACCI-DELTA:  (none)                         =  5  delta along Fibonacci index sequence
+// 83  CHUNK-ACCUM:      chunk(6)                       = 11  ACCUM-XOR within each fixed-size chunk
+// 84  PRNG-CTXT-NEXT-K: k(3)+op(3)+seed(8)            = 19  PRNG amps for next-byte context
+// 85  STAIRCASE-ADD:    step(6)+scale(8)               = 19  b[i]+=(i/step)*scale
+// 86  PARITY-XOR:       amp(8)                         = 13  XOR at even-popcount-index positions
+// 87  TWO-ACCUM:        seed(8)                        = 13  separate ACCUM-XOR for even/odd pos
+// 88  STAIRCASE-XOR:    step(6)                        = 11  b[i]^=(i/step)&0xFF, self-inverse
+// 89  PRNG-TWIN-ACCUM:  seed1(8)+seed2(8)              = 21  two interleaved ACCUM-XOR streams
+// 90  PRNG-CHUNK-ACCUM: chunk(6)+seed(8)               = 19  per-chunk PRNG-seeded ACCUM-XOR
+// 91  HALF-DELTA:       (none)                         =  5  delta on first half of block only
+// 92  XOR-ALTERNATING:  amp(8)                         = 13  even^amp, odd^(255-amp)
+// 93  GF-STRIDE-HALF:   stride(6)+alpha(8)             = 19  alpha at even groups, inv_alpha at odd
+// 94  PRNG-FIB-AMP:     seed(8)+op(3)                  = 16  PRNG amp at Fibonacci positions
+// 95  PRNG-CHUNK-COMP:  chunk(6)+seed(8)+thr(3)        = 22  PRNG-gated complement, reset per chunk
+// 96  BIT-INTERLEAVE:   (none)                         =  5  swap bit planes between consecutive pairs
+// 97  PERIOD-TWO-OP:    op1(3)+op2(3)+amp(8)           = 19  alternate two ops with shared amp
+// 98  STRIDE-GF-RAMP:   stride(6)+alpha(8)             = 19  GF-ramp at stride positions only
+// 99  PRNG-HALF-ACCUM:  seed1(8)+seed2(8)              = 21  separate ACCUM-XOR per block half
+static const int PAT_OH[] = {22,22,30,27,20,25,21,20,11,29,27, 8,27,26,26,12,21,8,6,5,24,21,
+                              13,13,5,13,13,9,9,9,9,5,
+                              13,16,17,20,20,16,16,20,20,19,
+                              22,22,16,5,11,11,19,5,19,19,
+                              19,14,16,22,13,11,19,16,5,11,
+                              11,13,22,11,16,5,14,16,5,19,
+                              17,12,13,13,22,21,11,16,
+                              14,5,5,11,19,19,13,13,11,21,
+                              19,5,13,19,16,22,5,19,19,21};
 
 // ── Apply a SearchResult in-place ─────────────────────────────────────────────
 static void apply_sr(u8 *blk, int n, const SR *r) {
-    int x,op,amp,seed,P,N,shape;
+    int x,op,amp,seed,P;
     u8 *orig=NULL;
     if(r->id==12||r->id==14){  // COND-PREV and COND-DELTA need orig
         orig=malloc(n); if(orig) memcpy(orig,blk,n);
     }
     switch(r->id){
-        case 0: x=r->p[0];op=r->p[1];amp=r->p[2]; // STRIDE-CONST
-            for(int p=0;p<n;p+=x) blk[p]=op_byte(blk[p],(u8)amp,op); break;
         case 1: x=r->p[0];seed=r->p[1];op=r->p[2]; // STRIDE-PRNG-AMP
             {uint32_t st=(uint32_t)seed; for(int p=0;p<n;p+=x) blk[p]=op_byte(blk[p],lcg_byte(&st),op);} break;
-        case 2: x=r->p[0];op=r->p[1];{int a1=r->p[2],a2=r->p[3]; // DUAL-STRIDE
-            for(int p=0;p<n;p+=2*x) blk[p]=op_byte(blk[p],(u8)a1,op);
-            for(int p=x;p<n;p+=2*x) blk[p]=op_byte(blk[p],(u8)a2,op);} break;
         case 3: seed=r->p[0];amp=r->p[1];op=r->p[2]; // PRNG-SELECT
             {int thr_vals[]={25,64,128,192,230};u8 thr=(u8)thr_vals[r->p[3]];
              uint32_t st=(uint32_t)seed;
              for(int i=0;i<n;i++) if(lcg_byte(&st)>=thr) blk[i]=op_byte(blk[i],(u8)amp,op);} break;
-        case 4: shape=r->p[0];op=r->p[1];amp=r->p[2]; // GLOBAL-SHAPE
-            for(int i=0;i<n;i++) blk[i]=op_byte(blk[i],global_amp(shape,i,n,amp),op); break;
-        case 5: P=r->p[0];shape=r->p[1];op=r->p[2];amp=r->p[3]; // PERIODIC-SHAPE
-            for(int i=0;i<n;i++) blk[i]=op_byte(blk[i],periodic_amp(shape,i%P,P,amp),op); break;
-        case 6: {int set_id=r->p[0];op=r->p[1];amp=r->p[2]; // SPARSE-INDEX
-            u8*mask=calloc(n,1);if(!mask)break;
-            if(set_id==0){int a=0,b=1;while(b<n){mask[b]=1;int c=a+b;a=b;b=c;}}
-            else if(set_id==1){for(int p=1;p<n;p<<=1)mask[p]=1;}
-            else if(set_id==2){u8*sv=calloc(n,1);for(int i=2;i<n;i++)sv[i]=1;
-                for(int i=2;(long long)i*i<n;i++)if(sv[i])for(int j=i*i;j<n;j+=i)sv[j]=0;
-                for(int i=2;i<n;i++)if(sv[i])mask[i]=1;free(sv);}
-            else{int pc=set_id-3;for(int i=0;i<n;i++)if(__builtin_popcount(i)==pc)mask[i]=1;}
-            for(int i=0;i<n;i++)if(mask[i])blk[i]=op_byte(blk[i],(u8)amp,op);
-            free(mask);} break;
-        case 7: shape=r->p[0];seed=r->p[1];op=r->p[2]; // PRNG+GRADIENT
-            {uint32_t st=(uint32_t)seed;
-             for(int i=0;i<n;i++){u8 a=(u8)(global_amp(shape,i,n,128)+lcg_byte(&st));blk[i]=op_byte(blk[i],a,op);}} break;
-        case 8: N=r->p[0];op=r->p[1]; // NWAY-STRIDE
-            for(int i=0;i<n;i++) blk[i]=op_byte(blk[i],r->amps[i%N],op); break;
         case 9: seed=r->p[0];{int ms=r->p[1];op=r->p[2];amp=r->p[3]; // PRNG-JUMP
             uint32_t st=(uint32_t)seed;int pos=0;
             while(pos<n){blk[pos]=op_byte(blk[pos],(u8)amp,op);pos+=(int)(lcg_byte(&st)%ms)+1;}} break;
         case 10: P=r->p[0];{int mask=r->p[1];op=r->p[2];amp=r->p[3]; // MODULAR-MASK
             for(int i=0;i<n;i++) if((mask>>(i%P))&1) blk[i]=op_byte(blk[i],(u8)amp,op);} break;
-        case 11: {int ot=r->p[0]; // DELTA: byte[i] -= byte[i-1], applied right-to-left
-            if(ot==0) for(int i=n-1;i>=1;i--) blk[i]=(u8)(blk[i]-blk[i-1]);
-            else      for(int i=n-1;i>=1;i--) blk[i]^=blk[i-1];} break;
         case 12: {int k=r->p[0];op=r->p[1]; // COND-PREV: amp keyed by high k bits of previous byte
             if(orig) for(int i=1;i<n;i++) blk[i]=op_byte(blk[i],r->amps[orig[i-1]>>(8-k)],op);} break;
         case 13: {int k=r->p[0];op=r->p[1]; // COND-NEXT: amp keyed by high k bits of next byte
             for(int i=0;i<n-1;i++) blk[i]=op_byte(blk[i],r->amps[blk[i+1]>>(8-k)],op);} break;
         case 14: {int k=r->p[0];op=r->p[1]; // COND-DELTA: amp keyed by high k bits of (prev XOR pprev)
             if(orig) for(int i=2;i<n;i++) blk[i]=op_byte(blk[i],r->amps[(orig[i-1]^orig[i-2])>>(8-k)],op);} break;
-        case 15: {int N=r->p[0];int ot=r->p[1]; // STRIDE-DELTA: b'[i] = b[i] OP b[i-N], right-to-left
-            if(ot==0) for(int i=n-1;i>=N;i--) blk[i]=(u8)(blk[i]-blk[i-N]);
-            else       for(int i=n-1;i>=N;i--) blk[i]^=blk[i-N];} break;
-        case 16: {int T=r->p[0]; int amp=r->p[1]; int M=256-T; // THRESH-MAP: rotate [T..255] by amp
-            // Reversible: inverse applies rotation by M-(amp%M) within [T..255]
-            for(int i=0;i<n;i++)
-                if(blk[i]>=(u8)T) blk[i]=(u8)(T+(blk[i]-T+amp)%M);} break;
-        case 17: {int k=r->p[0]; // BIT-ROTATE: rotate all bytes left by k bits
-            // Reversible: inverse rotates by (8-k)
-            for(int i=0;i<n;i++) blk[i]=(u8)((blk[i]<<k)|(blk[i]>>(8-k)));} break;
-        case 18: {int dir=r->p[0]; // GRAY: dir=0 encode (b^(b>>1)), dir=1 decode
-            // Encode and decode are each other's inverse
-            if(dir==0){for(int i=0;i<n;i++) blk[i]^=(blk[i]>>1);}
-            else{for(int i=0;i<n;i++){u8 v=blk[i];v^=(v>>4);v^=(v>>2);v^=(v>>1);blk[i]=v;}}
-            } break;
+        case 36: { // PRNG-LONIB-ADD: PRNG-gated low-nibble rotate, inv: subtract amp
+            int tv[]={25,64,128,192,230}; u8 thr=(u8)tv[r->p[1]];
+            int amp=r->p[2]; uint32_t st=(uint32_t)r->p[0];
+            for(int i=0;i<n;i++){if(lcg_byte(&st)>=thr)
+                blk[i]=(u8)((blk[i]&0xF0)|((blk[i]+amp)&0xF));}} break;
+        case 39: { // PRNG-HINIB-XOR: PRNG-gated high-nibble XOR, self-inverse
+            int tv[]={25,64,128,192,230}; u8 thr=(u8)tv[r->p[1]];
+            int amp=r->p[2]; uint32_t st=(uint32_t)r->p[0];
+            for(int i=0;i<n;i++){if(lcg_byte(&st)>=thr)
+                blk[i]=(u8)((blk[i]&0x0F)|(((blk[i]>>4)^amp)<<4));}} break;
+        case 40: { // PRNG-LONIB-XOR: PRNG-gated low-nibble XOR, self-inverse
+            int tv[]={25,64,128,192,230}; u8 thr=(u8)tv[r->p[1]];
+            int amp=r->p[2]; uint32_t st=(uint32_t)r->p[0];
+            for(int i=0;i<n;i++){if(lcg_byte(&st)>=thr)
+                blk[i]=(u8)((blk[i]&0xF0)|((blk[i]^amp)&0x0F));}} break;
+        case 42: { // PRNG-STRD-DELTA: apply stride-N delta at PRNG-gated positions, right-to-left
+            int N=r->p[0]; int tv[]={25,64,128,192,230}; u8 thr=(u8)tv[r->p[2]];
+            uint32_t st=(uint32_t)r->p[1];
+            u8 *gate=malloc(n); if(!gate) break;
+            for(int i=0;i<n;i++) gate[i]=(lcg_byte(&st)>=thr)?1:0;
+            for(int i=n-1;i>=N;i--) if(gate[i]) blk[i]=(u8)(blk[i]-blk[i-N]);
+            free(gate);} break;
+        case 43: { // PRNG-DUAL-STRIDE: dual sub-stride with per-element PRNG amps
+            // Even sub-stride uses seed; odd sub-stride uses seed^255.
+            int s=r->p[0]; int op=r->p[2];
+            uint32_t st_e=(uint32_t)r->p[1], st_o=(uint32_t)(r->p[1]^255);
+            for(int p=0;p<n;p+=2*s) blk[p]=op_byte(blk[p],lcg_byte(&st_e),op);
+            for(int p=s;p<n;p+=2*s) blk[p]=op_byte(blk[p],lcg_byte(&st_o),op);} break;
+        case 95: {int C=r->p[0]; u8 seed=(u8)r->p[1]; // PRNG-CHUNK-COMP
+            int tv[]={25,64,128,192,230}; u8 thr=(u8)tv[r->p[2]];
+            // PRNG resets per chunk; gate selects complement. Self-inverse.
+            for(int base_=0;base_<n;base_+=C){
+                uint32_t st=(uint32_t)seed;
+                for(int k=0;k<C&&base_+k<n;k++)
+                    if(lcg_byte(&st)>=thr) blk[base_+k]=(u8)(255-blk[base_+k]);}} break;
+        case 98: {int s=r->p[0]; u8 alpha=(u8)r->p[1]; if(alpha<2)alpha=2; // STRIDE-GF-RAMP
+            // At stride positions, multiply by successive powers of alpha (alpha^0, alpha^1, ...).
+            // Inverse: multiply by powers of gf_inv(alpha).
+            u8 acc=1;
+            for(int p=0;p<n;p+=s){blk[p]=gf_mul(blk[p],acc);acc=gf_mul(acc,alpha);}} break;
+        case 73: { // STRIDED-GRAY: Gray encode(dir=0) or decode(dir=1) at stride positions
+            int s=r->p[0]; int dir=r->p[1];
+            for(int p=0;p<n;p+=s){
+                if(!dir)blk[p]^=(blk[p]>>1);
+                else{u8 v=blk[p];v^=(v>>4);v^=(v>>2);v^=(v>>1);blk[p]=v;}}} break;
+        case 76: { // PRNG-STRD-COMP: PRNG-gated complement at stride positions
+            int s=r->p[0]; int tv[]={25,64,128,192,230}; u8 thr=(u8)tv[r->p[2]];
+            uint32_t st=(uint32_t)(u8)r->p[1];
+            for(int p=0;p<n;p+=s){if(lcg_byte(&st)>=thr) blk[p]=(u8)(255-blk[p]);}} break;
+        case 62: {int s=r->p[0]; // STRIDE-NIBSWAP: nibble-swap at stride positions, self-inverse
+            for(int p=0;p<n;p+=s){u8 v=blk[p];blk[p]=(u8)((v>>4)|(v<<4));}} break;
+        case 68: {int s=r->p[0]; int k=r->p[1]; // BIT-ROT-STRIDE: fixed bit-rotation at stride
+            for(int p=0;p<n;p+=s) blk[p]=(u8)((blk[p]<<k)|(blk[p]>>(8-k)));} break;
+        case 71: {int s=r->p[0]; uint32_t st=(uint32_t)(u8)r->p[1]; // PRNG-STRD-BITROT
+            for(int p=0;p<n;p+=s){int k=(int)(lcg_byte(&st)%7)+1;
+                blk[p]=(u8)((blk[p]<<k)|(blk[p]>>(8-k)));}} break;
+        case 55: { // PRNG-STRD-XDELTA: PRNG-gated XOR stride delta, right-to-left, self-inverse
+            int N=r->p[0]; int tv[]={25,64,128,192,230}; u8 thr=(u8)tv[r->p[2]];
+            uint32_t st=(uint32_t)r->p[1];
+            u8 *gate=malloc(n); if(!gate) break;
+            for(int i=0;i<n;i++) gate[i]=(lcg_byte(&st)>=thr)?1:0;
+            for(int i=n-1;i>=N;i--) if(gate[i]) blk[i]^=blk[i-N];
+            free(gate);} break;
+        case 57: {int s=r->p[0]; // STRIDE-NEG: complement (255-v) at stride positions, self-inverse
+            for(int p=0;p<n;p+=s) blk[p]=(u8)(255-blk[p]);} break;
+        case 58: {int s=r->p[0]; u8 alpha=(u8)r->p[1]; if(alpha<2)alpha=2; // GF-STRIDE-FIXED
+            // Inverse: multiply by gf_exp[255-gf_log[alpha]] at same positions.
+            for(int p=0;p<n;p+=s) blk[p]=gf_mul(blk[p],alpha);} break;
+        case 51: { // PRNG-GFMUL-STRD: PRNG GF256 coeff at stride positions, inv: GF256 inverse coeff
+            int s=r->p[0]; uint32_t st=(uint32_t)(u8)r->p[1];
+            for(int p=0;p<n;p+=s){u8 alpha=lcg_byte(&st); if(alpha<2)alpha=2;
+                blk[p]=gf_mul(blk[p],alpha);}} break;
     }
     free(orig);
 }
@@ -194,29 +278,6 @@ static void apply_sr(u8 *blk, int n, const SR *r) {
 #define SKIP_OP(op,amp) if(op==2&&(amp&1)==0) continue;
 
 // ── Search functions ──────────────────────────────────────────────────────────
-
-static SR search_stride_const(const u8*blk,int n,double base){
-    SR r; memset(&r,0,sizeof(r)); r.id=0; strcpy(r.name,"STRIDE-CONST"); r.entropy=base; r.overhead=PAT_OH[0];
-    int bfreq[256]={0};for(int i=0;i<n;i++)bfreq[blk[i]]++;
-    double be=base;int bx=0,bop=0,bamp=0;
-    #pragma omp parallel
-    {double le=base;int lx=0,lop=0,la=0;
-     #pragma omp for schedule(dynamic,1)
-     for(int x=1;x<=MAX_STRIDE;x++){
-         int sf[256]={0};for(int p=0;p<n;p+=x)sf[blk[p]]++;
-         int nsf[256];for(int v=0;v<256;v++)nsf[v]=bfreq[v]-sf[v];
-         for(int op=0;op<N_OPS;op++){OP_RANGE(op,alo,ahi)
-             for(int amp=alo;amp<=ahi;amp++){SKIP_OP(op,amp)
-                 int tf[256],ff[256];hist_transform(sf,tf,op,amp);
-                 for(int v=0;v<256;v++)ff[v]=nsf[v]+tf[v];
-                 double e=entropy_from_hist(ff,n);if(e<le){le=e;lx=x;lop=op;la=amp;}}}
-     }
-     #pragma omp critical
-     if(le<be){be=le;bx=lx;bop=lop;bamp=la;}}
-    r.entropy=be;r.p[0]=bx;r.p[1]=bop;r.p[2]=bamp;
-    snprintf(r.name,sizeof(r.name),"STRIDE-CONST %s s=%d a=%d",opname[bop],bx,bamp);
-    return r;
-}
 
 static SR search_stride_prng_amp(const u8*blk,int n,double base){
     SR r; memset(&r,0,sizeof(r)); r.id=1; r.entropy=base; r.overhead=PAT_OH[1];
@@ -238,37 +299,6 @@ static SR search_stride_prng_amp(const u8*blk,int n,double base){
      if(le<be){be=le;bx=lx;bop=lop;bseed=ls;}}
     r.entropy=be;r.p[0]=bx;r.p[1]=bseed;r.p[2]=bop;
     snprintf(r.name,sizeof(r.name),"STRIDE-PRNG-AMP %s s=%d seed=%d",opname[bop],bx,bseed);
-    return r;
-}
-
-static SR search_dual_stride(const u8*blk,int n,double base){
-    SR r; memset(&r,0,sizeof(r)); r.id=2; r.entropy=base; r.overhead=PAT_OH[2];
-    int bfreq[256]={0};for(int i=0;i<n;i++)bfreq[blk[i]]++;
-    double be=base;int bx=0,bop=0,ba1=0,ba2=0;
-    #pragma omp parallel
-    {double le=base;int lx=0,lop=0,la1=0,la2=0;
-     #pragma omp for schedule(dynamic,1)
-     for(int x=1;x<=MAX_STRIDE;x++){
-         int ef[256]={0},of_[256]={0};
-         for(int p=0;p<n;p+=2*x)ef[blk[p]]++;
-         for(int p=x;p<n;p+=2*x)of_[blk[p]]++;
-         int nf[256];for(int v=0;v<256;v++)nf[v]=bfreq[v]-ef[v]-of_[v];
-         for(int op=0;op<N_OPS;op++){OP_RANGE(op,alo,ahi)
-             double p1b=le;int p1a=0;
-             for(int a1=alo;a1<=ahi;a1++){SKIP_OP(op,a1)
-                 int tf[256],ff[256];hist_transform(ef,tf,op,a1);
-                 for(int v=0;v<256;v++)ff[v]=nf[v]+of_[v]+tf[v];
-                 double e=entropy_from_hist(ff,n);if(e<p1b){p1b=e;p1a=a1;}}
-             if(!p1a)continue;
-             int eft[256];hist_transform(ef,eft,op,p1a);
-             for(int a2=alo;a2<=ahi;a2++){SKIP_OP(op,a2)
-                 int tf[256],ff[256];hist_transform(of_,tf,op,a2);
-                 for(int v=0;v<256;v++)ff[v]=nf[v]+eft[v]+tf[v];
-                 double e=entropy_from_hist(ff,n);if(e<le){le=e;lx=x;lop=op;la1=p1a;la2=a2;}}}}
-     #pragma omp critical
-     if(le<be){be=le;bx=lx;bop=lop;ba1=la1;ba2=la2;}}
-    r.entropy=be;r.p[0]=bx;r.p[1]=bop;r.p[2]=ba1;r.p[3]=ba2;
-    snprintf(r.name,sizeof(r.name),"DUAL-STRIDE %s s=%d a1=%d a2=%d",opname[bop],bx,ba1,ba2);
     return r;
 }
 
@@ -298,137 +328,6 @@ static SR search_prng_select(const u8*blk,int n,double base){
     return r;
 }
 
-static SR search_global_shapes(const u8*blk,int n,double base){
-    SR r; memset(&r,0,sizeof(r)); r.id=4; r.entropy=base; r.overhead=PAT_OH[4];
-    double be=base;int bsh=0,bop=0,bamp=0;
-    #pragma omp parallel
-    {double le=base;int lsh=0,lop=0,la=0;int ff[256];
-     #pragma omp for schedule(dynamic,1)
-     for(int sh=0;sh<N_GSHAPES;sh++)for(int A=1;A<=255;A++)for(int op=0;op<N_OPS;op++){
-         memset(ff,0,sizeof(ff));
-         for(int i=0;i<n;i++)ff[op_byte(blk[i],global_amp(sh,i,n,A),op)]++;
-         double e=entropy_from_hist(ff,n);if(e<le){le=e;lsh=sh;lop=op;la=A;}}
-     #pragma omp critical
-     if(le<be){be=le;bsh=lsh;bop=lop;bamp=la;}}
-    r.entropy=be;r.p[0]=bsh;r.p[1]=bop;r.p[2]=bamp;
-    snprintf(r.name,sizeof(r.name),"GLOBAL-SHAPE %s %s A=%d",gshape_name[bsh],opname[bop],bamp);
-    return r;
-}
-
-static SR search_periodic_shapes(const u8*blk,int n,double base){
-    SR r; memset(&r,0,sizeof(r)); r.id=5; r.entropy=base; r.overhead=PAT_OH[5];
-    double be=base;int bP=0,bsh=0,bop=0,bamp=0;
-    #pragma omp parallel
-    {double le=base;int lP=0,lsh=0,lop=0,la=0;
-     #pragma omp for schedule(dynamic,1)
-     for(int P=2;P<=MAX_STRIDE;P++){
-         int (*sf)[256]=malloc(P*256*sizeof(int));if(!sf)continue;
-         memset(sf,0,P*256*sizeof(int));
-         for(int i=0;i<n;i++)sf[i%P][blk[i]]++;
-         for(int A=1;A<=255;A++)for(int sh=0;sh<N_PSHAPES;sh++)for(int op=0;op<N_OPS;op++){
-             int ff[256]={0};
-             for(int q=0;q<P;q++){u8 amp=periodic_amp(sh,q,P,A);int tf[256];
-                 hist_transform(sf[q],tf,op,amp);for(int v=0;v<256;v++)ff[v]+=tf[v];}
-             double e=entropy_from_hist(ff,n);if(e<le){le=e;lP=P;lsh=sh;lop=op;la=A;}}
-         free(sf);}
-     #pragma omp critical
-     if(le<be){be=le;bP=lP;bsh=lsh;bop=lop;bamp=la;}}
-    r.entropy=be;r.p[0]=bP;r.p[1]=bsh;r.p[2]=bop;r.p[3]=bamp;
-    snprintf(r.name,sizeof(r.name),"PERIODIC %s %s P=%d A=%d",pshape_name[bsh],opname[bop],bP,bamp);
-    return r;
-}
-
-static SR search_sparse_indexed(const u8*blk,int n,double base){
-    SR r; memset(&r,0,sizeof(r)); r.id=6; r.entropy=base; r.overhead=PAT_OH[6];
-    int bfreq[256]={0};for(int i=0;i<n;i++)bfreq[blk[i]]++;
-    int fib[64],nfib=0;{int a=0,b=1;while(b<n&&nfib<64){fib[nfib++]=b;int c=a+b;a=b;b=c;}}
-    int p2[20],np2=0;{for(int p=1;p<n;p<<=1)p2[np2++]=p;}
-    u8 *sv=calloc(n,1);int *primes=NULL;int nprimes=0;
-    if(sv){for(int i=2;i<n;i++)sv[i]=1;
-        for(int i=2;(long long)i*i<n;i++)if(sv[i])for(int j=i*i;j<n;j+=i)sv[j]=0;
-        for(int i=2;i<n;i++)if(sv[i])nprimes++;
-        primes=malloc(nprimes*sizeof(int));int j=0;for(int i=2;i<n;i++)if(sv[i])primes[j++]=i;
-        free(sv);}
-    int *pcg[17];int pcn[17]={0};
-    for(int k=0;k<=16;k++){pcg[k]=malloc((n+1)*sizeof(int));if(!pcg[k]){for(int m=0;m<k;m++)free(pcg[m]);free(primes);r.entropy=base;return r;}}
-    for(int i=0;i<n;i++){int pc=__builtin_popcount(i);if(pc<=16)pcg[pc][pcn[pc]++]=i;}
-
-    double be=base;int bset=0,bop=0,bamp=0;
-
-    #define TRY(set_id,idx_arr,cnt) do{ \
-        if((cnt)<=0)break; \
-        int sel[256]={0},unsel[256]; \
-        for(int j=0;j<(cnt);j++)sel[blk[(idx_arr)[j]]]++; \
-        for(int v=0;v<256;v++)unsel[v]=bfreq[v]-sel[v]; \
-        for(int op=0;op<N_OPS;op++){OP_RANGE(op,alo,ahi) \
-            for(int amp=alo;amp<=ahi;amp++){SKIP_OP(op,amp) \
-                int tf[256],ff[256];hist_transform(sel,tf,op,amp); \
-                for(int v=0;v<256;v++)ff[v]=unsel[v]+tf[v]; \
-                double e=entropy_from_hist(ff,n); \
-                if(e<be){be=e;bset=(set_id);bop=op;bamp=amp;}}} \
-    }while(0)
-    TRY(0,fib,nfib); TRY(1,p2,np2); TRY(2,primes,nprimes);
-    for(int k=0;k<=16;k++) TRY(3+k,pcg[k],pcn[k]);
-    #undef TRY
-
-    r.entropy=be;r.p[0]=bset;r.p[1]=bop;r.p[2]=bamp;
-    const char *snames[]={"fib","pow2","primes","pc0","pc1","pc2","pc3","pc4","pc5","pc6","pc7","pc8","pc9","pc10","pc11","pc12","pc13","pc14","pc15","pc16"};
-    snprintf(r.name,sizeof(r.name),"SPARSE %s %s a=%d",snames[bset<20?bset:0],opname[bop],bamp);
-    free(primes);for(int k=0;k<=16;k++)free(pcg[k]);
-    return r;
-}
-
-static SR search_prng_gradient(const u8*blk,int n,double base){
-    SR r; memset(&r,0,sizeof(r)); r.id=7; r.entropy=base; r.overhead=PAT_OH[7];
-    double be=base;int bsh=0,bseed=0,bop=0;
-    #pragma omp parallel
-    {double le=base;int lsh=0,ls=0,lop=0;int ff[256];
-     #pragma omp for schedule(dynamic,1)
-     for(int sh=0;sh<N_GSHAPES;sh++)for(int seed=0;seed<256;seed++)for(int op=0;op<N_OPS;op++){
-         memset(ff,0,sizeof(ff));uint32_t st=(uint32_t)seed;
-         for(int i=0;i<n;i++){u8 a=(u8)(global_amp(sh,i,n,128)+lcg_byte(&st));ff[op_byte(blk[i],a,op)]++;}
-         double e=entropy_from_hist(ff,n);if(e<le){le=e;lsh=sh;ls=seed;lop=op;}}
-     #pragma omp critical
-     if(le<be){be=le;bsh=lsh;bseed=ls;bop=lop;}}
-    r.entropy=be;r.p[0]=bsh;r.p[1]=bseed;r.p[2]=bop;
-    snprintf(r.name,sizeof(r.name),"PRNG+GRAD %s+n %s seed=%d",gshape_name[bsh],opname[bop],bseed);
-    return r;
-}
-
-static SR search_nway_stride(const u8*blk,int n,double base){
-    SR r; memset(&r,0,sizeof(r)); r.id=8; r.entropy=base; r.overhead=PAT_OH[8];
-    int bfreq[256]={0};for(int i=0;i<n;i++)bfreq[blk[i]]++;
-    double be=base;int bN=0,bop=0;u8 bamps[8]={0};
-    #pragma omp parallel
-    {double le=base;int lN=0,lop=0;u8 la[8]={0};
-     #pragma omp for schedule(dynamic,1)
-     for(int N=3;N<=8;N++){
-         int ch[8][256];memset(ch,0,sizeof(ch));
-         for(int i=0;i<n;i++)ch[i%N][blk[i]]++;
-         for(int op=0;op<N_OPS;op++){OP_RANGE(op,alo,ahi)
-             u8 amps[8];for(int k=0;k<N;k++)amps[k]=(u8)alo;
-             int combined[256]={0};
-             for(int k=0;k<N;k++){int tf[256];hist_transform(ch[k],tf,op,amps[k]);for(int v=0;v<256;v++)combined[v]+=tf[v];}
-             for(int pass=0;pass<2;pass++)for(int k=0;k<N;k++){
-                 int tc[256],wk[256];hist_transform(ch[k],tc,op,amps[k]);
-                 for(int v=0;v<256;v++)wk[v]=combined[v]-tc[v];
-                 double bke=1e30;u8 bka=amps[k];
-                 for(int amp=alo;amp<=ahi;amp++){SKIP_OP(op,amp)
-                     int tf[256],ff[256];hist_transform(ch[k],tf,op,amp);
-                     for(int v=0;v<256;v++)ff[v]=wk[v]+tf[v];
-                     double e=entropy_from_hist(ff,n);if(e<bke){bke=e;bka=(u8)amp;}}
-                 int tn[256];hist_transform(ch[k],tn,op,bka);
-                 for(int v=0;v<256;v++)combined[v]=wk[v]+tn[v];amps[k]=bka;}
-             double e=entropy_from_hist(combined,n);
-             if(e<le){le=e;lN=N;lop=op;for(int k=0;k<N;k++)la[k]=amps[k];}}}
-     #pragma omp critical
-     if(le<be){be=le;bN=lN;bop=lop;for(int k=0;k<bN;k++)bamps[k]=la[k];}}
-    r.entropy=be;r.p[0]=bN;r.p[1]=bop;for(int k=0;k<bN;k++)r.amps[k]=bamps[k];
-    r.overhead=5+(11+bN*8);
-    snprintf(r.name,sizeof(r.name),"NWAY N=%d %s",bN,opname[bop]);
-    return r;
-}
-
 static SR search_prng_jump(const u8*blk,int n,double base){
     SR r; memset(&r,0,sizeof(r)); r.id=9; r.entropy=base; r.overhead=PAT_OH[9];
     int bfreq[256]={0};for(int i=0;i<n;i++)bfreq[blk[i]]++;
@@ -437,7 +336,7 @@ static SR search_prng_jump(const u8*blk,int n,double base){
     {double le=base;int ls=0,lst=0,lop=0,la=0;u8 *vm=malloc(n);
      if(vm){
      #pragma omp for schedule(dynamic,1)
-     for(int seed=0;seed<256;seed++)for(int ms=1;ms<=16;ms++){
+     for(int seed=0;seed<512;seed++)for(int ms=1;ms<=16;ms++){
          memset(vm,0,n);uint32_t st=(uint32_t)seed;int pos=0;
          while(pos<n){vm[pos]=1;pos+=(int)(lcg_byte(&st)%ms)+1;}
          int vis[256]={0},unvis[256];
@@ -482,27 +381,6 @@ static SR search_modular_mask(const u8*blk,int n,double base){
     return r;
 }
 
-// DELTA: encode b[i] as (b[i] - b[i-1]) mod 256, or (b[i] XOR b[i-1]).
-// Apply right-to-left so b[i-1] is always the original value when read.
-// Invert left-to-right (standard scan reconstruction).
-// For smooth/correlated data (audio, images) consecutive bytes are similar,
-// so differences cluster near 0 — causing real collisions in the output histogram.
-static SR search_delta(const u8*blk,int n,double base){
-    SR r; memset(&r,0,sizeof(r)); r.id=11; r.entropy=base; r.overhead=PAT_OH[11];
-    double be=base; int bot=0;
-    // try SUB delta
-    {int ff[256]={0}; ff[blk[0]]++;
-     for(int i=1;i<n;i++) ff[(u8)(blk[i]-blk[i-1])]++;
-     double e=entropy_from_hist(ff,n); if(e<be){be=e;bot=0;}}
-    // try XOR delta
-    {int ff[256]={0}; ff[blk[0]]++;
-     for(int i=1;i<n;i++) ff[blk[i]^blk[i-1]]++;
-     double e=entropy_from_hist(ff,n); if(e<be){be=e;bot=1;}}
-    r.entropy=be; r.p[0]=bot;
-    snprintf(r.name,sizeof(r.name),"DELTA %s",bot?"XOR":"SUB");
-    return r;
-}
-
 // Shared greedy search core used by all COND-* patterns.
 // gh[g][0..255] = input histogram for group g.  N = number of groups.
 // unchanged_val = byte value of the one byte that has no context (counted outside groups).
@@ -530,8 +408,8 @@ static double cond_greedy(const int (*gh)[256],int N,int n,int unchanged_val,
 static SR search_cond_prev(const u8*blk,int n,double base){
     SR r; memset(&r,0,sizeof(r)); r.id=12; r.entropy=base; r.overhead=PAT_OH[12];
     double be=base; int bk=1,bop=0; u8 bamps[256]={0};
-    // try k=1..8: 2,4,...,256 groups keyed on high k bits of previous byte
-    for(int k=1;k<=8;k++){
+    // k=5..8 have overhead 267..2059 bits — never profitable on 4KB blocks
+    for(int k=1;k<=4;k++){
         int N=1<<k;
         int (*gh)[256]=malloc(N*256*sizeof(int)); if(!gh) continue;
         memset(gh,0,N*256*sizeof(int));
@@ -547,286 +425,540 @@ static SR search_cond_prev(const u8*blk,int n,double base){
     return r;
 }
 
-// COND-NEXT: amp keyed on high k bits of the NEXT byte.
-// Apply left→right (next byte untouched when processing i). Invert right→left.
+// PRNG-LONIB-ADD: PRNG-gated low-nibble rotation (add amp mod 16).
+// Inverse: same gate, low-nibble subtract amp.
+static SR search_prng_lo_nib_add(const u8*blk,int n,double base){
+    SR r; memset(&r,0,sizeof(r)); r.id=36; r.entropy=base; r.overhead=PAT_OH[36];
+    int bfreq[256]={0}; for(int i=0;i<n;i++) bfreq[blk[i]]++;
+    int tv[]={25,64,128,192,230};
+    double be=base; int bseed=0,bti=0,bamp=0;
+    #pragma omp parallel
+    {double le=base; int ls=0,lti=0,la=0;
+     #pragma omp for schedule(dynamic,1)
+     for(int si=0;si<256;si++) for(int ti=0;ti<5;ti++){
+         u8 thr=(u8)tv[ti]; uint32_t st=(uint32_t)si;
+         int sel[256]={0};
+         for(int i=0;i<n;i++) if(lcg_byte(&st)>=thr) sel[blk[i]]++;
+         for(int amp=1;amp<=15;amp++){
+             int ff[256]={0};
+             for(int v=0;v<256;v++){
+                 ff[v]+=bfreq[v]-sel[v];
+                 ff[(v&0xF0)|((v+amp)&0xF)]+=sel[v];}
+             double e=entropy_from_hist(ff,n); if(e<le){le=e;ls=si;lti=ti;la=amp;}}}
+     #pragma omp critical
+     if(le<be){be=le;bseed=ls;bti=lti;bamp=la;}}
+    r.entropy=be; r.p[0]=bseed; r.p[1]=bti; r.p[2]=bamp;
+    snprintf(r.name,sizeof(r.name),"PRNG-LONIB-ADD a=%d s=%d",bamp,bseed);
+    return r;
+}
+
+// PRNG-HINIB-XOR: PRNG-gated high-nibble XOR. Self-inverse.
+static SR search_prng_hi_nib_xor(const u8*blk,int n,double base){
+    SR r; memset(&r,0,sizeof(r)); r.id=39; r.entropy=base; r.overhead=PAT_OH[39];
+    int bfreq[256]={0}; for(int i=0;i<n;i++) bfreq[blk[i]]++;
+    int tv[]={25,64,128,192,230};
+    double be=base; int bseed=0,bti=0,bamp=0;
+    #pragma omp parallel
+    {double le=base; int ls=0,lti=0,la=0;
+     #pragma omp for schedule(dynamic,1)
+     for(int si=0;si<256;si++) for(int ti=0;ti<5;ti++){
+         u8 thr=(u8)tv[ti]; uint32_t st=(uint32_t)si;
+         int sel[256]={0};
+         for(int i=0;i<n;i++) if(lcg_byte(&st)>=thr) sel[blk[i]]++;
+         for(int amp=1;amp<=15;amp++){
+             int ff[256]={0};
+             for(int v=0;v<256;v++){
+                 ff[v]+=bfreq[v]-sel[v];
+                 ff[(v&0x0F)|(((v>>4)^amp)<<4)]+=sel[v];}
+             double e=entropy_from_hist(ff,n); if(e<le){le=e;ls=si;lti=ti;la=amp;}}}
+     #pragma omp critical
+     if(le<be){be=le;bseed=ls;bti=lti;bamp=la;}}
+    r.entropy=be; r.p[0]=bseed; r.p[1]=bti; r.p[2]=bamp;
+    snprintf(r.name,sizeof(r.name),"PRNG-HINIB-XOR a=%d s=%d",bamp,bseed);
+    return r;
+}
+
+// PRNG-LONIB-XOR: PRNG-gated low-nibble XOR. Self-inverse.
+static SR search_prng_lo_nib_xor(const u8*blk,int n,double base){
+    SR r; memset(&r,0,sizeof(r)); r.id=40; r.entropy=base; r.overhead=PAT_OH[40];
+    int bfreq[256]={0}; for(int i=0;i<n;i++) bfreq[blk[i]]++;
+    int tv[]={25,64,128,192,230};
+    double be=base; int bseed=0,bti=0,bamp=0;
+    #pragma omp parallel
+    {double le=base; int ls=0,lti=0,la=0;
+     #pragma omp for schedule(dynamic,1)
+     for(int si=0;si<256;si++) for(int ti=0;ti<5;ti++){
+         u8 thr=(u8)tv[ti]; uint32_t st=(uint32_t)si;
+         int sel[256]={0};
+         for(int i=0;i<n;i++) if(lcg_byte(&st)>=thr) sel[blk[i]]++;
+         for(int amp=1;amp<=15;amp++){
+             int ff[256]={0};
+             for(int v=0;v<256;v++){
+                 ff[v]+=bfreq[v]-sel[v];
+                 ff[(v&0xF0)|((v^amp)&0x0F)]+=sel[v];}
+             double e=entropy_from_hist(ff,n); if(e<le){le=e;ls=si;lti=ti;la=amp;}}}
+     #pragma omp critical
+     if(le<be){be=le;bseed=ls;bti=lti;bamp=la;}}
+    r.entropy=be; r.p[0]=bseed; r.p[1]=bti; r.p[2]=bamp;
+    snprintf(r.name,sizeof(r.name),"PRNG-LONIB-XOR a=%d s=%d",bamp,bseed);
+    return r;
+}
+
+// PRNG-CHUNK-COMP: PRNG-gated complement per chunk; PRNG resets each chunk. Self-inverse.
+static SR search_prng_chunk_comp(const u8*blk,int n,double base){
+    SR r; memset(&r,0,sizeof(r)); r.id=95; r.entropy=base; r.overhead=PAT_OH[95];
+    int tv[]={25,64,128,192,230};
+    double be=base; int bC=2,bseed=0,bti=0;
+    #pragma omp parallel
+    {double le=base; int lC=2,lseed=0,lti=0;
+     #pragma omp for schedule(dynamic,1)
+     for(int C=2;C<=MAX_STRIDE;C++) for(int si=0;si<256;si++) for(int ti=0;ti<5;ti++){
+         u8 thr=(u8)tv[ti]; u8 seed=(u8)si;
+         int ff[256]={0};
+         for(int base_=0;base_<n;base_+=C){
+             uint32_t st=(uint32_t)seed;
+             for(int k=0;k<C&&base_+k<n;k++)
+                 ff[lcg_byte(&st)>=thr?(u8)(255-blk[base_+k]):blk[base_+k]]++;}
+         double e=entropy_from_hist(ff,n); if(e<le){le=e;lC=C;lseed=si;lti=ti;}}
+     #pragma omp critical
+     if(le<be){be=le;bC=lC;bseed=lseed;bti=lti;}}
+    r.entropy=be; r.p[0]=bC; r.p[1]=bseed; r.p[2]=bti;
+    snprintf(r.name,sizeof(r.name),"PRNG-CHUNK-COMP C=%d s=%d",bC,bseed);
+    return r;
+}
+
+// STRIDE-GF-RAMP: at stride positions, multiply by successive powers of alpha.
+// k-th stride position gets alpha^k. Inverse: multiply by (inv_alpha)^k.
+static SR search_stride_gf_ramp(const u8*blk,int n,double base){
+    SR r; memset(&r,0,sizeof(r)); r.id=98; r.entropy=base; r.overhead=PAT_OH[98];
+    int bfreq[256]={0}; for(int i=0;i<n;i++) bfreq[blk[i]]++;
+    double be=base; int bs=1,balpha=2;
+    #pragma omp parallel
+    {double le=base; int ls=1,la=2;
+     #pragma omp for schedule(dynamic,1)
+     for(int s=1;s<=MAX_STRIDE;s++) for(int alpha=2;alpha<=255;alpha++){
+         int ff[256]; memcpy(ff,bfreq,sizeof(ff));
+         u8 acc=1;
+         for(int p=0;p<n;p+=s){ff[blk[p]]--;ff[gf_mul(blk[p],acc)]++;acc=gf_mul(acc,(u8)alpha);}
+         double e=entropy_from_hist(ff,n); if(e<le){le=e;ls=s;la=alpha;}}
+     #pragma omp critical
+     if(le<be){be=le;bs=ls;balpha=la;}}
+    r.entropy=be; r.p[0]=bs; r.p[1]=balpha;
+    snprintf(r.name,sizeof(r.name),"STRIDE-GF-RAMP s=%d a=%d",bs,balpha);
+    return r;
+}
+
+// COND-NEXT: amp keyed by high k bits of the NEXT byte (reads original, left-to-right scan).
+// Inverse: same context (next byte already decoded, going right-to-left) with inverse op.
 static SR search_cond_next(const u8*blk,int n,double base){
     SR r; memset(&r,0,sizeof(r)); r.id=13; r.entropy=base; r.overhead=PAT_OH[13];
-    double be=base; int bk=1,bop=0; u8 bamps[8]={0};
-    for(int k=1;k<=3;k++){
+    double be=base; int bk=1,bop=0; u8 bamps[256]={0};
+    for(int k=1;k<=4;k++){
         int N=1<<k;
-        int gh[8][256]; memset(gh,0,sizeof(gh));
+        int (*gh)[256]=malloc(N*256*sizeof(int)); if(!gh) continue;
+        memset(gh,0,N*256*sizeof(int));
         for(int i=0;i<n-1;i++) gh[blk[i+1]>>(8-k)][blk[i]]++;
         for(int op=0;op<N_OPS;op++){
-            u8 amps[8]={0};
-            // byte n-1 has no context, stays unchanged
-            double e=cond_greedy((const int(*)[256])gh,N,n,blk[n-1],op,amps);
+            u8 amps[256]={0};
+            double e=cond_greedy(gh,N,n,blk[n-1],op,amps);
             if(e<be){be=e;bk=k;bop=op;memcpy(bamps,amps,N*sizeof(u8));}}
-    }
+        free(gh);}
     r.entropy=be; r.p[0]=bk; r.p[1]=bop;
-    {int N=1<<bk; memcpy(r.amps,bamps,N*sizeof(u8)); r.overhead=5+2+3+N*8;}
+    {int N=1<<bk; memcpy(r.amps,bamps,N*sizeof(u8)); r.overhead=5+3+3+N*8;}
     snprintf(r.name,sizeof(r.name),"COND-NEXT k=%d %s",bk,opname[bop]);
     return r;
 }
 
-// COND-DELTA: amp keyed on high k bits of (byte[i-1] XOR byte[i-2]).
-// Context = rate of change between the two previous bytes.
-// Reversible: during decompression forward pass, i-1 and i-2 are already decoded.
+// COND-DELTA: amp keyed by high k bits of (b[i-1] XOR b[i-2]) — local difference as context.
+// Inverse: same context (b[i-1], b[i-2] already decoded) with inverse op, left-to-right.
 static SR search_cond_delta(const u8*blk,int n,double base){
     SR r; memset(&r,0,sizeof(r)); r.id=14; r.entropy=base; r.overhead=PAT_OH[14];
-    double be=base; int bk=1,bop=0; u8 bamps[8]={0};
-    for(int k=1;k<=3;k++){
+    double be=base; int bk=1,bop=0; u8 bamps[256]={0};
+    for(int k=1;k<=4;k++){
         int N=1<<k;
-        int gh[8][256]; memset(gh,0,sizeof(gh));
+        int (*gh)[256]=malloc(N*256*sizeof(int)); if(!gh) continue;
+        memset(gh,0,N*256*sizeof(int));
         for(int i=2;i<n;i++) gh[(blk[i-1]^blk[i-2])>>(8-k)][blk[i]]++;
-        for(int op=0;op<N_OPS;op++){OP_RANGE(op,alo,ahi)
-            u8 amps[8]; for(int g=0;g<N;g++) amps[g]=(u8)alo;
-            // bytes 0 and 1 have no context, stay unchanged
-            int combined[256]={0}; combined[blk[0]]++; combined[blk[1]]++;
-            for(int g=0;g<N;g++){int tf[256];hist_transform(gh[g],tf,op,amps[g]);for(int v=0;v<256;v++)combined[v]+=tf[v];}
-            for(int pass=0;pass<2;pass++) for(int g=0;g<N;g++){
-                int tc[256],wk[256]; hist_transform(gh[g],tc,op,amps[g]);
-                for(int v=0;v<256;v++) wk[v]=combined[v]-tc[v];
-                double bge=1e30; u8 bga=amps[g];
-                for(int amp=alo;amp<=ahi;amp++){SKIP_OP(op,amp)
-                    int tf[256],ff[256]; hist_transform(gh[g],tf,op,amp);
-                    for(int v=0;v<256;v++) ff[v]=wk[v]+tf[v];
-                    double e=entropy_from_hist(ff,n); if(e<bge){bge=e;bga=(u8)amp;}}
-                int tn[256]; hist_transform(gh[g],tn,op,bga);
-                for(int v=0;v<256;v++) combined[v]=wk[v]+tn[v];
-                amps[g]=bga;}
-            double e=entropy_from_hist(combined,n);
-            if(e<be){be=e;bk=k;bop=op;memcpy(bamps,amps,N*sizeof(u8));}}}
+        for(int op=0;op<N_OPS;op++){
+            u8 amps[256]={0};
+            double e=cond_greedy(gh,N,n,blk[0],op,amps);
+            if(e<be){be=e;bk=k;bop=op;memcpy(bamps,amps,N*sizeof(u8));}}
+        free(gh);}
     r.entropy=be; r.p[0]=bk; r.p[1]=bop;
-    {int N=1<<bk; memcpy(r.amps,bamps,N*sizeof(u8)); r.overhead=5+2+3+N*8;}
+    {int N=1<<bk; memcpy(r.amps,bamps,N*sizeof(u8)); r.overhead=5+3+3+N*8;}
     snprintf(r.name,sizeof(r.name),"COND-DELTA k=%d %s",bk,opname[bop]);
     return r;
 }
 
-// STRIDE-DELTA: b'[i] = b[i] - b[i-N]  (or XOR), applied right-to-left.
-// Right-to-left guarantees b[i-N] is always original when read — no orig[] needed.
-// Invert: left-to-right scan reconstruction (b[i] += b[i-N] or b[i] ^= b[i-N]).
-// Equivalent to: deinterleave N channels, apply DELTA within each channel, leave interleaved.
-// For real multi-channel data (stereo N=2, RGB N=3, RGBA N=4, etc.) this finds
-// within-channel correlations that stride-1 DELTA misses.
-static SR search_stride_delta(const u8*blk,int n,double base){
-    SR r; memset(&r,0,sizeof(r)); r.id=15; r.entropy=base; r.overhead=PAT_OH[15];
-    double be=base; int bN=2,bot=0;
-    for(int N=2;N<=MAX_STRIDE;N++){
-        // SUB delta at stride N
-        {int ff[256]={0};
-         for(int i=0;i<N&&i<n;i++) ff[blk[i]]++;
-         for(int i=N;i<n;i++) ff[(u8)(blk[i]-blk[i-N])]++;
-         double e=entropy_from_hist(ff,n); if(e<be){be=e;bN=N;bot=0;}}
-        // XOR delta at stride N
-        {int ff[256]={0};
-         for(int i=0;i<N&&i<n;i++) ff[blk[i]]++;
-         for(int i=N;i<n;i++) ff[blk[i]^blk[i-N]]++;
-         double e=entropy_from_hist(ff,n); if(e<be){be=e;bN=N;bot=1;}}
-    }
-    r.entropy=be; r.p[0]=bN; r.p[1]=bot;
-    snprintf(r.name,sizeof(r.name),"STRIDE-DELTA N=%d %s",bN,bot?"XOR":"SUB");
-    return r;
-}
-
-// THRESH-MAP: rotate the value range [T..255] by amp positions (mod 256-T).
-// Bytes < T are unchanged. Bytes >= T are mapped to T + (v-T+amp)%(256-T).
-// This is always a bijection: rotation within a closed set.
-// Inverse: rotation by (256-T - amp%(256-T)).
-static SR search_thresh_map(const u8*blk, int n, double base){
-    SR r; memset(&r,0,sizeof(r)); r.id=16; r.entropy=base; r.overhead=PAT_OH[16];
+// STRIDED-GRAY: apply Gray encode(dir=0) or Gray decode(dir=1) at stride positions.
+// Inverse: apply opposite direction at same positions.
+static SR search_strided_gray(const u8*blk,int n,double base){
+    SR r; memset(&r,0,sizeof(r)); r.id=73; r.entropy=base; r.overhead=PAT_OH[73];
     int bfreq[256]={0}; for(int i=0;i<n;i++) bfreq[blk[i]]++;
-    double be=base; int bT=0,bamp=0;
-    #pragma omp parallel
-    {double le=base; int lT=0,lamp=0;
-     #pragma omp for schedule(dynamic,4)
-     for(int T=0;T<=254;T++){
-         int M=256-T;
-         int ff[256];
-         for(int amp=1;amp<M;amp++){
-             for(int v=0;v<T;v++) ff[v]=bfreq[v];
-             for(int v=T;v<256;v++) ff[T+(v-T+amp)%M]=bfreq[v];
-             double e=entropy_from_hist(ff,n);
-             if(e<le){le=e;lT=T;lamp=amp;}
-         }
-     }
-     #pragma omp critical
-     if(le<be){be=le;bT=lT;bamp=lamp;}}
-    r.entropy=be; r.p[0]=bT; r.p[1]=bamp;
-    snprintf(r.name,sizeof(r.name),"THRESH-MAP T=%d a=%d",bT,bamp);
-    return r;
-}
-
-// BIT-ROTATE: rotate every byte left by k bits (k=1..7).
-// Inverse: rotate right by k, i.e. rotate left by (8-k).
-static SR search_bit_rotate(const u8*blk, int n, double base){
-    SR r; memset(&r,0,sizeof(r)); r.id=17; r.entropy=base; r.overhead=PAT_OH[17];
-    double be=base; int bk=0;
-    for(int k=1;k<=7;k++){
+    u8 genc[256],gdec[256];
+    for(int v=0;v<256;v++) genc[v]=(u8)(v^(v>>1));
+    for(int v=0;v<256;v++){u8 x=(u8)v;x^=(x>>4);x^=(x>>2);x^=(x>>1);gdec[v]=x;}
+    double be=base; int bs=1,bdir=0;
+    for(int s=1;s<=MAX_STRIDE;s++) for(int dir=0;dir<2;dir++){
+        u8 *tab=dir?gdec:genc;
+        int sf[256]={0}; for(int p=0;p<n;p+=s) sf[blk[p]]++;
         int ff[256]={0};
-        for(int i=0;i<n;i++) ff[(u8)((blk[i]<<k)|(blk[i]>>(8-k)))]++;
-        double e=entropy_from_hist(ff,n); if(e<be){be=e;bk=k;}
-    }
-    r.entropy=be; r.p[0]=bk;
-    snprintf(r.name,sizeof(r.name),"BIT-ROTATE k=%d",bk);
+        for(int v=0;v<256;v++){ff[v]+=bfreq[v]-sf[v]; ff[tab[v]]+=sf[v];}
+        double e=entropy_from_hist(ff,n); if(e<be){be=e;bs=s;bdir=dir;}}
+    r.entropy=be; r.p[0]=bs; r.p[1]=bdir;
+    snprintf(r.name,sizeof(r.name),"STRIDED-GRAY s=%d %s",bs,bdir?"dec":"enc");
     return r;
 }
 
-// GRAY: apply Gray encoding (b^(b>>1)) or Gray decoding to every byte.
-// Encode and decode are each other's inverse, so both are self-consistently reversible.
-static SR search_gray(const u8*blk, int n, double base){
-    SR r; memset(&r,0,sizeof(r)); r.id=18; r.entropy=base; r.overhead=PAT_OH[18];
-    double be=base; int bdir=0;
-    {int ff[256]={0};
-     for(int i=0;i<n;i++) ff[blk[i]^(blk[i]>>1)]++;
-     double e=entropy_from_hist(ff,n); if(e<be){be=e;bdir=0;}}
-    {int ff[256]={0};
-     for(int i=0;i<n;i++){u8 v=blk[i];v^=(v>>4);v^=(v>>2);v^=(v>>1);ff[v]++;}
-     double e=entropy_from_hist(ff,n); if(e<be){be=e;bdir=1;}}
-    r.entropy=be; r.p[0]=bdir;
-    snprintf(r.name,sizeof(r.name),"GRAY %s",bdir?"decode":"encode");
+// PRNG-STRD-COMP: PRNG-gated complement at stride-selected positions. Self-inverse.
+static SR search_prng_stride_comp(const u8*blk,int n,double base){
+    SR r; memset(&r,0,sizeof(r)); r.id=76; r.entropy=base; r.overhead=PAT_OH[76];
+    int bfreq[256]={0}; for(int i=0;i<n;i++) bfreq[blk[i]]++;
+    int tv[]={25,64,128,192,230};
+    double be=base; int bs=1,bseed=0,bti=0;
+    #pragma omp parallel
+    {double le=base; int ls_=1,lseed=0,lti=0;
+     #pragma omp for schedule(dynamic,1)
+     for(int s=1;s<=MAX_STRIDE;s++) for(int si=0;si<256;si++) for(int ti=0;ti<5;ti++){
+         u8 thr=(u8)tv[ti]; uint32_t st=(uint32_t)si;
+         int sel[256]={0};
+         for(int p=0;p<n;p+=s) if(lcg_byte(&st)>=thr) sel[blk[p]]++;
+         int ff[256]={0};
+         for(int v=0;v<256;v++){ff[v]+=bfreq[v]-sel[v]; ff[255-v]+=sel[v];}
+         double e=entropy_from_hist(ff,n); if(e<le){le=e;ls_=s;lseed=si;lti=ti;}}
+     #pragma omp critical
+     if(le<be){be=le;bs=ls_;bseed=lseed;bti=lti;}}
+    r.entropy=be; r.p[0]=bs; r.p[1]=bseed; r.p[2]=bti;
+    snprintf(r.name,sizeof(r.name),"PRNG-STRD-COMP s=%d seed=%d",bs,bseed);
+    return r;
+}
+
+// STRIDE-NIBSWAP: swap high and low nibbles at stride-selected positions. Self-inverse.
+static SR search_stride_nibswap(const u8*blk,int n,double base){
+    SR r; memset(&r,0,sizeof(r)); r.id=62; r.entropy=base; r.overhead=PAT_OH[62];
+    int bfreq[256]={0}; for(int i=0;i<n;i++) bfreq[blk[i]]++;
+    double be=base; int bs=1;
+    for(int s=1;s<=MAX_STRIDE;s++){
+        int sf[256]={0}; for(int p=0;p<n;p+=s) sf[blk[p]]++;
+        int ff[256]={0};
+        for(int v=0;v<256;v++){ff[v]+=bfreq[v]-sf[v]; ff[(u8)((v>>4)|(v<<4))]+=sf[v];}
+        double e=entropy_from_hist(ff,n); if(e<be){be=e;bs=s;}}
+    r.entropy=be; r.p[0]=bs;
+    snprintf(r.name,sizeof(r.name),"STRIDE-NIBSWAP s=%d",bs);
+    return r;
+}
+
+// BIT-ROT-STRIDE: fixed bit-rotation k (1..7) at stride-selected positions.
+// Inverse: rotate by (8-k) at same positions.
+static SR search_bit_rot_stride(const u8*blk,int n,double base){
+    SR r; memset(&r,0,sizeof(r)); r.id=68; r.entropy=base; r.overhead=PAT_OH[68];
+    int bfreq[256]={0}; for(int i=0;i<n;i++) bfreq[blk[i]]++;
+    double be=base; int bs=1,bk=1;
+    for(int s=1;s<=MAX_STRIDE;s++){
+        int sf[256]={0}; for(int p=0;p<n;p+=s) sf[blk[p]]++;
+        for(int k=1;k<=7;k++){
+            int ff[256]={0};
+            for(int v=0;v<256;v++){ff[v]+=bfreq[v]-sf[v];
+                ff[(u8)((v<<k)|(v>>(8-k)))]+=sf[v];}
+            double e=entropy_from_hist(ff,n); if(e<be){be=e;bs=s;bk=k;}}}
+    r.entropy=be; r.p[0]=bs; r.p[1]=bk;
+    snprintf(r.name,sizeof(r.name),"BIT-ROT-STRIDE s=%d k=%d",bs,bk);
+    return r;
+}
+
+// PRNG-STRD-BITROT: per-position PRNG-determined bit rotation at stride positions.
+// Inverse: replay same PRNG, rotate each position right by same k.
+static SR search_prng_stride_bitrot(const u8*blk,int n,double base){
+    SR r; memset(&r,0,sizeof(r)); r.id=71; r.entropy=base; r.overhead=PAT_OH[71];
+    int bfreq[256]={0}; for(int i=0;i<n;i++) bfreq[blk[i]]++;
+    double be=base; int bs=1,bseed=0;
+    #pragma omp parallel
+    {double le=base; int ls_=1,lseed=0;
+     #pragma omp for schedule(dynamic,1)
+     for(int s=1;s<=MAX_STRIDE;s++) for(int seed=0;seed<256;seed++){
+         int ff[256]; memcpy(ff,bfreq,sizeof(ff));
+         uint32_t st=(uint32_t)seed;
+         for(int p=0;p<n;p+=s){int k=(int)(lcg_byte(&st)%7)+1;
+             ff[blk[p]]--; ff[(u8)((blk[p]<<k)|(blk[p]>>(8-k)))]++;}
+         double e=entropy_from_hist(ff,n); if(e<le){le=e;ls_=s;lseed=seed;}}
+     #pragma omp critical
+     if(le<be){be=le;bs=ls_;bseed=lseed;}}
+    r.entropy=be; r.p[0]=bs; r.p[1]=bseed;
+    snprintf(r.name,sizeof(r.name),"PRNG-STRD-BITROT s=%d seed=%d",bs,bseed);
+    return r;
+}
+
+// PRNG-STRD-XDELTA: PRNG-gated XOR stride delta. Self-inverse (XOR, same gate).
+static SR search_prng_stride_xor_delta(const u8*blk,int n,double base){
+    SR r; memset(&r,0,sizeof(r)); r.id=55; r.entropy=base; r.overhead=PAT_OH[55];
+    int tv[]={25,64,128,192,230};
+    double be=base; int bN=1,bseed=0,bti=0;
+    #pragma omp parallel
+    {double le=base; int lN=1,ls=0,lti=0;
+     u8 *tmp=malloc(n); u8 *gate=malloc(n);
+     if(tmp&&gate){
+     #pragma omp for schedule(dynamic,1)
+     for(int N=1;N<=MAX_STRIDE;N++) for(int si=0;si<256;si++) for(int ti=0;ti<5;ti++){
+         u8 thr=(u8)tv[ti]; uint32_t st=(uint32_t)si;
+         for(int i=0;i<n;i++) gate[i]=(lcg_byte(&st)>=thr)?1:0;
+         memcpy(tmp,blk,n);
+         for(int i=n-1;i>=N;i--) if(gate[i]) tmp[i]^=tmp[i-N];
+         int ff[256]={0}; for(int i=0;i<n;i++) ff[tmp[i]]++;
+         double e=entropy_from_hist(ff,n); if(e<le){le=e;lN=N;ls=si;lti=ti;}}}
+     free(tmp); free(gate);
+     #pragma omp critical
+     if(le<be){be=le;bN=lN;bseed=ls;bti=lti;}}
+    r.entropy=be; r.p[0]=bN; r.p[1]=bseed; r.p[2]=bti;
+    snprintf(r.name,sizeof(r.name),"PRNG-STRD-XDELTA N=%d s=%d",bN,bseed);
+    return r;
+}
+
+// STRIDE-NEG: complement (255-v) at stride positions. Self-inverse.
+static SR search_stride_neg(const u8*blk,int n,double base){
+    SR r; memset(&r,0,sizeof(r)); r.id=57; r.entropy=base; r.overhead=PAT_OH[57];
+    int bfreq[256]={0}; for(int i=0;i<n;i++) bfreq[blk[i]]++;
+    double be=base; int bs=1;
+    for(int s=1;s<=MAX_STRIDE;s++){
+        int sf[256]={0}; for(int p=0;p<n;p+=s) sf[blk[p]]++;
+        int ff[256]={0};
+        for(int v=0;v<256;v++){ff[v]+=bfreq[v]-sf[v]; ff[255-v]+=sf[v];}
+        double e=entropy_from_hist(ff,n); if(e<be){be=e;bs=s;}}
+    r.entropy=be; r.p[0]=bs;
+    snprintf(r.name,sizeof(r.name),"STRIDE-NEG s=%d",bs);
+    return r;
+}
+
+// GF-STRIDE-FIXED: multiply stride-selected bytes by fixed GF256 coefficient.
+// Inverse: multiply by GF256 inverse of alpha.
+static SR search_gf_stride_fixed(const u8*blk,int n,double base){
+    SR r; memset(&r,0,sizeof(r)); r.id=58; r.entropy=base; r.overhead=PAT_OH[58];
+    int bfreq[256]={0}; for(int i=0;i<n;i++) bfreq[blk[i]]++;
+    double be=base; int bs=1,balpha=2;
+    #pragma omp parallel
+    {double le=base; int ls=1,la=2;
+     #pragma omp for schedule(dynamic,1)
+     for(int s=1;s<=MAX_STRIDE;s++) for(int alpha=2;alpha<=255;alpha++){
+         int sf[256]={0}; for(int p=0;p<n;p+=s) sf[blk[p]]++;
+         int ff[256]={0};
+         for(int v=0;v<256;v++){ff[v]+=bfreq[v]-sf[v]; ff[gf_mul((u8)v,(u8)alpha)]+=sf[v];}
+         double e=entropy_from_hist(ff,n); if(e<le){le=e;ls=s;la=alpha;}}
+     #pragma omp critical
+     if(le<be){be=le;bs=ls;balpha=la;}}
+    r.entropy=be; r.p[0]=bs; r.p[1]=balpha;
+    snprintf(r.name,sizeof(r.name),"GF-STRIDE-FIXED s=%d a=%d",bs,balpha);
+    return r;
+}
+
+// PRNG-STRD-DELTA: apply stride-N delta only at PRNG-selected positions.
+// Gate generated left-to-right; delta applied right-to-left (b[i-N] always original).
+static SR search_prng_stride_delta(const u8*blk,int n,double base){
+    SR r; memset(&r,0,sizeof(r)); r.id=42; r.entropy=base; r.overhead=PAT_OH[42];
+    int tv[]={25,64,128,192,230};
+    double be=base; int bN=1,bseed=0,bti=0;
+    #pragma omp parallel
+    {double le=base; int lN=1,ls=0,lti=0;
+     u8 *tmp=malloc(n); u8 *gate=malloc(n);
+     if(tmp&&gate){
+     #pragma omp for schedule(dynamic,1)
+     for(int N=1;N<=MAX_STRIDE;N++) for(int si=0;si<256;si++) for(int ti=0;ti<5;ti++){
+         u8 thr=(u8)tv[ti]; uint32_t st=(uint32_t)si;
+         for(int i=0;i<n;i++) gate[i]=(lcg_byte(&st)>=thr)?1:0;
+         memcpy(tmp,blk,n);
+         for(int i=n-1;i>=N;i--) if(gate[i]) tmp[i]=(u8)(tmp[i]-tmp[i-N]);
+         int ff[256]={0}; for(int i=0;i<n;i++) ff[tmp[i]]++;
+         double e=entropy_from_hist(ff,n); if(e<le){le=e;lN=N;ls=si;lti=ti;}}}
+     free(tmp); free(gate);
+     #pragma omp critical
+     if(le<be){be=le;bN=lN;bseed=ls;bti=lti;}}
+    r.entropy=be; r.p[0]=bN; r.p[1]=bseed; r.p[2]=bti;
+    snprintf(r.name,sizeof(r.name),"PRNG-STRD-DELTA N=%d s=%d",bN,bseed);
+    return r;
+}
+
+// PRNG-DUAL-STRIDE: dual sub-stride at period 2s, each element gets its own PRNG amp.
+// Even sub-stride positions use LCG(seed); odd positions use LCG(seed^255).
+// Inverse: replay same PRNGs with inverse op.
+static SR search_prng_dual_stride(const u8*blk,int n,double base){
+    SR r; memset(&r,0,sizeof(r)); r.id=43; r.entropy=base; r.overhead=PAT_OH[43];
+    int bfreq[256]={0}; for(int i=0;i<n;i++) bfreq[blk[i]]++;
+    double be=base; int bs=1,bseed=0,bop=0;
+    #pragma omp parallel
+    {double le=base; int ls_=1,lseed=0,lop=0;
+     #pragma omp for schedule(dynamic,1)
+     for(int s=1;s<=MAX_STRIDE;s++) for(int seed=0;seed<256;seed++) for(int op=0;op<N_OPS;op++){
+         int ff[256]; memcpy(ff,bfreq,sizeof(ff));
+         uint32_t st_e=(uint32_t)seed, st_o=(uint32_t)(seed^255);
+         for(int p=0;p<n;p+=2*s){ff[blk[p]]--; ff[op_byte(blk[p],lcg_byte(&st_e),op)]++;}
+         for(int p=s;p<n;p+=2*s){ff[blk[p]]--; ff[op_byte(blk[p],lcg_byte(&st_o),op)]++;}
+         double e=entropy_from_hist(ff,n); if(e<le){le=e;ls_=s;lseed=seed;lop=op;}}
+     #pragma omp critical
+     if(le<be){be=le;bs=ls_;bseed=lseed;bop=lop;}}
+    r.entropy=be; r.p[0]=bs; r.p[1]=bseed; r.p[2]=bop;
+    snprintf(r.name,sizeof(r.name),"PRNG-DUAL-STRIDE s=%d %s seed=%d",bs,opname[bop],bseed);
+    return r;
+}
+
+// PRNG-GFMUL-STRD: at stride positions, multiply by a PRNG-derived GF256 coefficient (>=2).
+// Inverse: replay same PRNG, multiply by GF256 inverse of each coefficient.
+static SR search_prng_gfmul_stride(const u8*blk,int n,double base){
+    SR r; memset(&r,0,sizeof(r)); r.id=51; r.entropy=base; r.overhead=PAT_OH[51];
+    int bfreq[256]={0}; for(int i=0;i<n;i++) bfreq[blk[i]]++;
+    double be=base; int bs=1,bseed=0;
+    #pragma omp parallel
+    {double le=base; int ls_=1,lseed=0;
+     #pragma omp for schedule(dynamic,1)
+     for(int s=1;s<=MAX_STRIDE;s++) for(int seed=0;seed<256;seed++){
+         int ff[256]; memcpy(ff,bfreq,sizeof(ff));
+         uint32_t st=(uint32_t)seed;
+         for(int p=0;p<n;p+=s){u8 alpha=lcg_byte(&st); if(alpha<2)alpha=2;
+             ff[blk[p]]--; ff[gf_mul(blk[p],alpha)]++;}
+         double e=entropy_from_hist(ff,n); if(e<le){le=e;ls_=s;lseed=seed;}}
+     #pragma omp critical
+     if(le<be){be=le;bs=ls_;bseed=lseed;}}
+    r.entropy=be; r.p[0]=bs; r.p[1]=bseed;
+    snprintf(r.name,sizeof(r.name),"PRNG-GFMUL-STRD s=%d seed=%d",bs,bseed);
     return r;
 }
 
 // ── Run all searches ──────────────────────────────────────────────────────────
 static void run_all(const u8 *blk, int n, double base, SR *out) {
-    out[0]  = search_stride_const    (blk,n,base);
-    out[1]  = search_stride_prng_amp (blk,n,base);
-    out[2]  = search_dual_stride     (blk,n,base);
-    out[3]  = search_prng_select     (blk,n,base);
-    out[4]  = search_global_shapes   (blk,n,base);
-    out[5]  = search_periodic_shapes (blk,n,base);
-    out[6]  = search_sparse_indexed  (blk,n,base);
-    out[7]  = search_prng_gradient   (blk,n,base);
-    out[8]  = search_nway_stride     (blk,n,base);
-    out[9]  = search_prng_jump       (blk,n,base);
-    out[10] = search_modular_mask    (blk,n,base);
-    out[11] = search_delta           (blk,n,base);
-    out[12] = search_cond_prev       (blk,n,base);
-    out[13] = search_cond_next       (blk,n,base);
-    out[14] = search_cond_delta      (blk,n,base);
-    out[15] = search_stride_delta    (blk,n,base);
-    out[16] = search_thresh_map      (blk,n,base);
-    out[17] = search_bit_rotate      (blk,n,base);
-    out[18] = search_gray            (blk,n,base);
+    out[0]  = search_stride_prng_amp     (blk,n,base);
+    out[1]  = search_prng_select         (blk,n,base);
+    out[2]  = search_prng_jump           (blk,n,base);
+    out[3]  = search_modular_mask        (blk,n,base);
+    out[4]  = search_cond_prev           (blk,n,base);
+    out[5]  = search_prng_lo_nib_add     (blk,n,base);
+    out[6]  = search_prng_hi_nib_xor     (blk,n,base);
+    out[7]  = search_prng_lo_nib_xor     (blk,n,base);
+    out[8]  = search_prng_stride_delta   (blk,n,base);
+    out[9]  = search_prng_dual_stride    (blk,n,base);
+    out[10] = search_prng_gfmul_stride   (blk,n,base);
+    out[11] = search_prng_stride_xor_delta(blk,n,base);
+    out[12] = search_stride_neg          (blk,n,base);
+    out[13] = search_gf_stride_fixed     (blk,n,base);
+    out[14] = search_stride_nibswap      (blk,n,base);
+    out[15] = search_bit_rot_stride      (blk,n,base);
+    out[16] = search_prng_stride_bitrot  (blk,n,base);
+    out[17] = search_cond_next           (blk,n,base);
+    out[18] = search_cond_delta          (blk,n,base);
+    out[19] = search_strided_gray        (blk,n,base);
+    out[20] = search_prng_stride_comp    (blk,n,base);
+    out[21] = search_prng_chunk_comp     (blk,n,base);
+    out[22] = search_stride_gf_ramp      (blk,n,base);
 }
 
-// ── Byte dump ────────────────────────────────────────────────────────────────
-static void print_bytes(const u8 *data, int len, const char *label) {
-    printf("\n=== %s (%d bytes) ===\n", label, len);
-    for(int i=0;i<len;i++) printf("%d ", data[i]);
-    printf("\n");
-}
 
-// ── BWT fallback ──────────────────────────────────────────────────────────────
-// Called when every regular transform gives negative net.
-// Applies Burrows-Wheeler Transform and re-runs all searches on the result.
-// BWT groups identical contexts together, making COND-* and DELTA patterns
-// far more effective on structured data that stumped the per-byte searches.
-// Overhead: 5 (pattern id) + 16 (row index, since BLOCK_SIZE = 2^16) = 21 bits.
-#define BWT_OH 21
-
-static const u8 *g_bwt_src;
-static int       g_bwt_n;
-static int bwt_cmp(const void *a, const void *b){
-    int ia=*(const int*)a, ib=*(const int*)b;
-    const u8 *s=g_bwt_src; int n=g_bwt_n;
-    for(int len=n;len--;){
-        int d=(int)s[ia]-(int)s[ib]; if(d) return d;
-        if(++ia==n) ia=0; if(++ib==n) ib=0;
-    }
-    return 0;
-}
-
-// Forward BWT of blk[0..n-1] in-place using cyclic rotations.
-// Returns the row index of the original string (needed for inverse), or -1 on alloc failure.
-static int bwt_forward(u8 *blk, int n){
-    int *sa=malloc(n*sizeof(int)); u8 *out=malloc(n);
-    if(!sa||!out){free(sa);free(out);return -1;}
-    for(int i=0;i<n;i++) sa[i]=i;
-    g_bwt_src=blk; g_bwt_n=n;
-    qsort(sa,n,sizeof(int),bwt_cmp);
-    int idx=-1;
-    for(int i=0;i<n;i++){out[i]=blk[sa[i]?sa[i]-1:n-1]; if(!sa[i]) idx=i;}
-    memcpy(blk,out,n); free(sa); free(out);
-    return idx;
-}
-
-static int try_bwt(u8*blk,int n,double*base,int pass,double*tnet){
-    printf("  (stuck — trying BWT)\n"); fflush(stdout);
-    u8 *tmp=malloc(n); if(!tmp) return 0;
-    memcpy(tmp,blk,n);
-    int idx=bwt_forward(tmp,n);
-    if(idx<0){free(tmp);return 0;}
-    SR res[N_PATTERNS];
-    run_all(tmp,n,*base,res);
-    int best_i=-1; double best_net=0;
-    for(int i=0;i<N_PATTERNS;i++){
-        double net=(*base-res[i].entropy)*n-BWT_OH-res[i].overhead;
-        if(net>best_net){best_net=net;best_i=i;}
-    }
-    if(best_i<0){printf("  (BWT did not improve — done)\n");free(tmp);return 0;}
-    memcpy(blk,tmp,n); free(tmp);
-    double before=*base;
-    apply_sr(blk,n,&res[best_i]);
-    *base=byte_entropy(blk,n);
-    *tnet+=best_net;
-    printf("Pass %d: BWT(idx=%d)+%s  entropy %.6f->%.6f  (net=%.1f)\n",
-           pass,idx,res[best_i].name,before,*base,best_net);
-    fflush(stdout);
-    return 1;
-}
+// ── Per-operation statistics ───────────────────────────────────────────────────
+typedef struct {
+    char   name[32];   // base op name (no params), fixed at startup
+    long   count;      // total times this slot won across all blocks
+    double sum_net;
+    double min_net;
+    double max_net;
+} OpStat;
 
 // ── Main ──────────────────────────────────────────────────────────────────────
-#define N_STATS 1
+#define N_STATS 50   // number of random 4KB blocks to run
 
 int main(void) {
     init_gf256();
     int nt=omp_get_max_threads()-1; if(nt<1)nt=1;
     omp_set_num_threads(nt);
 
-    printf("Running %d block x %d bytes  (threads=%d)\n",
+    // Seed stat names with one dummy block; strip params so the base name is stable.
+    OpStat stats[N_PATTERNS];
+    memset(stats,0,sizeof(stats));
+    for(int i=0;i<N_PATTERNS;i++) stats[i].min_net=1e30;
+    {
+        u8 *dummy=malloc(BLOCK_SIZE);
+        if(dummy&&fill_random(dummy,BLOCK_SIZE)){
+            SR tmp[N_PATTERNS];
+            run_all(dummy,BLOCK_SIZE,byte_entropy(dummy,BLOCK_SIZE),tmp);
+            for(int i=0;i<N_PATTERNS;i++){
+                strncpy(stats[i].name,tmp[i].name,31); stats[i].name[31]=0;
+                char *sp=strchr(stats[i].name,' '); if(sp)*sp=0; // keep first word only
+            }
+        }
+        free(dummy);
+    }
+
+    printf("Running %d blocks x %d bytes  (threads=%d)\n\n",
            N_STATS, BLOCK_SIZE, nt);
 
     for(int bi=0;bi<N_STATS;bi++){
         u8 *blk=malloc(BLOCK_SIZE);
         if(!blk||!fill_random(blk,BLOCK_SIZE)){free(blk);continue;}
 
-        print_bytes(blk, 256 * 5, "BEFORE transforms");
-
         double base=byte_entropy(blk,BLOCK_SIZE);
-        double start_entropy=base;
-        double total_net=0.0;
+        double start_entropy=base, total_net=0.0;
         SR results[N_PATTERNS];
-        int pass=0;
+        int passes_taken=0;
 
         while(1){
-            pass++;
             run_all(blk,BLOCK_SIZE,base,results);
 
             int best_idx=-1; double best_net=-1e30;
             for(int i=0;i<N_PATTERNS;i++){
-                double net=(base-results[i].entropy)*BLOCK_SIZE-results[i].overhead;
+                double net=(base-results[i].entfropy)*BLOCK_SIZE-results[i].overhead;
                 if(net>best_net){best_net=net;best_idx=i;}
             }
-            if(best_net<=0||best_idx<0){
-                if(!try_bwt(blk,BLOCK_SIZE,&base,pass,&total_net)) break;
-                continue;  // loop: run_all again on BWT'd data
-            }
+            if(best_net<=0||best_idx<0) break;
 
-            double before=base;
+            // Accumulate stats — name stays as the clean base name set above
+            OpStat *s=&stats[best_idx];
+            s->count++;
+            s->sum_net+=best_net;
+            if(best_net<s->min_net) s->min_net=best_net;
+            if(best_net>s->max_net) s->max_net=best_net;
+
             apply_sr(blk,BLOCK_SIZE,&results[best_idx]);
             base=byte_entropy(blk,BLOCK_SIZE);
             total_net+=best_net;
-            printf("Pass %d: %s  entropy %.6f -> %.6f  (net=%.1f)\n",
-                   pass, results[best_idx].name, before, base, best_net);
-            fflush(stdout);
+            passes_taken++;
         }
 
-        printf("\nSummary: entropy %.6f -> %.6f  total net=%.1f bits\n",
-               start_entropy, base, total_net);
-
-        print_bytes(blk, 256 * 5, "AFTER transforms");
+        // One line per block — just progress, not per-pass noise
+        printf("Block %02d: %d pass(es)  H %.4f -> %.4f  net=%+.0f bits\n",
+               bi+1, passes_taken, start_entropy, base, total_net);
+        fflush(stdout);
         free(blk);
+    }
+
+    // ── Count table ───────────────────────────────────────────────────────────
+    // Sort by count descending so useful ops bubble to the top, zeros sink to bottom
+    int order[N_PATTERNS];
+    for(int i=0;i<N_PATTERNS;i++) order[i]=i;
+    for(int i=1;i<N_PATTERNS;i++){          // insertion sort
+        int k=order[i]; int j=i-1;
+        while(j>=0&&stats[order[j]].count<stats[k].count){order[j+1]=order[j];j--;}
+        order[j+1]=k;
+    }
+
+    // Count how many were never triggered
+    int n_zero=0;
+    for(int i=0;i<N_PATTERNS;i++) if(stats[i].count==0) n_zero++;
+
+    printf("\n=== OPERATION USE COUNT (%d blocks) ===\n", N_STATS);
+    printf("  %6s  %8s  %8s  %8s  %-28s\n",
+           "Count", "Avg Net", "Min Net", "Max Net", "Operation");
+    printf("  %6s  %8s  %8s  %8s  %-28s\n",
+           "------","--------","--------","--------","--------");
+
+    for(int i=0;i<N_PATTERNS;i++){
+        int ii=order[i];
+        if(stats[ii].count==0) break;   // zeros sorted to bottom — stop printing
+        double avg=stats[ii].sum_net/stats[ii].count;
+        printf("  %6ld  %8.1f  %8.1f  %8.1f  %s\n",
+               stats[ii].count, avg, stats[ii].min_net, stats[ii].max_net,
+               stats[ii].name);
+    }
+
+    printf("\n--- NEVER TRIGGERED (%d / %d) — candidates to remove: ---\n",
+           n_zero, N_PATTERNS);
+    for(int i=0;i<N_PATTERNS;i++){
+        int ii=order[i];
+        if(stats[ii].count>0) continue;
+        printf("  slot%03d  %s\n", ii, stats[ii].name);
     }
 
     return 0;
