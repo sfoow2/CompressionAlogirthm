@@ -77,12 +77,13 @@ typedef struct {
 // 13  COND-NEXT:       k(3) + 2^k*(op(3)+amp(8))       = 30..184 bits
 // 14  COND-DELTA:      k(3) + 2^k*(op(3)+amp(8))       = 30..184 bits  context=b[i-1]^b[i-2]
 // Phase 2 (refinement on top of phase 1 result, looped until no gain):
-// 25  PRNG-GATE-PRNG-AMP:  seed(16)+thr(8)+op(4)  = 33 bits  PRNG gate+amp, fixed op, thr swept 200..255
+// Phase 1: 2 bits (which of 3 transforms) + per-group params. No shared ID field needed for Phase 2.
+// 25  PRNG-GATE-PRNG-AMP:  seed(16)+thr(5, stored as thr-224, range 224..255)+op(4)  = 25 bits
 static const int PAT_OH[] = {
     0,0,0,0,0,0,0,0,0,0,0,0,  // 0-11 unused
     30, 30, 30,                 // 12 COND-PREV, 13 COND-NEXT, 14 COND-DELTA
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 15-24 unused
-    33,                         // 25 PRNG-GATE-PRNG-AMP
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 15-24 unused (10 entries)
+    25,                          // 25 PRNG-GATE-PRNG-AMP
 };
 
 // Map a PRNG byte to a valid (bijective) amplitude for the given op.
@@ -273,7 +274,7 @@ static SR search_prng_gate_prng_amp(const u8*blk,int n,double base){
      u8 *gate=malloc(n),*ra=malloc(n);
      int *spos=malloc(n*sizeof(int));
      #pragma omp for schedule(dynamic,32)
-     for(int seed=0;seed<65536;seed++){
+     for(int seed=0;seed<65536;seed++){  // 16-bit seed: 0..65535
          if(!gate||!ra||!spos) continue;
          uint32_t st=(uint32_t)seed;
          for(int i=0;i<n;i++){gate[i]=lcg_byte(&st);ra[i]=lcg_byte(&st);}
@@ -285,14 +286,14 @@ static SR search_prng_gate_prng_amp(const u8*blk,int n,double base){
          {int sc[256]; memcpy(sc,gst,sizeof(gst));
           for(int i=0;i<n;i++) spos[sc[gate[i]]++]=i;}
          for(int op=0;op<N_OPS;op++){
-             // Precompute transformed output for this op (avoids recomputing in sweep)
+             // Precompute transformed output for this op
              u8 trf[BLOCK_SIZE];
              for(int i=0;i<n;i++) trf[i]=op_byte(blk[i],prng_amp(ra[i],op),op);
-             // Build initial ff for thr=200: gate>=200 → transformed, gate<200 → original
+             // Build initial ff for thr=224: gate>=224 → transformed, gate<224 → original
              int ff[256]={0};
-             for(int i=0;i<n;i++) ff[gate[i]>=200?trf[i]:blk[i]]++;
-             // Sweep thr 200..255: each step deselects positions with gate[i]==thr
-             for(int g=200;g<=254;g++){
+             for(int i=0;i<n;i++) ff[gate[i]>=224?trf[i]:blk[i]]++;
+             // Sweep thr 224..255 (5 bits, stored as thr-224, 32 values): deselect gate[i]==thr
+             for(int g=224;g<=254;g++){
                  double e=entropy_fast(ff);
                  if(e<le){le=e;ls=seed;lop=op;lth=(u8)g;}
                  for(int k=gst[g];k<gst[g]+gcnt[g];k++){
@@ -332,10 +333,19 @@ static void print_bytes(const u8 *blk, int n, const char *label) {
     printf("\n");
 }
 
-// â”€â”€ Main â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// -- Phase 2 statistics -------------------------------------------------------
+typedef struct {
+    int thr_count[256];  // applied threshold histogram (200..255 range)
+    int op_count[10];    // applied op histogram (N_OPS=10)
+    int total_applied;   // total transforms applied across all blocks/iters
+} P2Stats;
+
+// -- Main ----------------------------------------------------------------------
 // Returns 1 if a transform was applied, 0 if nothing was profitable.
+// stats: if non-NULL and applied transform is ID=25, records thr+op.
 static int run_phase_print(u8 *blk, int n, double *base, double *total_net,
-                            SR *results, int np, const char *phase_label) {
+                            SR *results, int np, const char *phase_label,
+                            P2Stats *stats) {
     double nets[256]; int best=-1; double best_net=-1e30;
     for(int i=0;i<np;i++){
         nets[i]=((*base)-results[i].entropy)*n-results[i].overhead;
@@ -352,7 +362,62 @@ static int run_phase_print(u8 *blk, int n, double *base, double *total_net,
     apply_sr(blk,n,&results[best]);
     *base=byte_entropy(blk,n);
     *total_net+=best_net;
+    if(stats && results[best].id==25){
+        int thr=results[best].p[1], op=results[best].p[2];
+        if(thr>=0&&thr<256) stats->thr_count[thr]++;
+        if(op>=0&&op<10)    stats->op_count[op]++;
+        stats->total_applied++;
+    }
     return 1;
+}
+
+static void print_p2_stats(const P2Stats *s) {
+    static const char *op_names[]={"ADD","XOR","MUL","ADDLO","SWXOR","GFMUL","ROL","ADDHI","GRAY","XORNIBBLE"};
+    int total=s->total_applied;
+    printf("\n=== Phase 2 Statistics (%d transforms applied) ===\n\n", total);
+    if(!total){printf("  (none applied)\n");return;}
+
+    // -- Threshold stats (200..255) -------------------------------------------
+    int tmin=256,tmax=-1,tnever=0; double tsum=0;
+    for(int t=200;t<=255;t++){
+        if(s->thr_count[t]){
+            if(t<tmin)tmin=t; if(t>tmax)tmax=t;
+            tsum+=t*s->thr_count[t];
+        } else tnever++;
+    }
+    printf("Threshold (200..255):\n");
+    printf("  min=%-3d  max=%-3d  avg=%.1f  never-used=%d/56\n",
+           tmin,tmax,tsum/total,tnever);
+    int omax_t=0;
+    for(int t=200;t<=255;t++) if(s->thr_count[t]>omax_t) omax_t=s->thr_count[t];
+    printf("  Non-zero values:\n");
+    for(int t=200;t<=255;t++){
+        if(!s->thr_count[t]) continue;
+        int c=s->thr_count[t];
+        int bar=omax_t?(int)(30.0*c/omax_t+0.5):0;
+        printf("    %3d: %5d (%5.1f%%)  |", t, c, 100.0*c/total);
+        for(int b=0;b<bar;b++) printf("#");
+        printf("\n");
+    }
+    if(tnever){
+        printf("  Never used:");
+        for(int t=200;t<=255;t++) if(!s->thr_count[t]) printf(" %d",t);
+        printf("\n");
+    }
+
+    // -- Op stats -------------------------------------------------------------
+    printf("\nOps:\n");
+    int omax_op=0;
+    for(int op=0;op<10;op++) if(s->op_count[op]>omax_op) omax_op=s->op_count[op];
+    for(int op=0;op<10;op++){
+        int c=s->op_count[op];
+        int bar=omax_op?(int)(30.0*c/omax_op+0.5):0;
+        printf("  op%d %-10s %5d (%5.1f%%)  |", op, op_names[op], c, 100.0*c/total);
+        for(int b=0;b<bar;b++) printf("#");
+        if(!c) printf(" [NEVER USED]");
+        printf("\n");
+    }
+    printf("\n");
 }
 
 int main(void) {
@@ -364,26 +429,25 @@ int main(void) {
     u8 *blk=malloc(BLOCK_SIZE);
     if(!blk||!fill_random(blk,BLOCK_SIZE)){free(blk);return 1;}
 
-    printf("Block size: %d bytes  (threads=%d)\n\n", BLOCK_SIZE, nt);
-    print_bytes(blk, BLOCK_SIZE, "Before");
+    printf("Block size: %d bytes  threads=%d\n\n", BLOCK_SIZE, nt);
 
     double base=byte_entropy(blk,BLOCK_SIZE);
-    double start_entropy=base, total_net=0.0;
+    double start_h=base, total_net=0.0;
+    P2Stats stats; memset(&stats,0,sizeof(stats));
 
     SR p1[N_P1]; run_phase1(blk,BLOCK_SIZE,base,p1);
-    run_phase_print(blk,BLOCK_SIZE,&base,&total_net,p1,N_P1,"Phase 1: context");
-
-    print_bytes(blk, BLOCK_SIZE, "After Phase 1");
+    run_phase_print(blk,BLOCK_SIZE,&base,&total_net,p1,N_P1,"Phase 1: context",NULL);
 
     for(int p2_iter=1;;p2_iter++){
         SR p2[N_P2]; run_phase2(blk,BLOCK_SIZE,base,p2);
         char lbl[32]; snprintf(lbl,sizeof(lbl),"Phase 2 iter %d",p2_iter);
-        if(!run_phase_print(blk,BLOCK_SIZE,&base,&total_net,p2,N_P2,lbl)) break;
+        if(!run_phase_print(blk,BLOCK_SIZE,&base,&total_net,p2,N_P2,lbl,&stats)) break;
     }
 
-    print_bytes(blk, BLOCK_SIZE, "After Phase 2");
+    printf("Total: H %.4f -> %.4f  net=%+.0f bits  p2_applied=%d\n",
+           start_h, base, total_net, stats.total_applied);
 
-    printf("Total: H %.4f -> %.4f  net=%+.0f bits\n", start_entropy, base, total_net);
+    print_p2_stats(&stats);
 
     free(blk);
     return 0;
