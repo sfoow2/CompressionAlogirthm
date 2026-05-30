@@ -77,20 +77,18 @@ typedef struct {
 // 13  COND-NEXT:       k(3) + 2^k*(op(3)+amp(8))       = 30..184 bits
 // 14  COND-DELTA:      k(3) + 2^k*(op(3)+amp(8))       = 30..184 bits  context=b[i-1]^b[i-2]
 // Phase 2 (refinement on top of phase 1 result, looped until no gain):
-// 25  PRNG-GATE-PRNG-AMP:  seed(16)+thr(8)+op(4)  = 33 bits  PRNG gate+amp, fixed op, thr swept 1..255
-// 27  PRNG-MOVE-OP:        seed(16)+op(4)+amp(8)  = 33 bits  PRNG walk step 1..11, op(amp) at each visit
+// 25  PRNG-GATE-PRNG-AMP:  seed(16)+thr(8)+op(4)  = 33 bits  PRNG gate+amp, fixed op, thr swept 200..255
 static const int PAT_OH[] = {
     0,0,0,0,0,0,0,0,0,0,0,0,  // 0-11 unused
     30, 30, 30,                 // 12 COND-PREV, 13 COND-NEXT, 14 COND-DELTA
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 15-24 unused
-    33, 0,                      // 25 PRNG-GATE-PRNG-AMP, 26 unused
-    33,                         // 27 PRNG-MOVE-OP
+    33,                         // 25 PRNG-GATE-PRNG-AMP
 };
 
 // Map a PRNG byte to a valid (bijective) amplitude for the given op.
 static inline u8 prng_amp(u8 r, int op) {
     switch(op){
-        case 2: return (u8)(r|1);            // MUL: odd 1..255
+        case 2: {u8 v=(u8)(r|1);return v<3?(u8)3:v;} // MUL: odd 3..255 (matches OP_RANGE alo=3)
         case 3: return (u8)(r&0x0F);         // ADDLO: 0..15
         case 5: return r<2?(u8)2:r;          // GFMUL: 2..255
         case 6: return (u8)((r%7)+1);        // ROL: 1..7
@@ -116,12 +114,6 @@ static void apply_sr(u8 *blk, int n, const SR *r) {
         case 14: {int k=r->p[0],flex=r->p[2],op=r->p[1]; // COND-DELTA: context=b[i-1]^b[i-2]
             if(orig) for(int i=2;i<n;i++){int g=(orig[i-1]^orig[i-2])>>(8-k);
                 blk[i]=op_byte(blk[i],r->amps[g],flex?r->grp_ops[g]:op);}} break;
-        case 27: { // PRNG-MOVE-OP: PRNG walk step=1..11, apply op(amp) at each visited position
-            uint32_t st=(uint32_t)r->p[0]; int op=r->p[1],amp=r->p[2];
-            int pos=0;
-            while(pos<n){
-                blk[pos]=op_byte(blk[pos],(u8)amp,op);
-                pos+=1+(int)(lcg_byte(&st)%11);}} break;
         case 25: { // PRNG-GATE-PRNG-AMP: 2 LCG/pos (gate, amp); fixed op; thr stored as raw byte
             uint32_t st=(uint32_t)r->p[0]; u8 thr=(u8)r->p[1]; int op=r->p[2];
             for(int i=0;i<n;i++){u8 gate=lcg_byte(&st);u8 ra=lcg_byte(&st);
@@ -296,11 +288,11 @@ static SR search_prng_gate_prng_amp(const u8*blk,int n,double base){
              // Precompute transformed output for this op (avoids recomputing in sweep)
              u8 trf[BLOCK_SIZE];
              for(int i=0;i<n;i++) trf[i]=op_byte(blk[i],prng_amp(ra[i],op),op);
-             // Build initial ff for thr=1: gate==0 → original, gate>=1 → transformed
+             // Build initial ff for thr=200: gate>=200 → transformed, gate<200 → original
              int ff[256]={0};
-             for(int i=0;i<n;i++) ff[gate[i]?trf[i]:blk[i]]++;
-             // Sweep thr 1..255: each step deselects positions with gate[i]==thr
-             for(int g=1;g<=254;g++){
+             for(int i=0;i<n;i++) ff[gate[i]>=200?trf[i]:blk[i]]++;
+             // Sweep thr 200..255: each step deselects positions with gate[i]==thr
+             for(int g=200;g<=254;g++){
                  double e=entropy_fast(ff);
                  if(e<le){le=e;ls=seed;lop=op;lth=(u8)g;}
                  for(int k=gst[g];k<gst[g]+gcnt[g];k++){
@@ -318,40 +310,8 @@ static SR search_prng_gate_prng_amp(const u8*blk,int n,double base){
 
 
 // â”€â”€ Phase runners â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-// ID=27  PRNG-MOVE-OP: PRNG walk with step 1..11 (move 0..10 extra bytes), apply op(amp) at each visit.
-// Position selection via walk is independent of op+amp, so histogram trick applies: build sel_hist
-// from the walk once per seed, then brute-force all op×amp combinations using hist_transform.
-static SR search_prng_move_op(const u8*blk,int n,double base){
-    SR r; memset(&r,0,sizeof(r)); r.id=27; r.entropy=base; r.overhead=PAT_OH[27];
-    int bfreq[256]={0}; for(int i=0;i<n;i++) bfreq[blk[i]]++;
-    double be=base; int bseed=0,bop=0,bamp=1;
-    #pragma omp parallel
-    {double le=base; int ls=0,lop=0,lamp=1;
-     #pragma omp for schedule(dynamic,128)
-     for(int seed=0;seed<65536;seed++){
-         // PRNG walk: step = 1 + (lcg % 11), so 1..11 bytes between visits
-         int sel[256]={0}; uint32_t st=(uint32_t)seed; int pos=0;
-         while(pos<n){
-             sel[blk[pos]]++;
-             pos+=1+(int)(lcg_byte(&st)%11);}
-         int unsel[256]; for(int v=0;v<256;v++) unsel[v]=bfreq[v]-sel[v];
-         // Brute-force op+amp with histogram trick
-         for(int op=0;op<N_OPS;op++){OP_RANGE(op,alo,ahi)
-             for(int amp=alo;amp<=ahi;amp++){SKIP_OP(op,amp)
-                 int tf[256],ff[256]; hist_transform(sel,tf,op,amp);
-                 for(int v=0;v<256;v++) ff[v]=unsel[v]+tf[v];
-                 double e=entropy_fast(ff);
-                 if(e<le){le=e;ls=seed;lop=op;lamp=amp;}}}
-     }
-     #pragma omp critical
-     if(le<be){be=le;bseed=ls;bop=lop;bamp=lamp;}}
-    r.entropy=be; r.p[0]=bseed; r.p[1]=bop; r.p[2]=bamp;
-    snprintf(r.name,sizeof(r.name),"PRNG-MOVE-OP s=%d op%d a=%d",bseed,bop,bamp);
-    return r;
-}
-
 #define N_P1 3
-#define N_P2 2
+#define N_P2 1
 static void run_phase1(const u8 *blk, int n, double base, SR *out) {
     out[0] = search_cond_prev  (blk,n,base);
     out[1] = search_cond_next  (blk,n,base);
@@ -359,7 +319,6 @@ static void run_phase1(const u8 *blk, int n, double base, SR *out) {
 }
 static void run_phase2(const u8 *blk, int n, double base, SR *out) {
     out[0] = search_prng_gate_prng_amp (blk,n,base);
-    out[1] = search_prng_move_op       (blk,n,base);
 }
 
 
