@@ -10,7 +10,8 @@
 typedef uint8_t u8;
 
 #define BLOCK_SIZE  (4 * 1024)
-#define N_OPS       10
+#define N_BLOCKS    20
+#define N_OPS       16
 #define N_PATTERNS  3
 
 // â”€â”€ GF(256) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -36,7 +37,13 @@ static inline u8 op_byte(u8 v,u8 amp,int op){
         case 6:{u8 a=amp&7;if(!a)a=1;return(u8)((v<<a)|(v>>(8-a)));}  // ROL
         case 7:return(u8)((((v>>4)+amp)&0xF)<<4|(v&0x0F));             // ADDHI
         case 8:{u8 w=(u8)(v+amp);return w^(w>>1);}                     // GRAY: Gray(v+amp), decode=gray_inv(r)-amp
-        case 9:return(u8)(((((v>>4)^(v&0xF)^(amp&0xF))&0xF)<<4)|(v&0x0F)); // XORNIBBLE: self-inverse
+        case 9: return(u8)(((((v>>4)^(v&0xF)^(amp&0xF))&0xF)<<4)|(v&0x0F));// XORNIBBLE
+        case 10:return(u8)((v&0xF0)|((amp-v)&0x0F));                          // SUBLO
+        case 11:return(u8)((((amp-(v>>4))&0x0F)<<4)|(v&0x0F));               // SUBHI
+        case 12:return(u8)(amp-v);                                             // NEGADD: amp-v mod 256
+        case 13:return(u8)((v&0xF0)|((v^amp)&0x0F));                         // XORLO
+        case 14:return(u8)((v&0x0F)|((((v>>4)^amp)&0x0F)<<4));              // XORHI
+        case 15:{u8 a=(u8)(amp&7);if(!a)a=1;return(u8)((v>>a)|(v<<(8-a)));} // ROR
     }return v;
 }
 static double entropy_from_hist(const int f[256],int n){
@@ -58,6 +65,7 @@ static void hist_transform(const int in[256],int out[256],int op,int amp){
     memset(out,0,256*sizeof(int));for(int v=0;v<256;v++)if(in[v])out[op_byte((u8)v,(u8)amp,op)]+=in[v];
 }
 // ops: 0=ADD  1=XOR  2=MUL  3=ADDLO  4=SWXOR  5=GFMUL  6=ROL  7=ADDHI  8=GRAY  9=XORNIBBLE
+//      10=SUBLO  11=SUBHI  12=NEGADD  13=XORLO  14=XORHI  15=ROR
 
 
 // â”€â”€ Search result struct â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -94,7 +102,13 @@ static inline u8 prng_amp(u8 r, int op) {
         case 5: return r<2?(u8)2:r;          // GFMUL: 2..255
         case 6: return (u8)((r%7)+1);        // ROL: 1..7
         case 7: return (u8)(r&0x0F);         // ADDHI: 0..15
-        case 9: return (u8)(r&0x0F);         // XORNIBBLE: 0..15
+        case 9:  return (u8)(r&0x0F);        // XORNIBBLE: 0..15
+        case 10: return (u8)(r&0x0F);        // SUBLO: 0..15
+        case 11: return (u8)(r&0x0F);        // SUBHI: 0..15
+        case 12: return r;                    // NEGADD: 0..255
+        case 13: return (u8)(r&0x0F);        // XORLO: 0..15
+        case 14: return (u8)(r&0x0F);        // XORHI: 0..15
+        case 15: return (u8)((r%7)+1);       // ROR: 1..7
         default: return r;                    // ADD, XOR, SWXOR, GRAY: 0..255
     }
 }
@@ -127,7 +141,9 @@ static void apply_sr(u8 *blk, int n, const SR *r) {
 // MUL(2): odd 3..255; ADDLO(3)/ADDHI(7)/XORNIBBLE(9): amp 0..15; GFMUL(5): amp>=2; ROL(6): 1..7; GRAY(8): 0..255
 #define OP_RANGE(op,alo,ahi) int alo=1,ahi=255; \
     if(op==2)alo=3; if(op==3)ahi=15; if(op==5)alo=2; if(op==6)ahi=7; if(op==7)ahi=15; \
-    if(op==8)alo=0; if(op==9){alo=0;ahi=15;}
+    if(op==8)alo=0; if(op==9){alo=0;ahi=15;} \
+    if(op==10){alo=0;ahi=15;} if(op==11){alo=0;ahi=15;} if(op==12)alo=0; \
+    if(op==13)ahi=15; if(op==14)ahi=15; if(op==15)ahi=7;
 #define SKIP_OP(op,amp) if(op==2&&(amp&1)==0) continue;
 
 // â”€â”€ Search functions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -335,8 +351,8 @@ static void print_bytes(const u8 *blk, int n, const char *label) {
 
 // -- Phase 2 statistics -------------------------------------------------------
 typedef struct {
-    int thr_count[256];  // applied threshold histogram (200..255 range)
-    int op_count[10];    // applied op histogram (N_OPS=10)
+    int thr_count[256];  // applied threshold histogram (224..255 range)
+    int op_count[N_OPS]; // applied op histogram
     int total_applied;   // total transforms applied across all blocks/iters
 } P2Stats;
 
@@ -365,33 +381,34 @@ static int run_phase_print(u8 *blk, int n, double *base, double *total_net,
     if(stats && results[best].id==25){
         int thr=results[best].p[1], op=results[best].p[2];
         if(thr>=0&&thr<256) stats->thr_count[thr]++;
-        if(op>=0&&op<10)    stats->op_count[op]++;
+        if(op>=0&&op<N_OPS) stats->op_count[op]++;
         stats->total_applied++;
     }
     return 1;
 }
 
 static void print_p2_stats(const P2Stats *s) {
-    static const char *op_names[]={"ADD","XOR","MUL","ADDLO","SWXOR","GFMUL","ROL","ADDHI","GRAY","XORNIBBLE"};
+    static const char *op_names[]={"ADD","XOR","MUL","ADDLO","SWXOR","GFMUL","ROL","ADDHI","GRAY","XORNIBBLE",
+                                    "SUBLO","SUBHI","NEGADD","XORLO","XORHI","ROR"};
     int total=s->total_applied;
     printf("\n=== Phase 2 Statistics (%d transforms applied) ===\n\n", total);
     if(!total){printf("  (none applied)\n");return;}
 
-    // -- Threshold stats (200..255) -------------------------------------------
+    // -- Threshold stats (224..255) -------------------------------------------
     int tmin=256,tmax=-1,tnever=0; double tsum=0;
-    for(int t=200;t<=255;t++){
+    for(int t=224;t<=255;t++){
         if(s->thr_count[t]){
             if(t<tmin)tmin=t; if(t>tmax)tmax=t;
             tsum+=t*s->thr_count[t];
         } else tnever++;
     }
-    printf("Threshold (200..255):\n");
-    printf("  min=%-3d  max=%-3d  avg=%.1f  never-used=%d/56\n",
+    printf("Threshold (224..255):\n");
+    printf("  min=%-3d  max=%-3d  avg=%.1f  never-used=%d/32\n",
            tmin,tmax,tsum/total,tnever);
     int omax_t=0;
-    for(int t=200;t<=255;t++) if(s->thr_count[t]>omax_t) omax_t=s->thr_count[t];
+    for(int t=224;t<=255;t++) if(s->thr_count[t]>omax_t) omax_t=s->thr_count[t];
     printf("  Non-zero values:\n");
-    for(int t=200;t<=255;t++){
+    for(int t=224;t<=255;t++){
         if(!s->thr_count[t]) continue;
         int c=s->thr_count[t];
         int bar=omax_t?(int)(30.0*c/omax_t+0.5):0;
@@ -401,15 +418,15 @@ static void print_p2_stats(const P2Stats *s) {
     }
     if(tnever){
         printf("  Never used:");
-        for(int t=200;t<=255;t++) if(!s->thr_count[t]) printf(" %d",t);
+        for(int t=224;t<=255;t++) if(!s->thr_count[t]) printf(" %d",t);
         printf("\n");
     }
 
     // -- Op stats -------------------------------------------------------------
     printf("\nOps:\n");
     int omax_op=0;
-    for(int op=0;op<10;op++) if(s->op_count[op]>omax_op) omax_op=s->op_count[op];
-    for(int op=0;op<10;op++){
+    for(int op=0;op<N_OPS;op++) if(s->op_count[op]>omax_op) omax_op=s->op_count[op];
+    for(int op=0;op<N_OPS;op++){
         int c=s->op_count[op];
         int bar=omax_op?(int)(30.0*c/omax_op+0.5):0;
         printf("  op%d %-10s %5d (%5.1f%%)  |", op, op_names[op], c, 100.0*c/total);
@@ -426,29 +443,68 @@ int main(void) {
     int nt=omp_get_max_threads()-1; if(nt<1)nt=1;
     omp_set_num_threads(nt);
 
-    u8 *blk=malloc(BLOCK_SIZE);
-    if(!blk||!fill_random(blk,BLOCK_SIZE)){free(blk);return 1;}
+    printf("Block size: %d bytes  threads=%d  N_BLOCKS=%d\n\n", BLOCK_SIZE, nt, N_BLOCKS);
 
-    printf("Block size: %d bytes  threads=%d\n\n", BLOCK_SIZE, nt);
-
-    double base=byte_entropy(blk,BLOCK_SIZE);
-    double start_h=base, total_net=0.0;
     P2Stats stats; memset(&stats,0,sizeof(stats));
 
-    SR p1[N_P1]; run_phase1(blk,BLOCK_SIZE,base,p1);
-    run_phase_print(blk,BLOCK_SIZE,&base,&total_net,p1,N_P1,"Phase 1: context",NULL);
+    double bst_min=1e30,bst_max=-1e30,bst_sum=0;  // start entropy
+    double bfn_min=1e30,bfn_max=-1e30,bfn_sum=0;  // final entropy
+    double bnt_min=1e30,bnt_max=-1e30,bnt_sum=0;  // net bits
+    int    n_done=0;
 
-    for(int p2_iter=1;;p2_iter++){
-        SR p2[N_P2]; run_phase2(blk,BLOCK_SIZE,base,p2);
-        char lbl[32]; snprintf(lbl,sizeof(lbl),"Phase 2 iter %d",p2_iter);
-        if(!run_phase_print(blk,BLOCK_SIZE,&base,&total_net,p2,N_P2,lbl,&stats)) break;
+    for(int blk_idx=0; blk_idx<N_BLOCKS; blk_idx++) {
+        u8 *blk=malloc(BLOCK_SIZE);
+        if(!blk||!fill_random(blk,BLOCK_SIZE)){free(blk);continue;}
+
+        printf("\n=== Block %d/%d ===\n\n", blk_idx+1, N_BLOCKS);
+
+        double base=byte_entropy(blk,BLOCK_SIZE);
+        double start_h=base, total_net=0.0;
+        int p1_iter=0, p2_iter=0;
+        int p2_before=stats.total_applied;
+
+        // Interleaved loop: one Phase 1 step, then Phase 2 loop, repeat until both fail.
+        for(;;) {
+            int p1_applied, p2_applied=0;
+
+            p1_iter++;
+            char lbl1[32]; snprintf(lbl1,sizeof(lbl1),"Phase 1 iter %d",p1_iter);
+            SR p1[N_P1]; run_phase1(blk,BLOCK_SIZE,base,p1);
+            p1_applied = run_phase_print(blk,BLOCK_SIZE,&base,&total_net,p1,N_P1,lbl1,NULL);
+
+            for(;;) {
+                p2_iter++;
+                char lbl2[32]; snprintf(lbl2,sizeof(lbl2),"Phase 2 iter %d",p2_iter);
+                SR p2[N_P2]; run_phase2(blk,BLOCK_SIZE,base,p2);
+                if(!run_phase_print(blk,BLOCK_SIZE,&base,&total_net,p2,N_P2,lbl2,&stats)) break;
+                p2_applied=1;
+            }
+
+            if(!p1_applied && !p2_applied) break;
+        }
+
+        printf("Block %d: H %.4f -> %.4f  net=%+.0f bits  p1_iters=%d  p2_applied=%d\n\n",
+               blk_idx+1, start_h, base, total_net, p1_iter, stats.total_applied-p2_before);
+
+        // Accumulate per-block stats
+        if(start_h<bst_min) bst_min=start_h; if(start_h>bst_max) bst_max=start_h; bst_sum+=start_h;
+        if(base   <bfn_min) bfn_min=base;    if(base   >bfn_max) bfn_max=base;    bfn_sum+=base;
+        if(total_net<bnt_min) bnt_min=total_net; if(total_net>bnt_max) bnt_max=total_net; bnt_sum+=total_net;
+        n_done++;
+
+        free(blk);
     }
 
-    printf("Total: H %.4f -> %.4f  net=%+.0f bits  p2_applied=%d\n",
-           start_h, base, total_net, stats.total_applied);
+    // Per-block summary
+    if(n_done>0){
+        printf("=== Block Summary (%d blocks) ===\n", n_done);
+        printf("               min       max       avg\n");
+        printf("  start H:  %7.4f   %7.4f   %7.4f\n", bst_min, bst_max, bst_sum/n_done);
+        printf("  final H:  %7.4f   %7.4f   %7.4f\n", bfn_min, bfn_max, bfn_sum/n_done);
+        printf("  net bits: %7.0f   %7.0f   %7.0f\n", bnt_min, bnt_max, bnt_sum/n_done);
+        printf("\n");
+    }
 
     print_p2_stats(&stats);
-
-    free(blk);
     return 0;
 }
