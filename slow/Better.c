@@ -10,7 +10,7 @@
 typedef uint8_t u8;
 
 #define BLOCK_SIZE  (4 * 1024)
-#define N_BLOCKS    20
+#define N_BLOCKS    3
 #define N_OPS       16
 #define N_PATTERNS  3
 
