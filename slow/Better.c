@@ -10,10 +10,10 @@
 typedef uint8_t u8;
 
 #define BLOCK_SIZE  (4 * 1024)
-#define N_OPS       6
+#define N_OPS       10
 #define N_PATTERNS  3
 
-// ── GF(256) ───────────────────────────────────────────────────────────────────
+// â”€â”€ GF(256) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 static u8 gf_exp[512], gf_log[256];
 static void init_gf256(void) {
     u8 x=1;
@@ -23,7 +23,8 @@ static void init_gf256(void) {
 }
 static inline u8 gf_mul(u8 a,u8 b){return(!a||!b)?0:gf_exp[gf_log[a]+gf_log[b]];}
 
-// ── Core helpers ──────────────────────────────────────────────────────────────
+// â”€â”€ Core helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+static inline u8 lcg_byte(uint32_t *s){*s=*s*1664525u+1013904223u;return(u8)(*s>>24);}
 static inline u8 op_byte(u8 v,u8 amp,int op){
     switch(op){
         case 0:return(u8)(v+amp);
@@ -32,20 +33,34 @@ static inline u8 op_byte(u8 v,u8 amp,int op){
         case 3:return(u8)((v&0xF0)|((v+amp)&0x0F));
         case 4:{u8 s=(u8)((v<<4)|(v>>4));return s^amp;}
         case 5:{u8 a=amp<2?2:amp;return gf_mul(v,a);}
+        case 6:{u8 a=amp&7;if(!a)a=1;return(u8)((v<<a)|(v>>(8-a)));}  // ROL
+        case 7:return(u8)((((v>>4)+amp)&0xF)<<4|(v&0x0F));             // ADDHI
+        case 8:{u8 w=(u8)(v+amp);return w^(w>>1);}                     // GRAY: Gray(v+amp), decode=gray_inv(r)-amp
+        case 9:return(u8)(((((v>>4)^(v&0xF)^(amp&0xF))&0xF)<<4)|(v&0x0F)); // XORNIBBLE: self-inverse
     }return v;
 }
 static double entropy_from_hist(const int f[256],int n){
     double e=0.0;for(int i=0;i<256;i++){if(!f[i])continue;double p=(double)f[i]/n;e-=p*log2(p);}return e;
+}
+// Fast entropy using a precomputed -p*log2(p) table indexed by count.
+// Call init_entropy_table(BLOCK_SIZE) once before use.
+static float g_ent_tab[BLOCK_SIZE+1];
+static void init_entropy_table(int n){
+    g_ent_tab[0]=0.0f;
+    for(int c=1;c<=n;c++){double p=(double)c/n;g_ent_tab[c]=(float)(-p*log2(p));}
+}
+static inline double entropy_fast(const int f[256]){
+    double e=0.0;for(int i=0;i<256;i++)e+=g_ent_tab[f[i]];return e;
 }
 static double byte_entropy(const u8*d,int n){int f[256]={0};for(int i=0;i<n;i++)f[d[i]]++;return entropy_from_hist(f,n);}
 static int fill_random(u8*buf,int n){return BCryptGenRandom(NULL,(PUCHAR)buf,(ULONG)n,BCRYPT_USE_SYSTEM_PREFERRED_RNG)==0;}
 static void hist_transform(const int in[256],int out[256],int op,int amp){
     memset(out,0,256*sizeof(int));for(int v=0;v<256;v++)if(in[v])out[op_byte((u8)v,(u8)amp,op)]+=in[v];
 }
-// ops: 0=ADD  1=XOR  2=MUL  3=ADDLO  4=SWXOR  5=GFMUL
+// ops: 0=ADD  1=XOR  2=MUL  3=ADDLO  4=SWXOR  5=GFMUL  6=ROL  7=ADDHI  8=GRAY  9=XORNIBBLE
 
 
-// ── Search result struct ──────────────────────────────────────────────────────
+// â”€â”€ Search result struct â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 typedef struct {
     int    id;
     char   name[48];
@@ -56,28 +71,39 @@ typedef struct {
     u8     grp_ops[256];  // per-group op (2^k entries used)
 } SR;
 
-// Overhead bits = 5 (ID) + parameter bits.  Per-group ops: each group stores (op 3b + amp 8b) = 11b.
-// 12  COND-PREV:  k(3) + 2^k*(op(3)+amp(8))  = 30 min (k=1,N=2)  ..  184 (k=4,N=16)
-//     Context = high k bits of b[i-1].  Each of the 2^k groups has its own op+amp.
-// 13  COND-NEXT:  k(3) + 2^k*(op(3)+amp(8))  = 30 min (k=1)
-//     Context = high k bits of b[i+1].  Uses original unmodified next byte.
-// 14  COND-DELTA: k(3) + 2^k*(op(3)+amp(8))  = 30 min (k=1)
-//     Context = high k bits of (b[i-1] XOR b[i-2]).  Tracks local difference trend.
-//
-// Per-group ops: instead of one shared op for all groups, cond_greedy_flex() independently
-// picks the best (op, amp) per group.  A group whose sub-histogram responds to XOR gets XOR;
-// another gets ADD; etc.  Net gain improves significantly with minimal overhead increase.
+// Overhead bits = 5 (ID) + parameter bits.  -F suffix = per-group op mode.
+// Phase 1 (always applied first):
+// 12  COND-PREV:       k(3) + 2^k*(op(3)+amp(8))       = 30..184 bits
+// 13  COND-NEXT:       k(3) + 2^k*(op(3)+amp(8))       = 30..184 bits
+// 14  COND-DELTA:      k(3) + 2^k*(op(3)+amp(8))       = 30..184 bits  context=b[i-1]^b[i-2]
+// Phase 2 (refinement on top of phase 1 result, looped until no gain):
+// 25  PRNG-GATE-PRNG-AMP:  seed(16)+thr(8)+op(4)  = 33 bits  PRNG gate+amp, fixed op, thr swept 1..255
+// 27  PRNG-MOVE-OP:        seed(16)+op(4)+amp(8)  = 33 bits  PRNG walk step 1..11, op(amp) at each visit
 static const int PAT_OH[] = {
-    0,0,0,0,0,0,0,0,0,0,0,0,  // IDs 0-11 unused
-    30,                         // 12 COND-PREV  (k=1 min; dynamic per best k found)
-    30,                         // 13 COND-NEXT
-    30,                         // 14 COND-DELTA
+    0,0,0,0,0,0,0,0,0,0,0,0,  // 0-11 unused
+    30, 30, 30,                 // 12 COND-PREV, 13 COND-NEXT, 14 COND-DELTA
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 15-24 unused
+    33, 0,                      // 25 PRNG-GATE-PRNG-AMP, 26 unused
+    33,                         // 27 PRNG-MOVE-OP
 };
 
-// ── Apply a SearchResult in-place ─────────────────────────────────────────────
+// Map a PRNG byte to a valid (bijective) amplitude for the given op.
+static inline u8 prng_amp(u8 r, int op) {
+    switch(op){
+        case 2: return (u8)(r|1);            // MUL: odd 1..255
+        case 3: return (u8)(r&0x0F);         // ADDLO: 0..15
+        case 5: return r<2?(u8)2:r;          // GFMUL: 2..255
+        case 6: return (u8)((r%7)+1);        // ROL: 1..7
+        case 7: return (u8)(r&0x0F);         // ADDHI: 0..15
+        case 9: return (u8)(r&0x0F);         // XORNIBBLE: 0..15
+        default: return r;                    // ADD, XOR, SWXOR, GRAY: 0..255
+    }
+}
+
+// â”€â”€ Apply a SearchResult in-place â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 static void apply_sr(u8 *blk, int n, const SR *r) {
     u8 *orig=NULL;
-    if(r->id==12||r->id==14){  // COND-PREV and COND-DELTA need a snapshot of the input
+    if(r->id==12||r->id==14){  // COND-PREV, COND-DELTA need orig snapshot
         orig=malloc(n); if(orig) memcpy(orig,blk,n);
     }
     switch(r->id){
@@ -87,20 +113,31 @@ static void apply_sr(u8 *blk, int n, const SR *r) {
         case 13: {int k=r->p[0],flex=r->p[2],op=r->p[1]; // COND-NEXT
             for(int i=0;i<n-1;i++){int g=blk[i+1]>>(8-k);
                 blk[i]=op_byte(blk[i],r->amps[g],flex?r->grp_ops[g]:op);}} break;
-        case 14: {int k=r->p[0],flex=r->p[2],op=r->p[1]; // COND-DELTA
+        case 14: {int k=r->p[0],flex=r->p[2],op=r->p[1]; // COND-DELTA: context=b[i-1]^b[i-2]
             if(orig) for(int i=2;i<n;i++){int g=(orig[i-1]^orig[i-2])>>(8-k);
                 blk[i]=op_byte(blk[i],r->amps[g],flex?r->grp_ops[g]:op);}} break;
+        case 27: { // PRNG-MOVE-OP: PRNG walk step=1..11, apply op(amp) at each visited position
+            uint32_t st=(uint32_t)r->p[0]; int op=r->p[1],amp=r->p[2];
+            int pos=0;
+            while(pos<n){
+                blk[pos]=op_byte(blk[pos],(u8)amp,op);
+                pos+=1+(int)(lcg_byte(&st)%11);}} break;
+        case 25: { // PRNG-GATE-PRNG-AMP: 2 LCG/pos (gate, amp); fixed op; thr stored as raw byte
+            uint32_t st=(uint32_t)r->p[0]; u8 thr=(u8)r->p[1]; int op=r->p[2];
+            for(int i=0;i<n;i++){u8 gate=lcg_byte(&st);u8 ra=lcg_byte(&st);
+                if(gate>=thr) blk[i]=op_byte(blk[i],prng_amp(ra,op),op);}} break;
     }
     free(orig);
 }
 
-// ── Helpers for search functions ──────────────────────────────────────────────
-// MUL(2) needs odd amp; ADDLO(3) amp 0-15; GFMUL(5) amp >= 2
+// â”€â”€ Helpers for search functions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// MUL(2): odd 3..255; ADDLO(3)/ADDHI(7)/XORNIBBLE(9): amp 0..15; GFMUL(5): amp>=2; ROL(6): 1..7; GRAY(8): 0..255
 #define OP_RANGE(op,alo,ahi) int alo=1,ahi=255; \
-    if(op==2)alo=3; if(op==3)ahi=15; if(op==5)alo=2;
+    if(op==2)alo=3; if(op==3)ahi=15; if(op==5)alo=2; if(op==6)ahi=7; if(op==7)ahi=15; \
+    if(op==8)alo=0; if(op==9){alo=0;ahi=15;}
 #define SKIP_OP(op,amp) if(op==2&&(amp&1)==0) continue;
 
-// ── Search functions ──────────────────────────────────────────────────────────
+// â”€â”€ Search functions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 // Shared-op greedy: all groups use the same op, 2 refinement passes.
 // Overhead when using this: 5 + 3 + 3 + N*8 bits (k + op + N*amp).
@@ -127,7 +164,7 @@ static double cond_greedy(const int (*gh)[256], int N, int n, int unchanged_val,
 
 // Per-group-op greedy: each group picks its own (op, amp), 3 refinement passes.
 // Overhead when using this: 5 + 3 + N*11 bits (k + N*(op+amp)).
-// Strictly more general than cond_greedy — wins on structured data where groups differ.
+// Strictly more general than cond_greedy â€” wins on structured data where groups differ.
 static double cond_greedy_flex(const int (*gh)[256], int N, int n, int unchanged_val,
                                 u8 *amps_out, u8 *ops_out) {
     u8 amps[256], ops[256];
@@ -232,149 +269,163 @@ static SR search_cond_delta(const u8*blk,int n,double base){
     return r;
 }
 
-// ── Run all searches ──────────────────────────────────────────────────────────
-static void run_all(const u8 *blk, int n, double base, SR *out) {
+// â”€â”€ Phase 2 search functions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+// ID=25  PRNG-GATE-PRNG-AMP: 2 LCG/pos (gate, amp), fixed op brute-forced, thr swept 1..255.
+// Sweep algorithm: counting-sort positions by gate value once per seed, then slide thr in O(n) total.
+static SR search_prng_gate_prng_amp(const u8*blk,int n,double base){
+    SR r; memset(&r,0,sizeof(r)); r.id=25; r.entropy=base; r.overhead=PAT_OH[25];
+    double be=base; int bseed=0,bop=0; u8 bthr=128;
+    #pragma omp parallel
+    {double le=base; int ls=0,lop=0; u8 lth=128;
+     u8 *gate=malloc(n),*ra=malloc(n);
+     int *spos=malloc(n*sizeof(int));
+     #pragma omp for schedule(dynamic,32)
+     for(int seed=0;seed<65536;seed++){
+         if(!gate||!ra||!spos) continue;
+         uint32_t st=(uint32_t)seed;
+         for(int i=0;i<n;i++){gate[i]=lcg_byte(&st);ra[i]=lcg_byte(&st);}
+         // Counting sort: sort positions by gate value for O(1) deselection per thr step
+         int gcnt[256]={0};
+         for(int i=0;i<n;i++) gcnt[gate[i]]++;
+         int gst[256]; gst[0]=0;
+         for(int g=1;g<256;g++) gst[g]=gst[g-1]+gcnt[g-1];
+         {int sc[256]; memcpy(sc,gst,sizeof(gst));
+          for(int i=0;i<n;i++) spos[sc[gate[i]]++]=i;}
+         for(int op=0;op<N_OPS;op++){
+             // Precompute transformed output for this op (avoids recomputing in sweep)
+             u8 trf[BLOCK_SIZE];
+             for(int i=0;i<n;i++) trf[i]=op_byte(blk[i],prng_amp(ra[i],op),op);
+             // Build initial ff for thr=1: gate==0 → original, gate>=1 → transformed
+             int ff[256]={0};
+             for(int i=0;i<n;i++) ff[gate[i]?trf[i]:blk[i]]++;
+             // Sweep thr 1..255: each step deselects positions with gate[i]==thr
+             for(int g=1;g<=254;g++){
+                 double e=entropy_fast(ff);
+                 if(e<le){le=e;ls=seed;lop=op;lth=(u8)g;}
+                 for(int k=gst[g];k<gst[g]+gcnt[g];k++){
+                     int i=spos[k]; ff[trf[i]]--; ff[blk[i]]++;}}
+             double e=entropy_fast(ff);
+             if(e<le){le=e;ls=seed;lop=op;lth=255;}}
+     }
+     free(gate); free(ra); free(spos);
+     #pragma omp critical
+     if(le<be){be=le;bseed=ls;bop=lop;bthr=lth;}}
+    r.entropy=be; r.p[0]=bseed; r.p[1]=(int)bthr; r.p[2]=bop;
+    snprintf(r.name,sizeof(r.name),"PRNG-GATE-PRNG-AMP s=%d thr=%d op%d",bseed,(int)bthr,bop);
+    return r;
+}
+
+
+// â”€â”€ Phase runners â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ID=27  PRNG-MOVE-OP: PRNG walk with step 1..11 (move 0..10 extra bytes), apply op(amp) at each visit.
+// Position selection via walk is independent of op+amp, so histogram trick applies: build sel_hist
+// from the walk once per seed, then brute-force all op×amp combinations using hist_transform.
+static SR search_prng_move_op(const u8*blk,int n,double base){
+    SR r; memset(&r,0,sizeof(r)); r.id=27; r.entropy=base; r.overhead=PAT_OH[27];
+    int bfreq[256]={0}; for(int i=0;i<n;i++) bfreq[blk[i]]++;
+    double be=base; int bseed=0,bop=0,bamp=1;
+    #pragma omp parallel
+    {double le=base; int ls=0,lop=0,lamp=1;
+     #pragma omp for schedule(dynamic,128)
+     for(int seed=0;seed<65536;seed++){
+         // PRNG walk: step = 1 + (lcg % 11), so 1..11 bytes between visits
+         int sel[256]={0}; uint32_t st=(uint32_t)seed; int pos=0;
+         while(pos<n){
+             sel[blk[pos]]++;
+             pos+=1+(int)(lcg_byte(&st)%11);}
+         int unsel[256]; for(int v=0;v<256;v++) unsel[v]=bfreq[v]-sel[v];
+         // Brute-force op+amp with histogram trick
+         for(int op=0;op<N_OPS;op++){OP_RANGE(op,alo,ahi)
+             for(int amp=alo;amp<=ahi;amp++){SKIP_OP(op,amp)
+                 int tf[256],ff[256]; hist_transform(sel,tf,op,amp);
+                 for(int v=0;v<256;v++) ff[v]=unsel[v]+tf[v];
+                 double e=entropy_fast(ff);
+                 if(e<le){le=e;ls=seed;lop=op;lamp=amp;}}}
+     }
+     #pragma omp critical
+     if(le<be){be=le;bseed=ls;bop=lop;bamp=lamp;}}
+    r.entropy=be; r.p[0]=bseed; r.p[1]=bop; r.p[2]=bamp;
+    snprintf(r.name,sizeof(r.name),"PRNG-MOVE-OP s=%d op%d a=%d",bseed,bop,bamp);
+    return r;
+}
+
+#define N_P1 3
+#define N_P2 2
+static void run_phase1(const u8 *blk, int n, double base, SR *out) {
     out[0] = search_cond_prev  (blk,n,base);
     out[1] = search_cond_next  (blk,n,base);
     out[2] = search_cond_delta (blk,n,base);
 }
+static void run_phase2(const u8 *blk, int n, double base, SR *out) {
+    out[0] = search_prng_gate_prng_amp (blk,n,base);
+    out[1] = search_prng_move_op       (blk,n,base);
+}
 
 
-// ── Per-operation statistics ───────────────────────────────────────────────────
-typedef struct {
-    char   name[32];   // base op name (no params), fixed at startup
-    long   count;      // total times this slot won across all blocks
-    long   opt_count;  // times in top-3 profitable but not chosen
-    double sum_net;
-    double min_net;
-    double max_net;
-} OpStat;
+static void print_bytes(const u8 *blk, int n, const char *label) {
+    int show = 512 < n ? 512 : n;
+    printf("%s [%d bytes, first %d]:\n", label, n, show);
+    for(int i=0;i<show;i++){
+        printf("%3d ", blk[i]);
+        if((i&15)==15) printf("\n");  // 16 values per row
+    }
+    printf("\n");
+}
 
-// ── Main ──────────────────────────────────────────────────────────────────────
-#define N_STATS 30   // number of random 4KB blocks to run
+// â”€â”€ Main â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Returns 1 if a transform was applied, 0 if nothing was profitable.
+static int run_phase_print(u8 *blk, int n, double *base, double *total_net,
+                            SR *results, int np, const char *phase_label) {
+    double nets[256]; int best=-1; double best_net=-1e30;
+    for(int i=0;i<np;i++){
+        nets[i]=((*base)-results[i].entropy)*n-results[i].overhead;
+        if(nets[i]>best_net){best_net=nets[i];best=i;}
+    }
+    printf("=== %s ===\n", phase_label);
+    for(int i=0;i<np;i++)
+        printf("  %-30s  net=%+.0f bits%s\n",
+               results[i].name, nets[i], i==best&&best_net>0?" <--":"");
+    if(best<0||best_net<=0){
+        printf("  (no profitable transform)\n\n"); return 0;}
+    printf("Applied: %-28s  H %.4f -> %.4f\n\n",
+           results[best].name, *base, results[best].entropy);
+    apply_sr(blk,n,&results[best]);
+    *base=byte_entropy(blk,n);
+    *total_net+=best_net;
+    return 1;
+}
 
 int main(void) {
     init_gf256();
+    init_entropy_table(BLOCK_SIZE);
     int nt=omp_get_max_threads()-1; if(nt<1)nt=1;
     omp_set_num_threads(nt);
 
-    // Seed stat names with one dummy block; strip params so the base name is stable.
-    OpStat stats[N_PATTERNS];
-    memset(stats,0,sizeof(stats));
-    for(int i=0;i<N_PATTERNS;i++) stats[i].min_net=1e30;
-    {
-        u8 *dummy=malloc(BLOCK_SIZE);
-        if(dummy&&fill_random(dummy,BLOCK_SIZE)){
-            SR tmp[N_PATTERNS];
-            run_all(dummy,BLOCK_SIZE,byte_entropy(dummy,BLOCK_SIZE),tmp);
-            for(int i=0;i<N_PATTERNS;i++){
-                strncpy(stats[i].name,tmp[i].name,31); stats[i].name[31]=0;
-                char *sp=strchr(stats[i].name,' '); if(sp)*sp=0; // keep first word only
-            }
-        }
-        free(dummy);
+    u8 *blk=malloc(BLOCK_SIZE);
+    if(!blk||!fill_random(blk,BLOCK_SIZE)){free(blk);return 1;}
+
+    printf("Block size: %d bytes  (threads=%d)\n\n", BLOCK_SIZE, nt);
+    print_bytes(blk, BLOCK_SIZE, "Before");
+
+    double base=byte_entropy(blk,BLOCK_SIZE);
+    double start_entropy=base, total_net=0.0;
+
+    SR p1[N_P1]; run_phase1(blk,BLOCK_SIZE,base,p1);
+    run_phase_print(blk,BLOCK_SIZE,&base,&total_net,p1,N_P1,"Phase 1: context");
+
+    print_bytes(blk, BLOCK_SIZE, "After Phase 1");
+
+    for(int p2_iter=1;;p2_iter++){
+        SR p2[N_P2]; run_phase2(blk,BLOCK_SIZE,base,p2);
+        char lbl[32]; snprintf(lbl,sizeof(lbl),"Phase 2 iter %d",p2_iter);
+        if(!run_phase_print(blk,BLOCK_SIZE,&base,&total_net,p2,N_P2,lbl)) break;
     }
 
-    printf("Running %d blocks x %d bytes  (threads=%d)\n\n",
-           N_STATS, BLOCK_SIZE, nt);
+    print_bytes(blk, BLOCK_SIZE, "After Phase 2");
 
-    for(int bi=0;bi<N_STATS;bi++){
-        u8 *blk=malloc(BLOCK_SIZE);
-        if(!blk||!fill_random(blk,BLOCK_SIZE)){free(blk);continue;}
+    printf("Total: H %.4f -> %.4f  net=%+.0f bits\n", start_entropy, base, total_net);
 
-        double base=byte_entropy(blk,BLOCK_SIZE);
-        double start_entropy=base, total_net=0.0;
-        SR results[N_PATTERNS];
-        int passes_taken=0;
-
-        while(1){
-            run_all(blk,BLOCK_SIZE,base,results);
-
-            double nets[N_PATTERNS];
-            int best_idx=-1; double best_net=-1e30;
-            for(int i=0;i<N_PATTERNS;i++){
-                nets[i]=(base-results[i].entropy)*BLOCK_SIZE-results[i].overhead;
-                if(nets[i]>best_net){best_net=nets[i];best_idx=i;}
-            }
-            if(best_net<=0||best_idx<0) break;
-
-            // Winner stats
-            OpStat *s=&stats[best_idx];
-            s->count++;
-            s->sum_net+=best_net;
-            if(best_net<s->min_net) s->min_net=best_net;
-            if(best_net>s->max_net) s->max_net=best_net;
-
-            // Top-3 optional: 2nd and 3rd best with positive net (not the winner)
-            {
-                int opt1=-1, opt2=-1; double on1=-1e30, on2=-1e30;
-                for(int i=0;i<N_PATTERNS;i++){
-                    if(i==best_idx||nets[i]<=0) continue;
-                    if(nets[i]>on1){on2=on1;opt2=opt1;on1=nets[i];opt1=i;}
-                    else if(nets[i]>on2){on2=nets[i];opt2=i;}
-                }
-                if(opt1>=0) stats[opt1].opt_count++;
-                if(opt2>=0) stats[opt2].opt_count++;
-            }
-
-            apply_sr(blk,BLOCK_SIZE,&results[best_idx]);
-            base=byte_entropy(blk,BLOCK_SIZE);
-            total_net+=best_net;
-            passes_taken++;
-        }
-
-        // One line per block — just progress, not per-pass noise
-        printf("Block %02d: %d pass(es)  H %.4f -> %.4f  net=%+.0f bits\n",
-               bi+1, passes_taken, start_entropy, base, total_net);
-        fflush(stdout);
-        free(blk);
-    }
-
-    // ── Count table ───────────────────────────────────────────────────────────
-    // Sort by count desc, then opt_count desc as tiebreak
-    int order[N_PATTERNS];
-    for(int i=0;i<N_PATTERNS;i++) order[i]=i;
-    for(int i=1;i<N_PATTERNS;i++){
-        int k=order[i]; int j=i-1;
-        while(j>=0 && (stats[order[j]].count < stats[k].count ||
-                       (stats[order[j]].count == stats[k].count &&
-                        stats[order[j]].opt_count < stats[k].opt_count))){
-            order[j+1]=order[j]; j--;
-        }
-        order[j+1]=k;
-    }
-
-    int n_never=0;  // neither won nor runner-up
-    for(int i=0;i<N_PATTERNS;i++)
-        if(stats[i].count==0 && stats[i].opt_count==0) n_never++;
-
-    printf("\n=== OPERATION USE COUNT (%d blocks) ===\n", N_STATS);
-    printf("  %-28s  %6s  %6s  %8s  %8s  %8s\n",
-           "Operation", "Count", "Opt", "Avg Net", "Min Net", "Max Net");
-    printf("  %-28s  %6s  %6s  %8s  %8s  %8s\n",
-           "----------------------------","------","------","--------","--------","--------");
-
-    for(int i=0;i<N_PATTERNS;i++){
-        int ii=order[i];
-        if(stats[ii].count==0 && stats[ii].opt_count==0) break;
-        double avg = stats[ii].count ? stats[ii].sum_net/stats[ii].count : 0.0;
-        // Mark runner-up-only rows with "opt" tag
-        const char *tag = (stats[ii].count==0) ? " [opt-only]" : "";
-        printf("  %-28s  %6ld  %6ld  %8.1f  %8.1f  %8.1f%s\n",
-               stats[ii].name, stats[ii].count, stats[ii].opt_count,
-               avg,
-               stats[ii].count ? stats[ii].min_net : 0.0,
-               stats[ii].max_net,
-               tag);
-    }
-
-    printf("\n--- NEVER TRIGGERED (%d / %d) — candidates to remove: ---\n",
-           n_never, N_PATTERNS);
-    for(int i=0;i<N_PATTERNS;i++){
-        int ii=order[i];
-        if(stats[ii].count>0 || stats[ii].opt_count>0) continue;
-        printf("  slot%03d  %s\n", ii, stats[ii].name);
-    }
-
+    free(blk);
     return 0;
 }
