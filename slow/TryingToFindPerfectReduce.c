@@ -3,10 +3,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include <windows.h>
-#include <bcrypt.h>
-
-#pragma comment(lib, "bcrypt.lib")
 
 typedef uint8_t u8;
 
@@ -63,14 +59,12 @@ int main(void) {
     u8 *tmp  = malloc(size);
     u8 *work = malloc(size);
 
-    NTSTATUS st = BCryptGenRandom(NULL, data, (ULONG)size, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-    if (!BCRYPT_SUCCESS(st)) {
-        fprintf(stderr, "BCryptGenRandom failed: 0x%08lX\n", st);
-        free(data); free(tmp); free(work); return 1;
-    }
+    uint32_t rng = 0xDEADBEEF;
+    for (int i = 0; i < size; i++) data[i] = (u8)xorshift(&rng);
 
     double ent = getEntropy(data, size);
     const double initial = ent;
+    double total_overhead = 0.0;
     printf("Starting entropy: %.6f bits/byte\n\n", ent);
 
     for (int pass = 1; ; pass++) {
@@ -121,6 +115,7 @@ int main(void) {
 
         if (xor_net >= stride_net) {
             applyXorStream(data, size, xor_seed);
+            total_overhead += 16.0;
             printf("Pass %2d: XOR stream      seed=%5u  entropy %.6f  net gain %.4f bits\n",
                    pass, xor_seed, best_ent, xor_net);
         } else {
@@ -131,6 +126,7 @@ int main(void) {
                         data[i] ^= (u8)xorshift(&s);
                 }
             }
+            total_overhead += 16.0 + active * 16.0;
             printf("Pass %2d: Stride-%d groups  seeds=", pass, best_k);
             for (int g = 0; g < best_k; g++) printf("%u%s", best_seeds[g], g<best_k-1?",":"");
             printf("  entropy %.6f  net gain %.4f bits\n", best_ent, stride_net);
@@ -138,10 +134,13 @@ int main(void) {
         ent = best_ent;
     }
 
-    printf("\nInitial:  %.6f bits/byte\n", initial);
-    printf("Final:    %.6f bits/byte\n", ent);
-    printf("Total:    %.4f bits saved (%.6f bits/byte)\n",
-           (initial - ent) * size, initial - ent);
+    double raw_saved = (initial - ent) * (double)size;
+    printf("\nInitial:       %.6f bits/byte\n", initial);
+    printf("Final:         %.6f bits/byte\n", ent);
+    printf("Raw saved:     %.4f bits\n", raw_saved);
+    printf("Seed overhead: %.4f bits\n", total_overhead);
+    printf("Net saved:     %.4f bits (%.6f bits/byte)\n",
+           raw_saved - total_overhead, (raw_saved - total_overhead) / (double)size);
 
     free(work); free(tmp); free(data);
     return 0;
