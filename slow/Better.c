@@ -155,9 +155,11 @@ static void apply_sr(u8 *blk, int n, const SR *r) {
             int rot=r->p[0]; if(!rot) break;
             int bs=rot/8, bp=rot%8;
             u8 *tmp=malloc(n); if(!tmp) break;
+            int j=bs%n, j1=(bs+1)%n;
             for(int i=0;i<n;i++){
-                u8 a=blk[(i+bs)%n], b=blk[(i+bs+1)%n];
-                tmp[i]=bp?(u8)((a<<bp)|(b>>(8-bp))):a;}
+                u8 a=blk[j], b=blk[j1];
+                tmp[i]=bp?(u8)((a<<bp)|(b>>(8-bp))):a;
+                if(++j>=n)j=0; if(++j1>=n)j1=0;}
             memcpy(blk,tmp,n); free(tmp);} break;
     }
     free(orig);
@@ -185,16 +187,15 @@ static double cond_greedy(const int (*gh)[256], int N, int n, int unchanged_val,
     for(int pass=0;pass<2;pass++) for(int g=0;g<N;g++){
         int tc[256],wk[256]; hist_transform(gh[g],tc,op,amps[g]);
         for(int v=0;v<256;v++) wk[v]=combined[v]-tc[v];
-        double bge=1e30; u8 bga=amps[g];
+        double bge=1e30; u8 bga=amps[g]; int best_tf[256]; memcpy(best_tf,tc,256*sizeof(int));
         for(int amp=alo;amp<=ahi;amp++){SKIP_OP(op,amp)
             int tf[256],ff[256]; hist_transform(gh[g],tf,op,amp);
             for(int v=0;v<256;v++) ff[v]=wk[v]+tf[v];
-            double e=entropy_fast(ff); if(e<bge){bge=e;bga=(u8)amp;}}
-        int tn[256]; hist_transform(gh[g],tn,op,bga);
-        for(int v=0;v<256;v++) combined[v]=wk[v]+tn[v];
+            double e=entropy_fast(ff); if(e<bge){bge=e;bga=(u8)amp;memcpy(best_tf,tf,256*sizeof(int));}}
+        for(int v=0;v<256;v++) combined[v]=wk[v]+best_tf[v];
         amps[g]=bga;}
     for(int g=0;g<N;g++) amps_out[g]=amps[g];
-    return entropy_from_hist(combined,n);
+    return entropy_fast(combined);
 }
 
 // Per-group-op greedy: each group picks its own (op, amp), 3 refinement passes.
@@ -209,25 +210,24 @@ static double cond_greedy_flex(const int (*gh)[256], int N, int n, int unchanged
     for(int pass=0;pass<3;pass++) for(int g=0;g<N;g++){
         int tc[256],wk[256]; hist_transform(gh[g],tc,ops[g],amps[g]);
         for(int v=0;v<256;v++) wk[v]=combined[v]-tc[v];
-        double bge=1e30; u8 bga=amps[g]; u8 bgo=ops[g];
+        double bge=1e30; u8 bga=amps[g]; u8 bgo=ops[g]; int best_tf[256]; memcpy(best_tf,tc,256*sizeof(int));
         for(int op=0;op<N_OPS;op++){OP_RANGE(op,alo,ahi)
             for(int amp=alo;amp<=ahi;amp++){SKIP_OP(op,amp)
                 int tf[256],ff[256]; hist_transform(gh[g],tf,op,amp);
                 for(int v=0;v<256;v++) ff[v]=wk[v]+tf[v];
-                double e=entropy_fast(ff); if(e<bge){bge=e;bga=(u8)amp;bgo=(u8)op;}}}
-        int tn[256]; hist_transform(gh[g],tn,bgo,bga);
-        for(int v=0;v<256;v++) combined[v]=wk[v]+tn[v];
+                double e=entropy_fast(ff); if(e<bge){bge=e;bga=(u8)amp;bgo=(u8)op;memcpy(best_tf,tf,256*sizeof(int));}}}
+        for(int v=0;v<256;v++) combined[v]=wk[v]+best_tf[v];
         amps[g]=bga; ops[g]=bgo;}
     for(int g=0;g<N;g++){amps_out[g]=amps[g]; ops_out[g]=ops[g];}
-    return entropy_from_hist(combined,n);
+    return entropy_fast(combined);
 }
 
 static SR search_cond_prev(const u8*blk,int n,double base){
     SR r; memset(&r,0,sizeof(r)); r.id=12; r.entropy=base; r.overhead=PAT_OH[12];
     double best_net=-1e30; int bk=1,bflex=0; u8 bamps[256]={0}, bops[256]={0};
-    for(int k=1;k<=5;k++){
+    int (*gh)[256]=malloc(32*256*sizeof(int));
+    if(gh) for(int k=1;k<=5;k++){
         int N=1<<k;
-        int (*gh)[256]=malloc(N*256*sizeof(int)); if(!gh) continue;
         memset(gh,0,N*256*sizeof(int));
         for(int i=1;i<n;i++) gh[blk[i-1]>>(8-k)][blk[i]]++;
         // shared op (cheaper overhead)
@@ -242,8 +242,8 @@ static SR search_cond_prev(const u8*blk,int n,double base){
          double e=cond_greedy_flex(gh,N,n,blk[0],amps,ops);
          double net=(base-e)*n-oh;
          if(net>best_net){best_net=net;bk=k;bflex=1;r.entropy=e;r.overhead=oh;
-             memcpy(bamps,amps,N);memcpy(bops,ops,N);}}
-        free(gh);}
+             memcpy(bamps,amps,N);memcpy(bops,ops,N);}}}
+    free(gh);
     r.p[0]=bk; r.p[2]=bflex;
     {int N=1<<bk; memcpy(r.amps,bamps,N); if(bflex) memcpy(r.grp_ops,bops,N);}
     snprintf(r.name,sizeof(r.name),"COND-PREV k=%d%s",bk,bflex?"-F":"");
@@ -254,9 +254,9 @@ static SR search_cond_prev(const u8*blk,int n,double base){
 static SR search_cond_next(const u8*blk,int n,double base){
     SR r; memset(&r,0,sizeof(r)); r.id=13; r.entropy=base; r.overhead=PAT_OH[13];
     double best_net=-1e30; int bk=1,bflex=0; u8 bamps[256]={0}, bops[256]={0};
-    for(int k=1;k<=5;k++){
+    int (*gh)[256]=malloc(32*256*sizeof(int));
+    if(gh) for(int k=1;k<=5;k++){
         int N=1<<k;
-        int (*gh)[256]=malloc(N*256*sizeof(int)); if(!gh) continue;
         memset(gh,0,N*256*sizeof(int));
         for(int i=0;i<n-1;i++) gh[blk[i+1]>>(8-k)][blk[i]]++;
         for(int op=0;op<N_OPS;op++){
@@ -269,8 +269,8 @@ static SR search_cond_next(const u8*blk,int n,double base){
          double e=cond_greedy_flex(gh,N,n,blk[n-1],amps,ops);
          double net=(base-e)*n-oh;
          if(net>best_net){best_net=net;bk=k;bflex=1;r.entropy=e;r.overhead=oh;
-             memcpy(bamps,amps,N);memcpy(bops,ops,N);}}
-        free(gh);}
+             memcpy(bamps,amps,N);memcpy(bops,ops,N);}}}
+    free(gh);
     r.p[0]=bk; r.p[2]=bflex;
     {int N=1<<bk; memcpy(r.amps,bamps,N); if(bflex) memcpy(r.grp_ops,bops,N);}
     snprintf(r.name,sizeof(r.name),"COND-NEXT k=%d%s",bk,bflex?"-F":"");
@@ -281,9 +281,9 @@ static SR search_cond_next(const u8*blk,int n,double base){
 static SR search_cond_delta(const u8*blk,int n,double base){
     SR r; memset(&r,0,sizeof(r)); r.id=14; r.entropy=base; r.overhead=PAT_OH[14];
     double best_net=-1e30; int bk=1,bflex=0; u8 bamps[256]={0}, bops[256]={0};
-    for(int k=1;k<=5;k++){
+    int (*gh)[256]=malloc(32*256*sizeof(int));
+    if(gh) for(int k=1;k<=5;k++){
         int N=1<<k;
-        int (*gh)[256]=malloc(N*256*sizeof(int)); if(!gh) continue;
         memset(gh,0,N*256*sizeof(int));
         for(int i=2;i<n;i++) gh[(blk[i-1]^blk[i-2])>>(8-k)][blk[i]]++;
         for(int op=0;op<N_OPS;op++){
@@ -296,8 +296,8 @@ static SR search_cond_delta(const u8*blk,int n,double base){
          double e=cond_greedy_flex(gh,N,n,blk[0],amps,ops);
          double net=(base-e)*n-oh;
          if(net>best_net){best_net=net;bk=k;bflex=1;r.entropy=e;r.overhead=oh;
-             memcpy(bamps,amps,N);memcpy(bops,ops,N);}}
-        free(gh);}
+             memcpy(bamps,amps,N);memcpy(bops,ops,N);}}}
+    free(gh);
     r.p[0]=bk; r.p[2]=bflex;
     {int N=1<<bk; memcpy(r.amps,bamps,N); if(bflex) memcpy(r.grp_ops,bops,N);}
     snprintf(r.name,sizeof(r.name),"COND-DELTA k=%d%s",bk,bflex?"-F":"");
@@ -311,10 +311,10 @@ static SR search_cond_delta(const u8*blk,int n,double base){
 static SR search_cond_prev2(const u8*blk,int n,double base){
     SR r; memset(&r,0,sizeof(r)); r.id=16; r.entropy=base; r.overhead=PAT_OH[16];
     double best_net=-1e30; int bj=1,bl=1,bflex=0,bop=0; u8 bamps[256]={0},bops[256]={0};
-    for(int j=1;j<=4;j++) for(int l=1;l<=4;l++){
+    int (*gh)[256]=malloc(32*256*sizeof(int));
+    if(gh) for(int j=1;j<=4;j++) for(int l=1;l<=4;l++){
         if(j+l>5) continue;
         int N=(1<<j)*(1<<l);
-        int (*gh)[256]=malloc(N*256*sizeof(int)); if(!gh) continue;
         memset(gh,0,N*256*sizeof(int));
         for(int i=2;i<n;i++) gh[((blk[i-1]>>(8-j))<<l)|(blk[i-2]>>(8-l))][blk[i]]++;
         for(int op=0;op<N_OPS;op++){
@@ -327,8 +327,8 @@ static SR search_cond_prev2(const u8*blk,int n,double base){
          double e=cond_greedy_flex(gh,N,n,blk[0],amps,ops);
          double net=(base-e)*n-oh;
          if(net>best_net){best_net=net;bj=j;bl=l;bflex=1;
-             r.entropy=e;r.overhead=oh;memcpy(bamps,amps,N);memcpy(bops,ops,N);}}
-        free(gh);}
+             r.entropy=e;r.overhead=oh;memcpy(bamps,amps,N);memcpy(bops,ops,N);}}}
+    free(gh);
     r.p[0]=bj; r.p[1]=bl; r.p[2]=bflex; r.p[3]=bop;
     {int N=(1<<bj)*(1<<bl); memcpy(r.amps,bamps,N); if(bflex) memcpy(r.grp_ops,bops,N);}
     snprintf(r.name,sizeof(r.name),"COND-PREV2 j=%d l=%d%s",bj,bl,bflex?"-F":"");
@@ -343,9 +343,9 @@ static SR search_cond_prev2(const u8*blk,int n,double base){
 static SR search_cond_pos(const u8 *blk, int n, double base){
     SR r; memset(&r,0,sizeof(r)); r.id=15; r.entropy=base; r.overhead=PAT_OH[15];
     double best_net=-1e30; int bk=1,bflex=0; u8 bamps[256]={0}, bops[256]={0};
-    for(int k=1;k<=4;k++){
+    int (*gh)[256]=malloc(32*256*sizeof(int));
+    if(gh) for(int k=1;k<=4;k++){
         int N=1<<k;
-        int (*gh)[256]=malloc(N*256*sizeof(int)); if(!gh) continue;
         memset(gh,0,N*256*sizeof(int));
         for(int i=0;i<n;i++) gh[i%N][blk[i]]++;  // context = position mod N
         for(int op=0;op<N_OPS;op++){
@@ -358,8 +358,8 @@ static SR search_cond_pos(const u8 *blk, int n, double base){
          double e=cond_greedy_flex(gh,N,n,-1,amps,ops);
          double net=(base-e)*n-oh;
          if(net>best_net){best_net=net;bk=k;bflex=1;r.entropy=e;r.overhead=oh;
-             memcpy(bamps,amps,N);memcpy(bops,ops,N);}}
-        free(gh);}
+             memcpy(bamps,amps,N);memcpy(bops,ops,N);}}}
+    free(gh);
     r.p[0]=bk; r.p[2]=bflex;
     {int N=1<<bk; memcpy(r.amps,bamps,N); if(bflex) memcpy(r.grp_ops,bops,N);}
     snprintf(r.name,sizeof(r.name),"COND-POS k=%d%s",bk,bflex?"-F":"");
@@ -481,17 +481,17 @@ static SR search_prng_gate_fixed_amp(const u8 *blk, int n, double base){
 // Inverse: rotate left by (n*8 - rot) bits, which is rotate right by rot.
 static SR search_bit_rotate(const u8 *blk, int n, double base){
     SR r; memset(&r,0,sizeof(r)); r.id=27; r.entropy=base; r.overhead=PAT_OH[27];
-    int total_bits=n*8;
     u8 *tmp=malloc(n); if(!tmp) return r;
     double be=base; int brot=0;
-    for(int rot=1;rot<total_bits;rot++){
-        int bs=rot/8, bp=rot%8;
-        for(int i=0;i<n;i++){
-            u8 a=blk[(i+bs)%n], b=blk[(i+bs+1)%n];
-            tmp[i]=bp?(u8)((a<<bp)|(b>>(8-bp))):a;
-        }
+    // For a fixed bit-phase bp, all byte-offsets bs produce identical histograms:
+    // incrementing bs by 1 cyclically shifts tmp by one byte, which preserves entropy.
+    // So only bp=1..7 need testing; bp=0 (byte-aligned) never changes the histogram.
+    for(int bp=1;bp<=7;bp++){
+        for(int i=0;i<n-1;i++)
+            tmp[i]=(u8)((blk[i]<<bp)|(blk[i+1]>>(8-bp)));
+        tmp[n-1]=(u8)((blk[n-1]<<bp)|(blk[0]>>(8-bp)));
         double e=byte_entropy(tmp,n);
-        if(e<be){be=e;brot=rot;}
+        if(e<be){be=e;brot=bp;}
     }
     free(tmp);
     r.entropy=be; r.p[0]=brot;
@@ -499,7 +499,7 @@ static SR search_bit_rotate(const u8 *blk, int n, double base){
     return r;
 }
 
-#define N_P1 5
+#define N_P1 4
 #define N_P2 3
 static void run_phase1(const u8 *blk, int n, double base, SR *out) {
     #pragma omp parallel sections
@@ -511,9 +511,7 @@ static void run_phase1(const u8 *blk, int n, double base, SR *out) {
     #pragma omp section
     out[2] = search_cond_delta (blk,n,base);
     #pragma omp section
-    out[3] = search_cond_pos   (blk,n,base);
-    #pragma omp section
-    out[4] = search_cond_prev2 (blk,n,base);
+    out[3] = search_cond_prev2 (blk,n,base);
     }
 }
 static void run_phase2(const u8 *blk, int n, double base, SR *out) {
@@ -682,11 +680,20 @@ typedef struct {
     int orig_bytes;
 } BlockData;
 
+typedef struct { char name[48]; int count; double sum_net,min_net,max_net; } OpStat;
+static int cmp_opstat(const void *a,const void *b){
+    return ((const OpStat*)b)->count-((const OpStat*)a)->count;}
+static const char *sr_base_name(int id){
+    switch(id){case 12:return"COND-PREV";case 13:return"COND-NEXT";
+               case 14:return"COND-DELTA";case 15:return"COND-POS";
+               case 16:return"COND-PREV2";default:return"UNKNOWN";}}
+
 int main(void) {
     init_gf256();
     init_entropy_table(BLOCK_SIZE);
     int nt=omp_get_max_threads();
     omp_set_num_threads(nt);
+    OpStat op_stats[128]; int n_op_stats=0; memset(op_stats,0,sizeof(op_stats));
 
     // ── Allocate block storage ────────────────────────────────────────────────
     int blocks_cap = 1024;
@@ -714,6 +721,7 @@ int main(void) {
             if(!tmp){ fprintf(stderr,"OOM\n"); fclose(fin); free(blocks); return 1; }
             blocks = tmp;
         }
+        if(n_blocks >= 40) break;
         BlockData *bd = &blocks[n_blocks];
         int got = (int)fread(bd->blk, 1, BLOCK_SIZE, fin);
         if(got <= 0) break;
@@ -725,9 +733,43 @@ int main(void) {
         double base = byte_entropy(bd->blk, BLOCK_SIZE);
         double start_h = base, total_net = 0.0;
 
+        printf("\nBlock %d (H=%.4f):\n", n_blocks+1, base);
+        int pass=0;
         for(;;) {
             if(bd->n_applied >= MAX_TRANSFORMS) break;
             SR p1[N_P1]; run_phase1(bd->blk, BLOCK_SIZE, base, p1);
+
+            int sb=-1; double sn=-1e30;
+            for(int i=0;i<N_P1;i++){
+                double net=(base-p1[i].entropy)*(double)BLOCK_SIZE-p1[i].overhead;
+                if(net>sn){sn=net;sb=i;}}
+
+            printf("  pass %d:\n", pass+1);
+            for(int i=0;i<N_P1;i++){
+                double net=(base-p1[i].entropy)*(double)BLOCK_SIZE-p1[i].overhead;
+                printf("    %-34s  H=%.4f  net=%+8.1f%s\n",
+                       p1[i].name, p1[i].entropy, net,
+                       (i==sb&&sn>0)?"  <-- chosen":"");
+            }
+            if(sb<0||sn<=0){ printf("    --> no gain, stopping\n"); break; }
+
+            if(sb>=0&&sn>0){
+                const char *bname=sr_base_name(p1[sb].id);
+                int f=-1;
+                for(int s=0;s<n_op_stats;s++)
+                    if(strcmp(op_stats[s].name,bname)==0){f=s;break;}
+                if(f<0&&n_op_stats<128){
+                    f=n_op_stats++;
+                    strncpy(op_stats[f].name,bname,47); op_stats[f].name[47]=0;
+                    op_stats[f].count=0; op_stats[f].sum_net=0.0;
+                    op_stats[f].min_net=1e30; op_stats[f].max_net=-1e30;}
+                if(f>=0){
+                    op_stats[f].count++;
+                    op_stats[f].sum_net+=sn;
+                    if(sn<op_stats[f].min_net)op_stats[f].min_net=sn;
+                    if(sn>op_stats[f].max_net)op_stats[f].max_net=sn;}}
+
+            pass++;
             if(!run_phase_apply(bd->blk, BLOCK_SIZE, &base, &total_net,
                                 p1, N_P1, NULL, &bd->applied[bd->n_applied])) break;
             bd->n_applied++;
@@ -740,6 +782,21 @@ int main(void) {
     }
     fclose(fin);
     printf("\n%d blocks read (%.2f KB)\n", n_blocks, total_input_bytes/1024.0);
+
+    qsort(op_stats, n_op_stats, sizeof(OpStat), cmp_opstat);
+    int top = n_op_stats < 40 ? n_op_stats : 40;
+    printf("\n=== Top %d chosen transforms (by count) ===\n", top);
+    printf("  %-38s  %6s  %10s  %10s  %10s\n",
+           "Transform","count","min net","max net","avg net");
+    printf("  %-38s  %6s  %10s  %10s  %10s\n",
+           "--------------------------------------","------",
+           "----------","----------","----------");
+    for(int i=0;i<top;i++)
+        printf("  %-38s  %6d  %10.1f  %10.1f  %10.1f\n",
+               op_stats[i].name, op_stats[i].count,
+               op_stats[i].min_net, op_stats[i].max_net,
+               op_stats[i].sum_net/op_stats[i].count);
+    printf("\n");
 
     // ── Build global frequency table ──────────────────────────────────────────
     uint16_t global_freq[256];
