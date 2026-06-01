@@ -10,12 +10,13 @@
 typedef uint8_t u8;
 
 #define BLOCK_SIZE  (4 * 1024)
-#define N_BLOCKS    1000
 #define N_OPS       16
-#define INPUT_FILE  "C:\\Users\\lukac\\Documents\\compressor\\compressor2.c"
+#define INPUT_FILE   "C:/Users/lukac/Documents/compressor/test.zip"
+#define OUTPUT_FILE  INPUT_FILE ".cmp2"
+#define MAX_TRANSFORMS 16
 #define N_PATTERNS  3
 
-// â”€â”€ GF(256) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// â"€â"€ GF(256) â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 static u8 gf_exp[512], gf_log[256];
 static void init_gf256(void) {
     u8 x=1;
@@ -25,7 +26,7 @@ static void init_gf256(void) {
 }
 static inline u8 gf_mul(u8 a,u8 b){return(!a||!b)?0:gf_exp[gf_log[a]+gf_log[b]];}
 
-// â”€â”€ Core helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// â"€â"€ Core helpers â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 static inline u8 lcg_byte(uint32_t *s){*s=*s*1664525u+1013904223u;return(u8)(*s>>24);}
 static inline u8 op_byte(u8 v,u8 amp,int op){
     switch(op){
@@ -69,7 +70,7 @@ static void hist_transform(const int in[256],int out[256],int op,int amp){
 //      10=SUBLO  11=SUBHI  12=NEGADD  13=XORLO  14=XORHI  15=ROR
 
 
-// â”€â”€ Search result struct â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// â"€â"€ Search result struct â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 typedef struct {
     int    id;
     char   name[48];
@@ -93,7 +94,7 @@ typedef struct {
 static const int PAT_OH[] = {
     0,0,0,0,0,0,0,0,0,0,0,0,  // 0-11 unused
     30, 30, 30,                 // 12 COND-PREV, 13 COND-NEXT, 14 COND-DELTA
-    30, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 15 COND-POS, 16-24 unused (9 entries)
+    30, 45, 0, 0, 0, 0, 0, 0, 0,  // 15 COND-POS, 16 COND-PREV2, 17-24 unused (8 entries)
     25,                          // 25 PRNG-GATE-PRNG-AMP
     27,                          // 26 PRNG-GATE-FIXED-AMP
     15,                          // 27 BIT-ROTATE
@@ -118,10 +119,10 @@ static inline u8 prng_amp(u8 r, int op) {
     }
 }
 
-// â”€â”€ Apply a SearchResult in-place â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// â"€â"€ Apply a SearchResult in-place â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 static void apply_sr(u8 *blk, int n, const SR *r) {
     u8 *orig=NULL;
-    if(r->id==12||r->id==14){  // COND-PREV, COND-DELTA need orig snapshot
+    if(r->id==12||r->id==14||r->id==16){  // COND-PREV, COND-DELTA, COND-PREV2 need orig snapshot
         orig=malloc(n); if(orig) memcpy(orig,blk,n);
     }
     switch(r->id){
@@ -136,6 +137,10 @@ static void apply_sr(u8 *blk, int n, const SR *r) {
                 blk[i]=op_byte(blk[i],r->amps[g],flex?r->grp_ops[g]:op);}} break;
         case 15: {int k=r->p[0],flex=r->p[2],op=r->p[1]; // COND-POS: context=i%(1<<k)
             for(int i=0;i<n;i++){int g=i%(1<<k);
+                blk[i]=op_byte(blk[i],r->amps[g],flex?r->grp_ops[g]:op);}} break;
+        case 16: {int j=r->p[0],l=r->p[1],flex=r->p[2],op=r->p[3]; // COND-PREV2
+            if(orig) for(int i=2;i<n;i++){
+                int g=((orig[i-1]>>(8-j))<<l)|(orig[i-2]>>(8-l));
                 blk[i]=op_byte(blk[i],r->amps[g],flex?r->grp_ops[g]:op);}} break;
         case 25: { // PRNG-GATE-PRNG-AMP
             uint32_t st=(uint32_t)r->p[0]; u8 thr=(u8)r->p[1]; int op=r->p[2];
@@ -158,7 +163,7 @@ static void apply_sr(u8 *blk, int n, const SR *r) {
     free(orig);
 }
 
-// â”€â”€ Helpers for search functions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// â"€â"€ Helpers for search functions â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 // MUL(2): odd 3..255; ADDLO(3)/ADDHI(7)/XORNIBBLE(9): amp 0..15; GFMUL(5): amp>=2; ROL(6): 1..7; GRAY(8): 0..255
 #define OP_RANGE(op,alo,ahi) int alo=1,ahi=255; \
     if(op==2)alo=3; if(op==3)ahi=15; if(op==5)alo=2; if(op==6)ahi=7; if(op==7)ahi=15; \
@@ -167,7 +172,7 @@ static void apply_sr(u8 *blk, int n, const SR *r) {
     if(op==13)ahi=15; if(op==14)ahi=15; if(op==15)ahi=7;
 #define SKIP_OP(op,amp) if(op==2&&(amp&1)==0) continue;
 
-// â”€â”€ Search functions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// â"€â"€ Search functions â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
 // Shared-op greedy: all groups use the same op, 2 refinement passes.
 // Overhead when using this: 5 + 3 + 3 + N*8 bits (k + op + N*amp).
@@ -194,7 +199,7 @@ static double cond_greedy(const int (*gh)[256], int N, int n, int unchanged_val,
 
 // Per-group-op greedy: each group picks its own (op, amp), 3 refinement passes.
 // Overhead when using this: 5 + 3 + N*11 bits (k + N*(op+amp)).
-// Strictly more general than cond_greedy â€” wins on structured data where groups differ.
+// Strictly more general than cond_greedy â€" wins on structured data where groups differ.
 static double cond_greedy_flex(const int (*gh)[256], int N, int n, int unchanged_val,
                                 u8 *amps_out, u8 *ops_out) {
     u8 amps[256], ops[256];
@@ -220,7 +225,7 @@ static double cond_greedy_flex(const int (*gh)[256], int N, int n, int unchanged
 static SR search_cond_prev(const u8*blk,int n,double base){
     SR r; memset(&r,0,sizeof(r)); r.id=12; r.entropy=base; r.overhead=PAT_OH[12];
     double best_net=-1e30; int bk=1,bflex=0; u8 bamps[256]={0}, bops[256]={0};
-    for(int k=1;k<=4;k++){
+    for(int k=1;k<=5;k++){
         int N=1<<k;
         int (*gh)[256]=malloc(N*256*sizeof(int)); if(!gh) continue;
         memset(gh,0,N*256*sizeof(int));
@@ -249,7 +254,7 @@ static SR search_cond_prev(const u8*blk,int n,double base){
 static SR search_cond_next(const u8*blk,int n,double base){
     SR r; memset(&r,0,sizeof(r)); r.id=13; r.entropy=base; r.overhead=PAT_OH[13];
     double best_net=-1e30; int bk=1,bflex=0; u8 bamps[256]={0}, bops[256]={0};
-    for(int k=1;k<=4;k++){
+    for(int k=1;k<=5;k++){
         int N=1<<k;
         int (*gh)[256]=malloc(N*256*sizeof(int)); if(!gh) continue;
         memset(gh,0,N*256*sizeof(int));
@@ -276,7 +281,7 @@ static SR search_cond_next(const u8*blk,int n,double base){
 static SR search_cond_delta(const u8*blk,int n,double base){
     SR r; memset(&r,0,sizeof(r)); r.id=14; r.entropy=base; r.overhead=PAT_OH[14];
     double best_net=-1e30; int bk=1,bflex=0; u8 bamps[256]={0}, bops[256]={0};
-    for(int k=1;k<=4;k++){
+    for(int k=1;k<=5;k++){
         int N=1<<k;
         int (*gh)[256]=malloc(N*256*sizeof(int)); if(!gh) continue;
         memset(gh,0,N*256*sizeof(int));
@@ -299,7 +304,38 @@ static SR search_cond_delta(const u8*blk,int n,double base){
     return r;
 }
 
-// â”€â”€ Phase 2 search functions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// COND-PREV2: op+amp keyed by high j bits of b[i-1] and high l bits of b[i-2].
+// Context = (b[i-1]>>(8-j))<<l | (b[i-2]>>(8-l)), N = 2^(j+l) groups.
+// Searches j,l in 1..4 with j+l<=5. Captures 2nd-order Markov structure.
+// Overhead shared: 5(ID)+3(j)+3(l)+3(op)+N*8; flex: 5+3+3+N*11.
+static SR search_cond_prev2(const u8*blk,int n,double base){
+    SR r; memset(&r,0,sizeof(r)); r.id=16; r.entropy=base; r.overhead=PAT_OH[16];
+    double best_net=-1e30; int bj=1,bl=1,bflex=0,bop=0; u8 bamps[256]={0},bops[256]={0};
+    for(int j=1;j<=4;j++) for(int l=1;l<=4;l++){
+        if(j+l>5) continue;
+        int N=(1<<j)*(1<<l);
+        int (*gh)[256]=malloc(N*256*sizeof(int)); if(!gh) continue;
+        memset(gh,0,N*256*sizeof(int));
+        for(int i=2;i<n;i++) gh[((blk[i-1]>>(8-j))<<l)|(blk[i-2]>>(8-l))][blk[i]]++;
+        for(int op=0;op<N_OPS;op++){
+            u8 amps[256]={0}; int oh=5+3+3+3+N*8;
+            double e=cond_greedy(gh,N,n,blk[0],op,amps);
+            double net=(base-e)*n-oh;
+            if(net>best_net){best_net=net;bj=j;bl=l;bflex=0;bop=op;
+                r.entropy=e;r.overhead=oh;memcpy(bamps,amps,N);}}
+        {u8 amps[256]={0},ops[256]={0}; int oh=5+3+3+N*11;
+         double e=cond_greedy_flex(gh,N,n,blk[0],amps,ops);
+         double net=(base-e)*n-oh;
+         if(net>best_net){best_net=net;bj=j;bl=l;bflex=1;
+             r.entropy=e;r.overhead=oh;memcpy(bamps,amps,N);memcpy(bops,ops,N);}}
+        free(gh);}
+    r.p[0]=bj; r.p[1]=bl; r.p[2]=bflex; r.p[3]=bop;
+    {int N=(1<<bj)*(1<<bl); memcpy(r.amps,bamps,N); if(bflex) memcpy(r.grp_ops,bops,N);}
+    snprintf(r.name,sizeof(r.name),"COND-PREV2 j=%d l=%d%s",bj,bl,bflex?"-F":"");
+    return r;
+}
+
+// â"€â"€ Phase 2 search functions â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
 // COND-POS: context = position mod 2^k (k=1..4). Groups bytes by their index
 // modulo 2/4/8/16. Captures periodic structure: even vs odd bytes, etc.
@@ -376,7 +412,7 @@ static SR search_prng_gate_prng_amp(const u8*blk,int n,double base){
 }
 
 
-// â”€â”€ Phase runners â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// â"€â"€ Phase runners â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 // ID=26 PRNG-GATE-FIXED-AMP: PRNG gate (1 LCG per position), single brute-forced op+amp.
 // Uses histogram trick: sel_hist built once per (seed,thr), all (op,amp) tried in O(256).
 // Overhead: seed(10)+thr(5)+op(4)+amp(8) = 27 bits. Seeds: 0..1023 (10-bit).
@@ -463,7 +499,7 @@ static SR search_bit_rotate(const u8 *blk, int n, double base){
     return r;
 }
 
-#define N_P1 4
+#define N_P1 5
 #define N_P2 3
 static void run_phase1(const u8 *blk, int n, double base, SR *out) {
     #pragma omp parallel sections
@@ -476,6 +512,8 @@ static void run_phase1(const u8 *blk, int n, double base, SR *out) {
     out[2] = search_cond_delta (blk,n,base);
     #pragma omp section
     out[3] = search_cond_pos   (blk,n,base);
+    #pragma omp section
+    out[4] = search_cond_prev2 (blk,n,base);
     }
 }
 static void run_phase2(const u8 *blk, int n, double base, SR *out) {
@@ -486,14 +524,16 @@ static void run_phase2(const u8 *blk, int n, double base, SR *out) {
 
 
 // Returns 1 if a profitable transform was found and applied, 0 otherwise.
+// applied_out: if non-NULL, receives a copy of the applied SR.
 static int run_phase_apply(u8 *blk, int n, double *base, double *total_net,
-                           SR *results, int np, int *total_oh) {
+                           SR *results, int np, int *total_oh, SR *applied_out) {
     int best=-1; double best_net=-1e30;
     for(int i=0;i<np;i++){
         double net=((*base)-results[i].entropy)*n-results[i].overhead;
         if(net>best_net){best_net=net;best=i;}
     }
     if(best<0||best_net<=0) return 0;
+    if(applied_out) *applied_out=results[best];
     apply_sr(blk,n,&results[best]);
     *base=byte_entropy(blk,n);
     *total_net+=best_net;
@@ -520,6 +560,7 @@ static uint32_t bb_read(BitBuf *b, int bits){
 
 // ── Global frequency table (rANS precision M=4096) ───────────────────────────
 #define RANS_M 4096
+#define RANS_L ((uint32_t)(RANS_M) << 11)   // lower bound = 2^23
 // Normalize raw histogram to sum=RANS_M; each non-zero raw[i] → norm[i]≥1.
 // Requires RANS_M ≥ number of non-zero symbols (always true: 4096 >> 256).
 static void freq_normalize(const int raw[256], uint16_t norm[256]){
@@ -585,95 +626,181 @@ static void print_compression_estimate(const uint16_t norm[256],
     printf("  coder overhead exceeding savings. Bit-packing is optimal here.\n\n");
 }
 
+// ── rANS encoder ─────────────────────────────────────────────────────────────
+static void rans_build_cum(const uint16_t freq[256], uint32_t cum[257]) {
+    cum[0]=0;
+    for(int i=0;i<256;i++) cum[i+1]=cum[i]+freq[i];
+}
+
+// Encodes src[n] backwards into buf[0..buf_cap-1].
+// Returns pointer to start of encoded data; *out_len = number of bytes.
+static u8 *rans_encode_blk(const u8 *src, int n,
+                            const uint16_t freq[256], const uint32_t cum[257],
+                            u8 *buf, int buf_cap, int *out_len) {
+    u8 *ptr = buf + buf_cap;
+    uint32_t x = RANS_L;
+    for(int i=n-1; i>=0; i--) {
+        u8  s  = src[i];
+        uint32_t fs = freq[s] ? (uint32_t)freq[s] : 1u;
+        uint32_t cs = cum[s];
+        uint32_t xmax = ((RANS_L / RANS_M) << 8) * fs;
+        while(x >= xmax) { *--ptr = (u8)(x & 0xFF); x >>= 8; }
+        x = (x / fs) * RANS_M + cs + (x % fs);
+    }
+    // Write final state LE (4 bytes) — decoder reads this first
+    ptr -= 4;
+    ptr[0]=(u8)x; ptr[1]=(u8)(x>>8); ptr[2]=(u8)(x>>16); ptr[3]=(u8)(x>>24);
+    *out_len = (int)(buf + buf_cap - ptr);
+    return ptr;
+}
+
+// ── Instruction stream serialization ─────────────────────────────────────────
+// Bit layout for COND transforms (ids 12-15):
+//   type(2) k-1(2) flex(1) [shared: op(4) N*amp(8)] [flex: N*(op(4)+amp(8))]
+// where type: 0=PREV 1=NEXT 2=DELTA 3=POS, N=2^k
+static void serialize_sr(BitBuf *bb, const SR *r) {
+    int type;
+    switch(r->id){ case 12:type=0;break; case 13:type=1;break;
+                   case 14:type=2;break; case 15:type=3;break; default:return; }
+    int k=r->p[0], N=1<<k, flex=r->p[2];
+    bb_write(bb, type, 2);
+    bb_write(bb, k-1,  2);
+    bb_write(bb, flex,  1);
+    if(flex) {
+        for(int g=0;g<N;g++) { bb_write(bb,r->grp_ops[g],4); bb_write(bb,r->amps[g],8); }
+    } else {
+        bb_write(bb, r->p[1], 4);
+        for(int g=0;g<N;g++) bb_write(bb, r->amps[g], 8);
+    }
+}
+
+// ── Block storage (pass 1 results) ───────────────────────────────────────────
+typedef struct {
+    u8  blk[BLOCK_SIZE];
+    SR  applied[MAX_TRANSFORMS];
+    int n_applied;
+    int orig_bytes;
+} BlockData;
+
 int main(void) {
     init_gf256();
     init_entropy_table(BLOCK_SIZE);
     int nt=omp_get_max_threads();
     omp_set_num_threads(nt);
 
-    FILE *fin = fopen(INPUT_FILE, "rb");
-    if(!fin){ fprintf(stderr, "Cannot open: %s\n", INPUT_FILE); return 1; }
+    // ── Allocate block storage ────────────────────────────────────────────────
+    int blocks_cap = 1024;
+    BlockData *blocks = malloc((size_t)blocks_cap * sizeof(BlockData));
+    if(!blocks){ fprintf(stderr,"OOM\n"); return 1; }
 
-    printf("Input: %s\n", INPUT_FILE);
-    printf("Block size: %d bytes  threads=%d\n", BLOCK_SIZE, nt);
-    printf("%-4s  %-7s %-7s  %-6s %-5s %-4s  %-9s  %s\n",
-           "Blk","startH","finalH","net","OH","iter","cumRatio%","note");
-    printf("----  ------- -------  ------ ----- ----  ---------  ----\n");
+    // ── Pass 1: read file, apply transforms, collect stats ────────────────────
+    FILE *fin = fopen(INPUT_FILE,"rb");
+    if(!fin){ fprintf(stderr,"Cannot open: %s\n", INPUT_FILE); free(blocks); return 1; }
 
-    int    global_hist[256]={0};
-    int    total_payload_bits=0;
-    int    total_instr_bits=0;
+    printf("Input:  %s\n", INPUT_FILE);
+    printf("Output: %s\n", OUTPUT_FILE);
+    printf("Block:  %d bytes  threads=%d\n\n", BLOCK_SIZE, nt);
+    printf("%-4s  %-7s %-7s  %-6s  %-3s\n","Blk","startH","finalH","net","T");
+    printf("----  ------- -------  ------  ---\n");
 
-    double bst_min=1e30,bst_max=-1e30,bst_sum=0;
-    double bfn_min=1e30,bfn_max=-1e30,bfn_sum=0;
-    double bnt_min=1e30,bnt_max=-1e30,bnt_sum=0;
-    int    n_done=0;
-    int    first_under100=-1;
+    int global_hist[256]={0};
+    uint64_t total_input_bytes=0;
+    int n_blocks=0;
 
-    for(int blk_idx=0; blk_idx<N_BLOCKS; blk_idx++) {
-        u8 *blk=calloc(BLOCK_SIZE,1);
-        if(!blk) break;
-        int got=(int)fread(blk,1,BLOCK_SIZE,fin);
-        if(got<=0){free(blk);break;}  // EOF
+    for(;;) {
+        if(n_blocks >= blocks_cap) {
+            blocks_cap *= 2;
+            BlockData *tmp = realloc(blocks, (size_t)blocks_cap * sizeof(BlockData));
+            if(!tmp){ fprintf(stderr,"OOM\n"); fclose(fin); free(blocks); return 1; }
+            blocks = tmp;
+        }
+        BlockData *bd = &blocks[n_blocks];
+        int got = (int)fread(bd->blk, 1, BLOCK_SIZE, fin);
+        if(got <= 0) break;
+        bd->orig_bytes = got;
+        bd->n_applied  = 0;
+        total_input_bytes += (uint64_t)got;
+        memset(bd->blk + got, 0, BLOCK_SIZE - got);
 
-        double base=byte_entropy(blk,BLOCK_SIZE);
-        double start_h=base, total_net=0.0;
-        int total_oh=0, p1_iter=0;
+        double base = byte_entropy(bd->blk, BLOCK_SIZE);
+        double start_h = base, total_net = 0.0;
 
         for(;;) {
-            p1_iter++;
-            SR p1[N_P1]; run_phase1(blk,BLOCK_SIZE,base,p1);
-            if(!run_phase_apply(blk,BLOCK_SIZE,&base,&total_net,p1,N_P1,&total_oh)) break;
+            if(bd->n_applied >= MAX_TRANSFORMS) break;
+            SR p1[N_P1]; run_phase1(bd->blk, BLOCK_SIZE, base, p1);
+            if(!run_phase_apply(bd->blk, BLOCK_SIZE, &base, &total_net,
+                                p1, N_P1, NULL, &bd->applied[bd->n_applied])) break;
+            bd->n_applied++;
         }
 
-        for(int i=0;i<BLOCK_SIZE;i++) global_hist[blk[i]]++;
-
-        int payload_bits = (int)(base * BLOCK_SIZE);
-        int instr_bits   = total_oh;
-        total_payload_bits += payload_bits;
-        total_instr_bits   += instr_bits;
-
-        int table_bits = 512*8;
-        int cumul_comp = total_payload_bits + total_instr_bits + table_bits;
-        int cumul_raw  = 8 * BLOCK_SIZE * (n_done+1);
-        double ratio   = 100.0 * cumul_comp / cumul_raw;
-
-        const char *note = "";
-        if(first_under100<0 && ratio<100.0){
-            first_under100 = blk_idx+1;
-            note = "  <-- BREAK EVEN";
-        }
-
-        printf("%4d  %.4f %.4f  %+6.0f %5d %4d  %8.3f%%  %s\n",
-               blk_idx+1, start_h, base, total_net, total_oh, p1_iter, ratio, note);
-
-        if(start_h<bst_min) bst_min=start_h; if(start_h>bst_max) bst_max=start_h; bst_sum+=start_h;
-        if(base   <bfn_min) bfn_min=base;    if(base   >bfn_max) bfn_max=base;    bfn_sum+=base;
-        if(total_net<bnt_min) bnt_min=total_net; if(total_net>bnt_max) bnt_max=total_net; bnt_sum+=total_net;
-        n_done++;
-
-        free(blk);
+        for(int i=0;i<BLOCK_SIZE;i++) global_hist[bd->blk[i]]++;
+        printf("%4d  %.4f %.4f  %+6.0f  %3d\n",
+               n_blocks+1, start_h, base, total_net, bd->n_applied);
+        n_blocks++;
     }
     fclose(fin);
+    printf("\n%d blocks read (%.2f KB)\n", n_blocks, total_input_bytes/1024.0);
 
-    printf("\n=== Block Summary (%d blocks) ===\n", n_done);
-    printf("               min       max       avg\n");
-    printf("  start H:  %7.4f   %7.4f   %7.4f\n", bst_min, bst_max, bst_sum/n_done);
-    printf("  final H:  %7.4f   %7.4f   %7.4f\n", bfn_min, bfn_max, bfn_sum/n_done);
-    printf("  net bits: %7.0f   %7.0f   %7.0f\n", bnt_min, bnt_max, bnt_sum/n_done);
-    if(first_under100>0)
-        printf("\n  Break-even at block %d\n", first_under100);
-    else
-        printf("\n  Never broke 100%% in %d blocks\n", n_done);
+    // ── Build global frequency table ──────────────────────────────────────────
+    uint16_t global_freq[256];
+    freq_normalize(global_hist, global_freq);
+    uint32_t cum[257];
+    rans_build_cum(global_freq, cum);
 
-    if(n_done>0){
-        uint16_t global_freq[256];
-        freq_normalize(global_hist, global_freq);
-        printf("\n");
-        print_compression_estimate(global_freq, n_done,
-                                   8*BLOCK_SIZE*n_done,
-                                   total_payload_bits,
-                                   total_instr_bits);
+    // ── Pass 2: write compressed file ─────────────────────────────────────────
+    FILE *fout = fopen(OUTPUT_FILE,"wb");
+    if(!fout){ fprintf(stderr,"Cannot create: %s\n", OUTPUT_FILE); free(blocks); return 1; }
+
+    // Header: "CMP2"(4) ver(1) orig_size(8,LE) block_size(4,LE) n_blocks(4,LE) flags(1)
+    fwrite("CMP2",1,4,fout);
+    fputc(0x01,fout);
+    for(int i=0;i<8;i++) fputc((int)((total_input_bytes>>(i*8))&0xFF),fout);
+    uint32_t bsz=BLOCK_SIZE;
+    for(int i=0;i<4;i++) fputc((bsz>>(i*8))&0xFF,fout);
+    uint32_t nb=(uint32_t)n_blocks;
+    for(int i=0;i<4;i++) fputc((nb>>(i*8))&0xFF,fout);
+    fputc(0x01,fout);   // flags: global freq table present
+    // Global freq table: 256 × uint16 LE  (512 bytes)
+    for(int i=0;i<256;i++){ fputc(global_freq[i]&0xFF,fout); fputc((global_freq[i]>>8)&0xFF,fout); }
+
+    // Per-block: n_applied(1) instr_size(2,LE) instr_bytes rans_size(3,LE) rans_bytes
+    u8 *rans_buf = malloc(2*BLOCK_SIZE+64);
+    u8 instr_buf[2048];
+    for(int bi=0; bi<n_blocks; bi++) {
+        BlockData *bd = &blocks[bi];
+
+        // Serialize instruction stream into bit buffer
+        BitBuf bb; bb_init(&bb, instr_buf, sizeof(instr_buf));
+        for(int j=0;j<bd->n_applied;j++) serialize_sr(&bb, &bd->applied[j]);
+        int instr_bytes = (bb.bit_pos + 7) / 8;
+
+        // rANS encode the transformed block
+        int rans_len = 0;
+        u8 *rans_ptr = rans_encode_blk(bd->blk, BLOCK_SIZE, global_freq, cum,
+                                        rans_buf, 2*BLOCK_SIZE+64, &rans_len);
+
+        // Write block record
+        fputc((u8)bd->n_applied, fout);
+        fputc(instr_bytes & 0xFF, fout);
+        fputc((instr_bytes >> 8) & 0xFF, fout);
+        fwrite(instr_buf, 1, instr_bytes, fout);
+        fputc(rans_len & 0xFF, fout);
+        fputc((rans_len >> 8) & 0xFF, fout);
+        fputc((rans_len >> 16) & 0xFF, fout);
+        fwrite(rans_ptr, 1, rans_len, fout);
     }
+    free(rans_buf);
+
+    long out_bytes = ftell(fout);
+    fclose(fout);
+    free(blocks);
+
+    printf("\n=== Compression Result ===\n");
+    printf("  Input:   %llu bytes  (%.2f KB)\n",
+           (unsigned long long)total_input_bytes, total_input_bytes/1024.0);
+    printf("  Output:  %ld bytes  (%.2f KB)\n", out_bytes, out_bytes/1024.0);
+    printf("  Ratio:   %.4f  (%.2f%%)\n",
+           (double)out_bytes/total_input_bytes,
+           100.0*out_bytes/total_input_bytes);
     return 0;
 }
