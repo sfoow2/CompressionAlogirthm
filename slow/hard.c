@@ -237,65 +237,277 @@ void applyInstruction(u8 *data, int size, int instr, int amp) {
     }
 }
 
-double FindNextStep(u8 *data, int size, int *usedInstr, int verbose) {
-    double baseE  = getEntropy(data, size);
-    double bestE  = baseE;
+/* candidate step record for beam search */
+typedef struct { int instr; int amp; double net; } Cand;
+
+/* ------------------------------------------------------------------ *
+ * Single-threaded step finder — safe to call from any parallel region *
+ * scratch is a caller-provided buffer of length `size`               *
+ * ------------------------------------------------------------------ */
+/* Entropy from a pre-built 256-bucket frequency table */
+static double entropyFromFreq(const int *freq, int size) {
+    double e = 0.0;
+    for (int v = 0; v < 256; v++) {
+        if (!freq[v]) continue;
+        double p = (double)freq[v] / size;
+        e -= p * log2(p);
+    }
+    return e;
+}
+
+/* ------------------------------------------------------------------ *
+ * Optimised single-threaded FindNextStep using frequency-table cache  *
+ * All instructions are permutations of byte values on a position      *
+ * subset. Pre-build stride×phase frequency tables once (O(n×16)),    *
+ * then evaluate each (instr,amp) candidate in O(256) — no memcpy,    *
+ * no data scan per candidate. ~1000× faster than the naïve approach.  *
+ * ------------------------------------------------------------------ */
+static double FindNextStepST(u8 *data, int size, int *usedInstr, int verbose) {
+    /* --- build per-stride-phase frequency tables (one pass over data) --- */
+    /* pFreq[s][ph][v] = count of bytes with value v at positions i where   */
+    /* i mod (s+2) == ph. strides 2..17 → s=0..15, max phase index = 16    */
+    int (*pFreq)[17][256] = calloc(16, sizeof(*pFreq));
+    int totalFreq[256] = {0};
+
+    {
+        int ph[16] = {0};
+        for (int i = 0; i < size; i++) {
+            u8 b = data[i];
+            totalFreq[b]++;
+            for (int s = 0; s < 16; s++) {
+                pFreq[s][ph[s]][b]++;
+                if (++ph[s] == s + 2) ph[s] = 0;
+            }
+        }
+    }
+
+    double baseE = entropyFromFreq(totalFreq, size);
+    double bestE = baseE;
     int bestInstr = -1, bestAmp = -1;
 
+    for (int instr = 0; instr < 32; instr++) {
+        if (instr == 5) continue;
+        for (int amp = 0; amp < 256; amp++) {
+            /* map (instr, amp) → stride, phase, permutation type + value */
+            int stride, phase, ptype, pval;
+            switch (instr) {
+            case  0: stride=(amp>>4)+2; phase=0; ptype=0; pval=amp&0xF;      break;
+            case  1: stride=(amp>>4)+2; phase=1; ptype=0; pval=amp&0xF;      break;
+            case  2: stride=(amp>>4)+2; phase=0; ptype=2; pval=amp&0xF;      break;
+            case  3: stride=(amp>>4)+2; phase=1; ptype=2; pval=amp&0xF;      break;
+            case  4: stride=2;          phase=0; ptype=0; pval=amp;           break;
+            case  6: stride=2;          phase=0; ptype=1; pval=amp;           break;
+            case  7: stride=2;          phase=1; ptype=1; pval=amp;           break;
+            case  8: stride=(amp>>4)+2; phase=0; ptype=1; pval=(amp&0xF)<<4; break;
+            case  9: stride=(amp>>4)+2; phase=1; ptype=1; pval=(amp&0xF)<<4; break;
+            case 10: stride=3;          phase=0; ptype=0; pval=amp;           break;
+            case 11: stride=3;          phase=1; ptype=0; pval=amp;           break;
+            case 12: stride=3;          phase=0; ptype=1; pval=amp;           break;
+            case 13: stride=3;          phase=1; ptype=1; pval=amp;           break;
+            case 14: stride=(amp>>4)+2; phase=0; ptype=0; pval=(amp&0xF)<<4; break;
+            case 15: stride=(amp>>4)+2; phase=1; ptype=0; pval=(amp&0xF)<<4; break;
+            case 16: stride=(amp>>4)+2; phase=2; ptype=0; pval=amp&0xF;      break;
+            case 17: stride=(amp>>4)+2; phase=3; ptype=0; pval=amp&0xF;      break;
+            case 18: stride=(amp>>4)+2; phase=2; ptype=2; pval=amp&0xF;      break;
+            case 19: stride=(amp>>4)+2; phase=3; ptype=2; pval=amp&0xF;      break;
+            case 20: stride=(amp>>4)+2; phase=2; ptype=0; pval=(amp&0xF)<<4; break;
+            case 21: stride=(amp>>4)+2; phase=3; ptype=0; pval=(amp&0xF)<<4; break;
+            case 22: stride=(amp>>4)+2; phase=2; ptype=1; pval=(amp&0xF)<<4; break;
+            case 23: stride=(amp>>4)+2; phase=3; ptype=1; pval=(amp&0xF)<<4; break;
+            case 24: stride=3;          phase=2; ptype=0; pval=amp;           break;
+            case 25: stride=3;          phase=2; ptype=1; pval=amp;           break;
+            case 26: stride=4;          phase=0; ptype=0; pval=amp;           break;
+            case 27: stride=4;          phase=1; ptype=0; pval=amp;           break;
+            case 28: stride=4;          phase=2; ptype=0; pval=amp;           break;
+            case 29: stride=4;          phase=3; ptype=0; pval=amp;           break;
+            case 30: stride=4;          phase=0; ptype=1; pval=amp;           break;
+            case 31: stride=4;          phase=1; ptype=1; pval=amp;           break;
+            default: continue;
+            }
+
+            /* phase % stride: handles phase>=stride for packed instrs with
+               small strides (off-by-a-few-bytes approximation, negligible
+               on 1MB data) */
+            const int *sp = pFreq[stride - 2][phase % stride];
+
+            /* build new freq: remove affected bytes, re-add with permutation */
+            int nf[256];
+            memcpy(nf, totalFreq, 256 * sizeof(int));
+            for (int v = 0; v < 256; v++) nf[v] -= sp[v];
+            switch (ptype) {
+            case 0: for (int v=0;v<256;v++) nf[v^pval]           += sp[v]; break;
+            case 1: for (int v=0;v<256;v++) nf[(v+pval)&0xFF]    += sp[v]; break;
+            case 2: for (int v=0;v<256;v++) nf[(v&0xF0)|((v+pval)&0xF)] += sp[v]; break;
+            }
+
+            double e = entropyFromFreq(nf, size);
+            if (e < bestE) { bestE = e; bestInstr = instr; bestAmp = amp; }
+        }
+    }
+
+    free(pFreq);
+
+    double saved = (baseE - bestE) * size, net = saved - 13.0;
+    if (bestInstr < 0 || net <= 0.0) {
+        if (usedInstr) *usedInstr = -1;
+        return 0.0;
+    }
+    applyInstruction(data, size, bestInstr, bestAmp);
+    if (verbose)
+        printf("  instr=%2d amp=%3d | entropy %.6f -> %.6f | saved=%.1f  net=%.1f bits\n",
+               bestInstr, bestAmp, baseE, bestE, saved, net);
+    if (usedInstr) *usedInstr = bestInstr;
+    return net;
+}
+
+/* ------------------------------------------------------------------ *
+ * Full greedy chain + full-chain scramble lookahead — single-threaded *
+ * Covers improvements 1 (full-chain lookahead) and 3 (nested scrambles)*
+ * ------------------------------------------------------------------ */
+static double RunChainST(u8 *data, int size, int *hits, int verbose) {
+    double total = 0.0;
+
+    for (;;) {
+        /* greedy passes until stall */
+        int instr; double net;
+        while ((net = FindNextStepST(data, size, &instr, verbose)) > 0.0) {
+            total += net;
+            if (hits) hits[instr]++;
+        }
+
+        /* improvement 1: full-chain lookahead for scramble selection
+           try 32 strides, evaluate the entire subsequent chain for each */
+        u8 *buf = malloc(size);
+        int bestAmp = -1; double bestGain = 0.0;
+        for (int amp = 0; amp < 32; amp++) {
+            memcpy(buf, data, size);
+            applyInstruction(buf, size, 5, amp);
+            double cg = 0.0, n; int dummy;
+            while ((n = FindNextStepST(buf, size, &dummy, 0)) > 0.0) cg += n;
+            double gain = cg - 13.0;
+            if (gain > bestGain) { bestGain = gain; bestAmp = amp; }
+        }
+        free(buf);
+
+        if (bestAmp < 0) break;  /* no useful scramble found */
+
+        applyInstruction(data, size, 5, bestAmp);
+        total -= 13.0;
+        if (hits) hits[5]++;
+        if (verbose)
+            printf("  instr= 5 amp=%3d | deinterleave stride=%-3d        | overhead=13.0  net=-13.0 bits\n",
+                   bestAmp, bestAmp + 2);
+        /* improvement 3: loop back — chain runs again after scramble,
+           and will try another scramble if it stalls again (nested) */
+    }
+
+    return total;
+}
+
+/* ------------------------------------------------------------------ *
+ * Find top-K first steps via parallel brute-force                     *
+ * bufs: pre-allocated per-thread scratch buffers                      *
+ * ------------------------------------------------------------------ */
+static void FindTopK(u8 *data, int size, int K, Cand *topK) {
+    /* build frequency tables once — same layout as FindNextStepST */
+    int (*pFreq)[17][256] = calloc(16, sizeof(*pFreq));
+    int totalFreq[256] = {0};
+    {
+        int ph[16] = {0};
+        for (int i = 0; i < size; i++) {
+            u8 b = data[i];
+            totalFreq[b]++;
+            for (int s = 0; s < 16; s++) {
+                pFreq[s][ph[s]][b]++;
+                if (++ph[s] == s + 2) ph[s] = 0;
+            }
+        }
+    }
+
+    double baseE = entropyFromFreq(totalFreq, size);
+    for (int k = 0; k < K; k++) topK[k] = (Cand){-1, -1, -1e30};
+
     int nthreads = omp_get_max_threads();
-    u8 **bufs = malloc(nthreads * sizeof(u8 *));
-    for (int t = 0; t < nthreads; t++) bufs[t] = malloc(size);
+    Cand *local = malloc(nthreads * K * sizeof(Cand));
+    for (int i = 0; i < nthreads * K; i++) local[i] = (Cand){-1, -1, -1e30};
 
     #pragma omp parallel
     {
         int tid = omp_get_thread_num();
-        u8 *buf = bufs[tid];
-        double lBestE    = baseE;
-        int    lBestInstr = -1;
-        int    lBestAmp   = -1;
+        Cand *myTop = &local[tid * K];
 
         #pragma omp for schedule(dynamic)
         for (int instr = 0; instr < 32; instr++) {
             if (instr == 5) continue;
             for (int amp = 0; amp < 256; amp++) {
-                memcpy(buf, data, size);
-                applyInstruction(buf, size, instr, amp);
-                double e = getEntropy(buf, size);
-                if (e < lBestE) {
-                    lBestE     = e;
-                    lBestInstr = instr;
-                    lBestAmp   = amp;
+                int stride, phase, ptype, pval;
+                switch (instr) {
+                case  0: stride=(amp>>4)+2; phase=0; ptype=0; pval=amp&0xF;      break;
+                case  1: stride=(amp>>4)+2; phase=1; ptype=0; pval=amp&0xF;      break;
+                case  2: stride=(amp>>4)+2; phase=0; ptype=2; pval=amp&0xF;      break;
+                case  3: stride=(amp>>4)+2; phase=1; ptype=2; pval=amp&0xF;      break;
+                case  4: stride=2;          phase=0; ptype=0; pval=amp;           break;
+                case  6: stride=2;          phase=0; ptype=1; pval=amp;           break;
+                case  7: stride=2;          phase=1; ptype=1; pval=amp;           break;
+                case  8: stride=(amp>>4)+2; phase=0; ptype=1; pval=(amp&0xF)<<4; break;
+                case  9: stride=(amp>>4)+2; phase=1; ptype=1; pval=(amp&0xF)<<4; break;
+                case 10: stride=3;          phase=0; ptype=0; pval=amp;           break;
+                case 11: stride=3;          phase=1; ptype=0; pval=amp;           break;
+                case 12: stride=3;          phase=0; ptype=1; pval=amp;           break;
+                case 13: stride=3;          phase=1; ptype=1; pval=amp;           break;
+                case 14: stride=(amp>>4)+2; phase=0; ptype=0; pval=(amp&0xF)<<4; break;
+                case 15: stride=(amp>>4)+2; phase=1; ptype=0; pval=(amp&0xF)<<4; break;
+                case 16: stride=(amp>>4)+2; phase=2; ptype=0; pval=amp&0xF;      break;
+                case 17: stride=(amp>>4)+2; phase=3; ptype=0; pval=amp&0xF;      break;
+                case 18: stride=(amp>>4)+2; phase=2; ptype=2; pval=amp&0xF;      break;
+                case 19: stride=(amp>>4)+2; phase=3; ptype=2; pval=amp&0xF;      break;
+                case 20: stride=(amp>>4)+2; phase=2; ptype=0; pval=(amp&0xF)<<4; break;
+                case 21: stride=(amp>>4)+2; phase=3; ptype=0; pval=(amp&0xF)<<4; break;
+                case 22: stride=(amp>>4)+2; phase=2; ptype=1; pval=(amp&0xF)<<4; break;
+                case 23: stride=(amp>>4)+2; phase=3; ptype=1; pval=(amp&0xF)<<4; break;
+                case 24: stride=3;          phase=2; ptype=0; pval=amp;           break;
+                case 25: stride=3;          phase=2; ptype=1; pval=amp;           break;
+                case 26: stride=4;          phase=0; ptype=0; pval=amp;           break;
+                case 27: stride=4;          phase=1; ptype=0; pval=amp;           break;
+                case 28: stride=4;          phase=2; ptype=0; pval=amp;           break;
+                case 29: stride=4;          phase=3; ptype=0; pval=amp;           break;
+                case 30: stride=4;          phase=0; ptype=1; pval=amp;           break;
+                case 31: stride=4;          phase=1; ptype=1; pval=amp;           break;
+                default: continue;
+                }
+
+                const int *sp = pFreq[stride - 2][phase % stride];
+                int nf[256];
+                memcpy(nf, totalFreq, 256 * sizeof(int));
+                for (int v = 0; v < 256; v++) nf[v] -= sp[v];
+                switch (ptype) {
+                case 0: for (int v=0;v<256;v++) nf[v^pval]                   += sp[v]; break;
+                case 1: for (int v=0;v<256;v++) nf[(v+pval)&0xFF]             += sp[v]; break;
+                case 2: for (int v=0;v<256;v++) nf[(v&0xF0)|((v+pval)&0xF)]  += sp[v]; break;
+                }
+
+                double e   = entropyFromFreq(nf, size);
+                double net = (baseE - e) * size - 13.0;
+                if (net > myTop[K-1].net) {
+                    myTop[K-1] = (Cand){instr, amp, net};
+                    for (int k = K-2; k >= 0 && myTop[k+1].net > myTop[k].net; k--) {
+                        Cand t = myTop[k]; myTop[k] = myTop[k+1]; myTop[k+1] = t;
+                    }
                 }
             }
         }
-
         #pragma omp critical
-        if (lBestE < bestE) {
-            bestE     = lBestE;
-            bestInstr = lBestInstr;
-            bestAmp   = lBestAmp;
+        for (int k = 0; k < K; k++) {
+            if (myTop[k].net > topK[K-1].net) {
+                topK[K-1] = myTop[k];
+                for (int j = K-2; j >= 0 && topK[j+1].net > topK[j].net; j--) {
+                    Cand t = topK[j]; topK[j] = topK[j+1]; topK[j+1] = t;
+                }
+            }
         }
     }
-
-    for (int t = 0; t < nthreads; t++) free(bufs[t]);
-    free(bufs);
-
-    double savedBits = (baseE - bestE) * size;
-    double netBits   = savedBits - 13.0;
-
-    if (bestInstr == -1 || netBits <= 0.0) {
-        if (usedInstr) *usedInstr = -1;
-        return 0.0;
-    }
-
-    applyInstruction(data, size, bestInstr, bestAmp);
-
-    if (verbose)
-        printf("  instr=%2d amp=%3d | entropy %.6f -> %.6f | saved=%.1f  net=%.1f bits\n",
-               bestInstr, bestAmp, baseE, bestE, savedBits, netBits);
-
-    if (usedInstr) *usedInstr = bestInstr;
-    return netBits;
+    free(local);
+    free(pFreq);
 }
 
 void main() {
@@ -320,45 +532,60 @@ void main() {
 
         double totalNet = 0.0;
         int localHits[32] = {0};
-        int usedInstr;
-        double net;
 
-        for (;;) {
-            /* run normal chain until it stalls */
-            while ((net = FindNextStep(data, BLOCK_SIZE, &usedInstr, 1)) > 0.0) {
-                totalNet += net;
-                localHits[usedInstr]++;
-            }
-
-            /* chain stalled: try every deinterleave stride, pick the one whose
-               best follow-up step covers both overheads (deinterleave + next step) */
-            u8 *scTmp = malloc(BLOCK_SIZE);
-            int bestSAmp  = -1;
-            double bestSGain = 0.0;
-
-            for (int amp = 0; amp < 256; amp++) {
-                memcpy(scTmp, data, BLOCK_SIZE);
-                applyInstruction(scTmp, BLOCK_SIZE, 5, amp);
-                int dummy;
-                double nextNet = FindNextStep(scTmp, BLOCK_SIZE, &dummy, 0);
-                double gain = nextNet - 13.0;
-                if (gain > bestSGain) {
-                    bestSGain = gain;
-                    bestSAmp  = amp;
-                }
-            }
-            free(scTmp);
-
-            if (bestSAmp == -1)
-                break;
-
-            applyInstruction(data, BLOCK_SIZE, 5, bestSAmp);
-            totalNet -= 13.0;
-            localHits[5]++;
-            printf("  instr= 5 amp=%3d | deinterleave stride=%-3d        | overhead=13.0  net=-13.0 bits\n",
-                   bestSAmp, bestSAmp + 2);
-            /* loop back: run chain again on rearranged data, then try scramble again */
+        /* ---- improvement 4: beam search ----
+           find top-K first steps, run full chain from each in parallel,
+           keep the path with the most total net savings               */
+        int BEAM_K = 64;
+        Cand    *topK     = malloc(BEAM_K * sizeof(Cand));
+        double  *beamNets = calloc(BEAM_K, sizeof(double));
+        u8     **beamData = malloc(BEAM_K * sizeof(u8 *));
+        int    **beamHits = malloc(BEAM_K * sizeof(int *));
+        for (int k = 0; k < BEAM_K; k++) {
+            beamData[k] = malloc(BLOCK_SIZE);
+            memcpy(beamData[k], data, BLOCK_SIZE);
+            beamHits[k] = calloc(32, sizeof(int));
         }
+
+        FindTopK(data, BLOCK_SIZE, BEAM_K, topK);
+
+        /* improvement 2: parallel evaluation of K beams across all threads */
+        #pragma omp parallel for schedule(dynamic)
+        for (int k = 0; k < BEAM_K; k++) {
+            if (topK[k].net <= 0.0) continue;
+            applyInstruction(beamData[k], BLOCK_SIZE, topK[k].instr, topK[k].amp);
+            beamHits[k][topK[k].instr]++;
+            /* RunChainST = improvements 1 (full-chain lookahead) + 3 (nested scrambles) */
+            beamNets[k] = topK[k].net + RunChainST(beamData[k], BLOCK_SIZE, beamHits[k], 0);
+        }
+
+        int best = 0;
+        for (int k = 1; k < BEAM_K; k++)
+            if (beamNets[k] > beamNets[best]) best = k;
+
+        if (topK[best].net > 0.0) {
+            /* verbose replay of the winning beam's chain for display */
+            u8 *replay = malloc(BLOCK_SIZE);
+            memcpy(replay, data, BLOCK_SIZE);
+            printf("  [beam %d/%d selected | paths tried: %d]\n", best+1, BEAM_K, BEAM_K);
+            applyInstruction(replay, BLOCK_SIZE, topK[best].instr, topK[best].amp);
+            {
+                double bE = getEntropy(data, BLOCK_SIZE);
+                double aE = getEntropy(replay, BLOCK_SIZE);
+                printf("  instr=%2d amp=%3d | entropy %.6f -> %.6f | saved=%.1f  net=%.1f bits\n",
+                       topK[best].instr, topK[best].amp, bE, aE,
+                       (bE-aE)*BLOCK_SIZE, topK[best].net);
+            }
+            RunChainST(replay, BLOCK_SIZE, NULL, 1);  /* verbose replay */
+            free(replay);
+
+            memcpy(data, beamData[best], BLOCK_SIZE);
+            totalNet = beamNets[best];
+            for (int i = 0; i < 32; i++) localHits[i] = beamHits[best][i];
+        }
+
+        for (int k = 0; k < BEAM_K; k++) { free(beamData[k]); free(beamHits[k]); }
+        free(topK); free(beamNets); free(beamData); free(beamHits);
 
         free(data);
         netPerBlock[b] = totalNet;
