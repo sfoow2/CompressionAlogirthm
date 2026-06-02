@@ -238,27 +238,47 @@ void applyInstruction(u8 *data, int size, int instr, int amp) {
 }
 
 double FindNextStep(u8 *data, int size, int *usedInstr, int verbose) {
-    u8 *data2 = malloc(size);
-    double baseE    = getEntropy(data, size);
-    double bestE    = baseE;
-    int bestInstr   = -1;
-    int bestAmp     = -1;
+    double baseE  = getEntropy(data, size);
+    double bestE  = baseE;
+    int bestInstr = -1, bestAmp = -1;
 
-    for (int instr = 0; instr < 32; instr++) {
-        if (instr == 5) continue;  /* deinterleave never wins on entropy alone; handled via lookahead */
-        for (int amp = 0; amp < 256; amp++) {
-            memcpy(data2, data, size);
-            applyInstruction(data2, size, instr, amp);
-            double e = getEntropy(data2, size);
-            if (e < bestE) {
-                bestE     = e;
-                bestInstr = instr;
-                bestAmp   = amp;
+    int nthreads = omp_get_max_threads();
+    u8 **bufs = malloc(nthreads * sizeof(u8 *));
+    for (int t = 0; t < nthreads; t++) bufs[t] = malloc(size);
+
+    #pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        u8 *buf = bufs[tid];
+        double lBestE    = baseE;
+        int    lBestInstr = -1;
+        int    lBestAmp   = -1;
+
+        #pragma omp for schedule(dynamic)
+        for (int instr = 0; instr < 32; instr++) {
+            if (instr == 5) continue;
+            for (int amp = 0; amp < 256; amp++) {
+                memcpy(buf, data, size);
+                applyInstruction(buf, size, instr, amp);
+                double e = getEntropy(buf, size);
+                if (e < lBestE) {
+                    lBestE     = e;
+                    lBestInstr = instr;
+                    lBestAmp   = amp;
+                }
             }
+        }
+
+        #pragma omp critical
+        if (lBestE < bestE) {
+            bestE     = lBestE;
+            bestInstr = lBestInstr;
+            bestAmp   = lBestAmp;
         }
     }
 
-    free(data2);
+    for (int t = 0; t < nthreads; t++) free(bufs[t]);
+    free(bufs);
 
     double savedBits = (baseE - bestE) * size;
     double netBits   = savedBits - 13.0;
@@ -288,7 +308,6 @@ void main() {
     printf("Running %d blocks on %d thread(s)...\n",
            NUM_BLOCKS, omp_get_max_threads());
 
-    #pragma omp parallel for schedule(dynamic)
     for (int b = 0; b < NUM_BLOCKS; b++) {
         u8 *data = malloc(BLOCK_SIZE);
         uint32_t rng = (uint32_t)(b + 1);
@@ -336,8 +355,8 @@ void main() {
             applyInstruction(data, BLOCK_SIZE, 5, bestSAmp);
             totalNet -= 13.0;
             localHits[5]++;
-            printf("  scramble: stride=%d | unlocks %.1f bits net\n",
-                   bestSAmp + 2, bestSGain);
+            printf("  instr= 5 amp=%3d | deinterleave stride=%-3d        | overhead=13.0  net=-13.0 bits\n",
+                   bestSAmp, bestSAmp + 2);
             /* loop back: run chain again on rearranged data, then try scramble again */
         }
 
