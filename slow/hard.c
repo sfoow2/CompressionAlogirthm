@@ -61,11 +61,11 @@ overhead per step = 13 bits (5-bit instr ID + 8-bit amp)
 13: ADD amp, stride 3, phase 1
 25: ADD amp, stride 3, phase 2
 
---- BIT ROTATION, packed stride, phases 0-3 (amp: high nibble=stride-2, low 3 bits=rotation 1-7) ---
-26: ROL (amp&7) bits, packed stride, phase 0   [reverse: ROL(8-(amp&7)) bits same phase]
-27: ROL (amp&7) bits, packed stride, phase 1
-28: ROL (amp&7) bits, packed stride, phase 2
-29: ROL (amp&7) bits, packed stride, phase 3
+--- DELTA SUB, fixed stride per slot (amp=0 only; byte[i] -= byte[i-stride], right-to-left) ---
+26: delta stride=1  (all bytes)          [reverse: left-to-right add same stride]
+27: delta stride=2  (even/odd channels independently)
+28: delta stride=3
+29: delta stride=4  (RGBA / 4-byte interleaved)
 
 --- HIGH PRECISION STRIDE 4, phases 0-1 (full 8-bit amp) ---
 30: ADD amp, stride 4, phase 0   reverse: amp = (256-amp)&0xFF
@@ -218,14 +218,10 @@ void applyInstruction(u8 *data, int size, int instr, int amp) {
     case 25:
         for (i = 2; i < size; i += 3) data[i] += (u8)amp;
         break;
-    case 26: { int strd=(amp>>4)+2, rot=amp&7; if (!rot) break;
-               for (i=0; i<size; i+=strd) data[i]=(u8)((data[i]<<rot)|(data[i]>>(8-rot))); break; }
-    case 27: { int strd=(amp>>4)+2, rot=amp&7; if (!rot) break;
-               for (i=1; i<size; i+=strd) data[i]=(u8)((data[i]<<rot)|(data[i]>>(8-rot))); break; }
-    case 28: { int strd=(amp>>4)+2, rot=amp&7; if (!rot) break;
-               for (i=2; i<size; i+=strd) data[i]=(u8)((data[i]<<rot)|(data[i]>>(8-rot))); break; }
-    case 29: { int strd=(amp>>4)+2, rot=amp&7; if (!rot) break;
-               for (i=3; i<size; i+=strd) data[i]=(u8)((data[i]<<rot)|(data[i]>>(8-rot))); break; }
+    case 26: for (i=size-1; i>=1; i--) data[i]-=data[i-1]; break; /* delta stride=1 */
+    case 27: for (i=size-1; i>=2; i--) data[i]-=data[i-2]; break; /* delta stride=2 */
+    case 28: for (i=size-1; i>=3; i--) data[i]-=data[i-3]; break; /* delta stride=3 */
+    case 29: for (i=size-1; i>=4; i--) data[i]-=data[i-4]; break; /* delta stride=4 */
     case 30:
         for (i = 0; i < size; i += 4) data[i] += (u8)amp;
         break;
@@ -268,10 +264,10 @@ static int imap(int instr, int amp, IMap *m) {
     case 23: m->stride=(amp>>4)+2; m->phase=3; m->ptype=1; m->pval=(amp&0xF)<<4; break;
     case 24: m->stride=3;          m->phase=2; m->ptype=0; m->pval=amp;           break;
     case 25: m->stride=3;          m->phase=2; m->ptype=1; m->pval=amp;           break;
-    case 26: if (!(amp&7)) return 0; m->stride=(amp>>4)+2; m->phase=0; m->ptype=3; m->pval=amp&7; break;
-    case 27: if (!(amp&7)) return 0; m->stride=(amp>>4)+2; m->phase=1; m->ptype=3; m->pval=amp&7; break;
-    case 28: if (!(amp&7)) return 0; m->stride=(amp>>4)+2; m->phase=2; m->ptype=3; m->pval=amp&7; break;
-    case 29: if (!(amp&7)) return 0; m->stride=(amp>>4)+2; m->phase=3; m->ptype=3; m->pval=amp&7; break;
+    case 26: if (amp!=0) return 0; m->stride=1; m->phase=0; m->ptype=4; m->pval=1; break;
+    case 27: if (amp!=0) return 0; m->stride=2; m->phase=0; m->ptype=4; m->pval=2; break;
+    case 28: if (amp!=0) return 0; m->stride=3; m->phase=0; m->ptype=4; m->pval=3; break;
+    case 29: if (amp!=0) return 0; m->stride=4; m->phase=0; m->ptype=4; m->pval=4; break;
     case 30: m->stride=4;          m->phase=0; m->ptype=1; m->pval=amp;           break;
     case 31: m->stride=4;          m->phase=1; m->ptype=1; m->pval=amp;           break;
     default: return 0;
@@ -320,6 +316,15 @@ static double FindNextStepST(u8 *data, int size, int *usedInstr, int verbose) {
         }
     }
 
+    /* bigram tables for delta: bf[stride*(stride-1)/2 + phase][prev][cur]
+       strides 1-4 → 1+2+3+4=10 phase-buckets total */
+    int (*bf)[256][256] = calloc(10, sizeof(int[256][256]));
+    for (int s = 1; s <= 4; s++) {
+        int base = s*(s-1)/2;
+        for (int i = s; i < size; i++)
+            bf[base + i%s][data[i-s]][data[i]]++;
+    }
+
     double baseE = entropyFromFreq(totalFreq, size);
     double bestE = baseE;
     int bestInstr = -1, bestAmp = -1;
@@ -355,13 +360,26 @@ static double FindNextStepST(u8 *data, int size, int *usedInstr, int verbose) {
             case 23: stride=(amp>>4)+2; phase=3; ptype=1; pval=(amp&0xF)<<4; break;
             case 24: stride=3;          phase=2; ptype=0; pval=amp;           break;
             case 25: stride=3;          phase=2; ptype=1; pval=amp;           break;
-            case 26: if (!(amp&7)) continue; stride=(amp>>4)+2; phase=0; ptype=3; pval=amp&7; break;
-            case 27: if (!(amp&7)) continue; stride=(amp>>4)+2; phase=1; ptype=3; pval=amp&7; break;
-            case 28: if (!(amp&7)) continue; stride=(amp>>4)+2; phase=2; ptype=3; pval=amp&7; break;
-            case 29: if (!(amp&7)) continue; stride=(amp>>4)+2; phase=3; ptype=3; pval=amp&7; break;
+            case 26: if (amp!=0) continue; stride=1; phase=0; ptype=4; pval=1; break;
+            case 27: if (amp!=0) continue; stride=2; phase=0; ptype=4; pval=2; break;
+            case 28: if (amp!=0) continue; stride=3; phase=0; ptype=4; pval=3; break;
+            case 29: if (amp!=0) continue; stride=4; phase=0; ptype=4; pval=4; break;
             case 30: stride=4;          phase=0; ptype=1; pval=amp;           break;
             case 31: stride=4;          phase=1; ptype=1; pval=amp;           break;
             default: continue;
+            }
+
+            /* delta instructions: use bigram tables, skip normal freq-table path */
+            if (ptype == 4) {
+                int ds = pval, base = ds*(ds-1)/2;
+                int nf_d[256] = {0};
+                for (int P = 0; P < ds; P++)
+                    for (int prev=0; prev<256; prev++)
+                        for (int cur=0; cur<256; cur++)
+                            nf_d[(cur-prev)&0xFF] += bf[base+P][prev][cur];
+                double e = entropyFromFreq(nf_d, size);
+                if (e < bestE) { bestE = e; bestInstr = instr; bestAmp = amp; }
+                continue;
             }
 
             /* phase % stride: handles phase>=stride for packed instrs with
@@ -374,10 +392,9 @@ static double FindNextStepST(u8 *data, int size, int *usedInstr, int verbose) {
             memcpy(nf, totalFreq, 256 * sizeof(int));
             for (int v = 0; v < 256; v++) nf[v] -= sp[v];
             switch (ptype) {
-            case 0: for (int v=0;v<256;v++) nf[v^pval]                         += sp[v]; break;
-            case 1: for (int v=0;v<256;v++) nf[(v+pval)&0xFF]                  += sp[v]; break;
-            case 2: for (int v=0;v<256;v++) nf[(v&0xF0)|((v+pval)&0xF)]        += sp[v]; break;
-            case 3: for (int v=0;v<256;v++) nf[((v<<pval)|(v>>(8-pval)))&0xFF] += sp[v]; break;
+            case 0: for (int v=0;v<256;v++) nf[v^pval]                  += sp[v]; break;
+            case 1: for (int v=0;v<256;v++) nf[(v+pval)&0xFF]           += sp[v]; break;
+            case 2: for (int v=0;v<256;v++) nf[(v&0xF0)|((v+pval)&0xF)] += sp[v]; break;
             }
 
             double e = entropyFromFreq(nf, size);
@@ -386,6 +403,7 @@ static double FindNextStepST(u8 *data, int size, int *usedInstr, int verbose) {
     }
 
     free(pFreq);
+    free(bf);
 
     double saved = (baseE - bestE) * size, net = saved - 13.0;
     if (bestInstr < 0 || net <= 0.0) {
@@ -462,9 +480,10 @@ static void FindTopK2(u8 *data, int size, int K, Cand2 *topK) {
     {
         int tid = omp_get_thread_num();
         Cand2 *myTop = &local[tid * K];
-        u8 *dc = malloc(size);                       /* per-thread data copy */
-        int (*pf)[17][256] = malloc(16*sizeof(*pf)); /* freq tables after step1 */
-        int tf[256];                                 /* totalFreq after step1 */
+        u8 *dc = malloc(size);                        /* per-thread data copy */
+        int (*pf)[17][256] = malloc(16*sizeof(*pf));  /* freq tables after step1 */
+        int tf[256];                                  /* totalFreq after step1 */
+        int (*bf)[256][256] = malloc(10*sizeof(*bf)); /* bigram tables for delta */
 
         #pragma omp for schedule(dynamic)
         for (int instr1 = 0; instr1 < 32; instr1++) {
@@ -486,21 +505,43 @@ static void FindTopK2(u8 *data, int size, int K, Cand2 *topK) {
                         }
                     }
                 }
+                memset(bf, 0, 10*sizeof(*bf));
+                for (int s = 1; s <= 4; s++) {
+                    int bbase = s*(s-1)/2;
+                    for (int i = s; i < size; i++)
+                        bf[bbase + i%s][dc[i-s]][dc[i]]++;
+                }
 
                 for (int instr2 = 0; instr2 < 32; instr2++) {
                     if (instr2 == 5) continue;
                     for (int amp2 = 0; amp2 < 256; amp2++) {
                         IMap m2; if (!imap(instr2, amp2, &m2)) continue;
+                        if (m2.ptype == 4) {
+                            int ds = m2.pval, bbase = ds*(ds-1)/2;
+                            int nf_d[256] = {0};
+                            for (int P = 0; P < ds; P++)
+                                for (int prev=0;prev<256;prev++)
+                                    for (int cur=0;cur<256;cur++)
+                                        nf_d[(cur-prev)&0xFF] += bf[bbase+P][prev][cur];
+                            double e2 = entropyFromFreq(nf_d, size);
+                            double net = (baseE - e2) * size - 26.0;
+                            if (net > myTop[K-1].net) {
+                                myTop[K-1] = (Cand2){instr1, amp1, instr2, amp2, net};
+                                for (int k = K-2; k >= 0 && myTop[k+1].net > myTop[k].net; k--) {
+                                    Cand2 t = myTop[k]; myTop[k] = myTop[k+1]; myTop[k+1] = t;
+                                }
+                            }
+                            continue;
+                        }
                         const int *sp2 = pf[m2.stride-2][m2.phase % m2.stride];
 
                         int nf2[256];
                         memcpy(nf2, tf, 256*sizeof(int));
                         for (int v = 0; v < 256; v++) nf2[v] -= sp2[v];
                         switch (m2.ptype) {
-                        case 0: for (int v=0;v<256;v++) nf2[v^m2.pval]                              += sp2[v]; break;
-                        case 1: for (int v=0;v<256;v++) nf2[(v+m2.pval)&0xFF]                       += sp2[v]; break;
-                        case 2: for (int v=0;v<256;v++) nf2[(v&0xF0)|((v+m2.pval)&0xF)]             += sp2[v]; break;
-                        case 3: for (int v=0;v<256;v++) nf2[((v<<m2.pval)|(v>>(8-m2.pval)))&0xFF]   += sp2[v]; break;
+                        case 0: for (int v=0;v<256;v++) nf2[v^m2.pval]                  += sp2[v]; break;
+                        case 1: for (int v=0;v<256;v++) nf2[(v+m2.pval)&0xFF]           += sp2[v]; break;
+                        case 2: for (int v=0;v<256;v++) nf2[(v&0xF0)|((v+m2.pval)&0xF)] += sp2[v]; break;
                         }
 
                         double e2  = entropyFromFreq(nf2, size);
@@ -518,6 +559,7 @@ static void FindTopK2(u8 *data, int size, int K, Cand2 *topK) {
 
         free(dc);
         free(pf);
+        free(bf);
 
         #pragma omp critical
         for (int k = 0; k < K; k++) {
