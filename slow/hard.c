@@ -3,7 +3,7 @@
 #include <math.h>
 #include <stdint.h>
 #include <string.h>
-#include <omp.h>
+// #include <omp.h>
 
 typedef uint8_t u8;
 
@@ -83,7 +83,6 @@ static double h_table[8193];
 
 /* Thread-local amplitude array for stride-sweep instructions (250-281). */
 static int g_sweep_amps[18];
-//#pragma omp threadprivate(g_sweep_amps)
 
 /* Adaptive instruction overhead: reduce cost for "hot" instructions.
    Hot instruction set identified from profiling: 4-bit overhead (vs 13-15).
