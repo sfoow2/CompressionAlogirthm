@@ -176,12 +176,8 @@ void applyInstruction(u8 *data, int size, int instr, int amp) {
         free(tmp);
         break;
     }
-    case 6:
-        for (i = 0; i < size; i += 2) data[i] += (u8)amp;
-        break;
-    case 7:
-        for (i = 1; i < size; i += 2) data[i] += (u8)amp;
-        break;
+    case 6: for (i=size-1; i>=2; i--) data[i]^=(data[i-1]^data[i-2]); break; /* compound xor-delta strides {1,2} */
+    case 7: for (i=size-1; i>=1; i--) data[i]-=data[i-1]; break; /* add-delta stride=1 */
 
     /* --- packed stride, high nibble ADD, phase 0/1 --- */
     case 8:
@@ -232,7 +228,7 @@ void applyInstruction(u8 *data, int size, int instr, int amp) {
         xval   = (u8)(amp & 0x0F);
         for (i = 3; i < size; i += stride) data[i] ^= xval;
         break;
-    case 18: for (i=size-1; i>=2; i--) data[i]^=data[i-2]; break; /* xor-delta stride=2 */
+    case 18: for (i=size-1; i>=5; i--) data[i]-=data[i-5]; break; /* add-delta stride=5 */
     case 19: for (i=size-1; i>=1; i--) data[i]^=data[i-1]; break; /* xor-delta stride=1 */
 
     /* --- packed stride, high nibble XOR/ADD, phases 2/3 --- */
@@ -257,9 +253,9 @@ void applyInstruction(u8 *data, int size, int instr, int amp) {
         for (i = 2; i < size; i += 3) data[i] += (u8)amp;
         break;
     case 26: for (i=size-1; i>=8; i--) data[i]^=data[i-8]; break; /* xor-delta stride=8 */
-    case 27: for (i=size-1; i>=8; i--) data[i]^=(data[i-4]^data[i-8]); break; /* compound xor-delta 4+8 */
-    case 28: for (i=size-1; i>=3; i--) data[i]-=data[i-3]; break; /* delta stride=3 */
-    case 29: for (i=size-1; i>=4; i--) data[i]-=data[i-4]; break; /* delta stride=4 */
+    case 27: for (i=size-1; i>=8; i--) data[i]-=data[i-8]; break; /* add-delta stride=8 */
+    case 28: for (i=size-1; i>=7; i--) data[i]-=data[i-7]; break; /* add-delta stride=7 */
+    case 29: for (i=size-1; i>=4; i--) data[i]-=data[i-4]; break; /* add-delta stride=4 */
     case 30:
         for (i = 0; i < size; i += 4) data[i] += (u8)amp;
         break;
@@ -291,8 +287,8 @@ static int imap(int instr, int amp, IMap *m) {
     case  2: m->stride=(amp>>4)+2; m->phase=0; m->ptype=2; m->pval=amp&0xF;      break;
     case  3: m->stride=(amp>>4)+2; m->phase=1; m->ptype=2; m->pval=amp&0xF;      break;
     case  4: m->stride=2;          m->phase=0; m->ptype=0; m->pval=amp;           break;
-    case  6: m->stride=2;          m->phase=0; m->ptype=1; m->pval=amp;           break;
-    case  7: m->stride=2;          m->phase=1; m->ptype=1; m->pval=amp;           break;
+    case  6: if (amp!=0) return 0; m->stride=2; m->phase=0; m->ptype=6; m->pval=1; break; /* compound xor-delta {1,2} */
+    case  7: if (amp!=0) return 0; m->stride=1; m->phase=0; m->ptype=4; m->pval=1; break; /* add-delta stride=1 */
     case  8: m->stride=(amp>>4)+2; m->phase=0; m->ptype=1; m->pval=(amp&0xF)<<4; break;
     case  9: m->stride=(amp>>4)+2; m->phase=1; m->ptype=1; m->pval=(amp&0xF)<<4; break;
     case 10: m->stride=3;          m->phase=0; m->ptype=0; m->pval=amp;           break;
@@ -303,7 +299,7 @@ static int imap(int instr, int amp, IMap *m) {
     case 15: m->stride=(amp>>4)+2; m->phase=1; m->ptype=0; m->pval=(amp&0xF)<<4; break;
     case 16: m->stride=(amp>>4)+2; m->phase=2; m->ptype=0; m->pval=amp&0xF;      break;
     case 17: m->stride=(amp>>4)+2; m->phase=3; m->ptype=0; m->pval=amp&0xF;      break;
-    case 18: if (amp!=0) return 0; m->stride=2; m->phase=0; m->ptype=5; m->pval=2; break; /* xor-delta stride=2 */
+    case 18: if (amp!=0) return 0; m->stride=5; m->phase=0; m->ptype=4; m->pval=5; break; /* add-delta stride=5 */
     case 19: if (amp!=0) return 0; m->stride=1; m->phase=0; m->ptype=5; m->pval=1; break; /* xor-delta stride=1 */
     case 20: m->stride=(amp>>4)+2; m->phase=2; m->ptype=0; m->pval=(amp&0xF)<<4; break;
     case 21: m->stride=(amp>>4)+2; m->phase=3; m->ptype=0; m->pval=(amp&0xF)<<4; break;
@@ -312,8 +308,8 @@ static int imap(int instr, int amp, IMap *m) {
     case 24: m->stride=3;          m->phase=2; m->ptype=0; m->pval=amp;           break;
     case 25: m->stride=3;          m->phase=2; m->ptype=1; m->pval=amp;           break;
     case 26: if (amp!=0) return 0; m->stride=8; m->phase=0; m->ptype=5; m->pval=8; break; /* xor-delta stride=8 */
-    case 27: if (amp!=0) return 0; m->stride=8; m->phase=0; m->ptype=6; m->pval=0; break; /* compound xor-delta */
-    case 28: if (amp!=0) return 0; m->stride=3; m->phase=0; m->ptype=4; m->pval=3; break;
+    case 27: if (amp!=0) return 0; m->stride=8; m->phase=0; m->ptype=4; m->pval=8; break; /* add-delta stride=8 */
+    case 28: if (amp!=0) return 0; m->stride=7; m->phase=0; m->ptype=4; m->pval=7; break; /* add-delta stride=7 */
     case 29: if (amp!=0) return 0; m->stride=4; m->phase=0; m->ptype=4; m->pval=4; break;
     case 30: m->stride=4;          m->phase=0; m->ptype=1; m->pval=amp;           break;
     case 31: m->stride=4;          m->phase=1; m->ptype=1; m->pval=amp;           break;
@@ -327,7 +323,7 @@ static double instrOverhead(int instr) {
     if (instr >= 220 && instr <= 222) return 5.0;
 
     /* Other no-amp instructions (delta, xor-delta strides 1-4, 8): 5-bit overhead */
-    if ((instr >= 18 && instr <= 19) || (instr >= 22 && instr <= 23) ||
+    if (instr == 6 || instr == 7 || (instr >= 18 && instr <= 19) || (instr >= 22 && instr <= 23) ||
         instr == 26 || instr == 27 || (instr >= 28 && instr <= 29)) return 5.0;
 
     /* Check tiered hot instruction overheads */
@@ -377,21 +373,23 @@ static double FindNextStepST(u8 *data, int size, int *usedInstr, int *usedAmp, i
     /* Pass 0: build totalFreq + delta tables — all tiny (≤9×256 ints), stay in L1.
        Separated from pFreq build so neither scan pollutes the other's cache. */
     int dx[9][256] = {{0}};        /* xor-delta strides 1..8  */
-    int da[5][256] = {{0}};        /* add-delta strides 2..4  */
+    int da[9][256] = {{0}};        /* add-delta strides 1..8  */
     int compound_freq[256] = {0};
+    int compound2_freq[256] = {0}; /* data[i]^data[i-1]^data[i-2] */
     {
         u8 w0=0,w1=0,w2=0,w3=0,w4=0,w5=0,w6=0,w7=0;
         for (int i = 0; i < size; i++) {
             u8 b = data[i];
             totalFreq[b]++;
-            if (i>=1) dx[1][w0^b]++;
+            if (i>=1) { dx[1][w0^b]++; da[1][(b-w0)&0xFF]++; }
             if (i>=2) { dx[2][w1^b]++; da[2][(b-w1)&0xFF]++; }
             if (i>=3) { dx[3][w2^b]++; da[3][(b-w2)&0xFF]++; }
             if (i>=4) { dx[4][w3^b]++; da[4][(b-w3)&0xFF]++; }
-            if (i>=5) dx[5][w4^b]++;
-            if (i>=6) dx[6][w5^b]++;
-            if (i>=7) dx[7][w6^b]++;
-            if (i>=8) { dx[8][w7^b]++; compound_freq[b^w3^w7]++; }
+            if (i>=5) { dx[5][w4^b]++; da[5][(b-w4)&0xFF]++; }
+            if (i>=6) { dx[6][w5^b]++; da[6][(b-w5)&0xFF]++; }
+            if (i>=7) { dx[7][w6^b]++; da[7][(b-w6)&0xFF]++; }
+            if (i>=2) compound2_freq[b^w0^w1]++;
+            if (i>=8) { dx[8][w7^b]++; da[8][(b-w7)&0xFF]++; compound_freq[b^w3^w7]++; }
             w7=w6; w6=w5; w5=w4; w4=w3; w3=w2; w2=w1; w1=w0; w0=b;
         }
     }
@@ -421,18 +419,25 @@ static double FindNextStepST(u8 *data, int size, int *usedInstr, int *usedAmp, i
        Each is normalized by its own pair count (size-k) to avoid a phantom
        profit from wrong normalization. */
     double delta_e[2][9]; /* [0=ADD,1=XOR][stride 0..8] */
+    delta_e[0][1]=entropyFromFreq(da[1],size-1);
     delta_e[1][1]=entropyFromFreq(dx[1],size-1);
     for (int ds=2; ds<=4; ds++) {
         delta_e[0][ds]=entropyFromFreq(da[ds],size-ds);
         delta_e[1][ds]=entropyFromFreq(dx[ds],size-ds);
     }
-    for (int ds=5; ds<=8; ds++) delta_e[1][ds]=entropyFromFreq(dx[ds],size-ds);
-    double compound_e = entropyFromFreq(compound_freq, size-8);
+    for (int ds=5; ds<=7; ds++) {
+        delta_e[0][ds]=entropyFromFreq(da[ds],size-ds);
+        delta_e[1][ds]=entropyFromFreq(dx[ds],size-ds);
+    }
+    delta_e[0][8]=entropyFromFreq(da[8],size-8);
+    delta_e[1][8]=entropyFromFreq(dx[8],size-8);
+    double compound_e  = entropyFromFreq(compound_freq,  size-8);
+    double compound2_e = entropyFromFreq(compound2_freq, size-2);
 
     for (int instr = 0; instr < 32; instr++) {
         if (instr == 5) continue;
         /* Skip rarely-used instructions */
-        if (instr == 13 || instr == 23 || instr == 24 || instr == 30) continue;
+        if (instr == 11 || instr == 12 || instr == 13 || instr == 23 || instr == 24 || instr == 29 || instr == 30 || instr == 31) continue;
         double oh = instrOverhead(instr);  /* hoist: constant for all amps */
         for (int amp = 0; amp < 256; amp++) {
             /* map (instr, amp) → stride, phase, permutation type + value */
@@ -443,8 +448,8 @@ static double FindNextStepST(u8 *data, int size, int *usedInstr, int *usedAmp, i
             case  2: stride=(amp>>4)+2; phase=0; ptype=2; pval=amp&0xF;      break;
             case  3: stride=(amp>>4)+2; phase=1; ptype=2; pval=amp&0xF;      break;
             case  4: stride=2;          phase=0; ptype=0; pval=amp;           break;
-            case  6: stride=2;          phase=0; ptype=1; pval=amp;           break;
-            case  7: stride=2;          phase=1; ptype=1; pval=amp;           break;
+            case  6: if (amp!=0) continue; stride=2; phase=0; ptype=6; pval=1; break;
+            case  7: if (amp!=0) continue; stride=1; phase=0; ptype=4; pval=1; break;
             case  8: stride=(amp>>4)+2; phase=0; ptype=1; pval=(amp&0xF)<<4; break;
             case  9: stride=(amp>>4)+2; phase=1; ptype=1; pval=(amp&0xF)<<4; break;
             case 10: stride=3;          phase=0; ptype=0; pval=amp;           break;
@@ -455,7 +460,7 @@ static double FindNextStepST(u8 *data, int size, int *usedInstr, int *usedAmp, i
             case 15: stride=(amp>>4)+2; phase=1; ptype=0; pval=(amp&0xF)<<4; break;
             case 16: stride=(amp>>4)+2; phase=2; ptype=0; pval=amp&0xF;      break;
             case 17: stride=(amp>>4)+2; phase=3; ptype=0; pval=amp&0xF;      break;
-            case 18: if (amp!=0) continue; stride=2; phase=0; ptype=5; pval=2; break;
+            case 18: if (amp!=0) continue; stride=5; phase=0; ptype=4; pval=5; break;
             case 19: if (amp!=0) continue; stride=1; phase=0; ptype=5; pval=1; break;
             case 20: stride=(amp>>4)+2; phase=2; ptype=0; pval=(amp&0xF)<<4; break;
             case 21: stride=(amp>>4)+2; phase=3; ptype=0; pval=(amp&0xF)<<4; break;
@@ -464,8 +469,8 @@ static double FindNextStepST(u8 *data, int size, int *usedInstr, int *usedAmp, i
             case 24: stride=3;          phase=2; ptype=0; pval=amp;           break;
             case 25: stride=3;          phase=2; ptype=1; pval=amp;           break;
             case 26: if (amp!=0) continue; stride=8; phase=0; ptype=5; pval=8; break;
-            case 27: if (amp!=0) continue; stride=8; phase=0; ptype=6; pval=0; break;
-            case 28: if (amp!=0) continue; stride=3; phase=0; ptype=4; pval=3; break;
+            case 27: if (amp!=0) continue; stride=8; phase=0; ptype=4; pval=8; break;
+            case 28: if (amp!=0) continue; stride=7; phase=0; ptype=4; pval=7; break;
             case 29: if (amp!=0) continue; stride=4; phase=0; ptype=4; pval=4; break;
             case 30: stride=4;          phase=0; ptype=1; pval=amp;           break;
             case 31: stride=4;          phase=1; ptype=1; pval=amp;           break;
@@ -474,8 +479,9 @@ static double FindNextStepST(u8 *data, int size, int *usedInstr, int *usedAmp, i
 
             /* compound delta (ptype=6): use pre-computed compound_freq entropy */
             if (ptype == 6) {
-                double net = (baseE - compound_e) * size - 5.0;
-                if (net > bestNet) { bestNet=net; bestE=compound_e; bestInstr=instr; bestAmp=amp; }
+                double ce = (pval == 0) ? compound_e : compound2_e;
+                double net = (baseE - ce) * size - 5.0;
+                if (net > bestNet) { bestNet=net; bestE=ce; bestInstr=instr; bestAmp=amp; }
                 continue;
             }
 
@@ -509,8 +515,8 @@ static double FindNextStepST(u8 *data, int size, int *usedInstr, int *usedAmp, i
         }
     }
 
-    /* xor-delta strides 5-7 (instrs 220-222) */
-    for (int ds=5; ds<=7; ds++) {
+    /* xor-delta strides 6-7 (instrs 221-222); stride 5 dropped — never useful */
+    for (int ds=6; ds<=7; ds++) {
         double e = delta_e[1][ds];
         int instr_xd = 220 + (ds - 5);
         double net = (baseE - e)*size - instrOverhead(instr_xd);
@@ -654,7 +660,7 @@ static void InstrSeq_Free(InstrSeq *seq) {
     free(seq);
 }
 
-/* greedy-only chain with instruction 5 lookahead (repeatable) */
+/* greedy-only chain with instruction 5 lookahead (shallow: 3-step chain limit) */
 static double RunGreedyST(u8 *data, int size, int *hits, InstrSeq *seq, int verbose,
                           double *minReduction, double *maxReduction, double *sumReduction) {
     int (*pFreq)[17][256] = calloc(16, sizeof(*pFreq));
@@ -664,32 +670,17 @@ static double RunGreedyST(u8 *data, int size, int *hits, InstrSeq *seq, int verb
     int passes = 0;
     int lastInstr = -1;
 
-    /* Parallel lookahead: use spare cores when blocks don't fill all threads.
-       Each lookahead chain is independent — thread t uses laFreq[t] and laBuf[t]. */
-    int outer_nthreads = omp_get_num_threads();
-    int la_threads = omp_get_max_threads() / outer_nthreads;
-    if (la_threads < 1) la_threads = 1;
-    if (la_threads > 16) la_threads = 16;
-
-    int (*laFreq[16])[17][256];
-    u8  *laBuf[16];
-    for (int t = 0; t < la_threads; t++) {
-        laFreq[t] = calloc(16, sizeof(int[17][256]));
-        laBuf[t]  = malloc(size);
-    }
-
-    u8 *buf = laBuf[0];  /* alias for serial fallback (la_threads==1) */
+    int (*laFreq)[17][256] = calloc(16, sizeof(int[17][256]));
+    u8  *laBuf = malloc(size);
 
     for (;;) {
-        /* Greedy phase */
+        /* greedy until stall */
         while ((net = FindNextStepST(data, size, &instr, &amp, verbose, pFreq)) > 0.0) {
             total += net;
             if (hits) hits[instr]++;
             if (seq) InstrSeq_Add(seq, instr, amp);
             passes++;
             lastInstr = instr;
-
-            /* Track min/max/sum entropy reduction per instruction */
             if (minReduction && maxReduction && sumReduction) {
                 if (net < minReduction[instr]) minReduction[instr] = net;
                 if (net > maxReduction[instr]) maxReduction[instr] = net;
@@ -697,48 +688,39 @@ static double RunGreedyST(u8 *data, int size, int *hits, InstrSeq *seq, int verb
             }
         }
 
-        /* Stalled: try instruction 5 with lookahead (only if last instr wasn't 5) */
         if (lastInstr == 5) break;
 
-        /* Evaluate all 16 amps in parallel when spare threads are available.
-           Removes the serial early-exit: we now always pick the true best amp. */
+        /* shallow lookahead: try 16 deinterleave strides, each chain capped at 3 steps */
         double gains[16] = {0};
-        #pragma omp parallel for num_threads(la_threads) schedule(static,1)
         for (int amp5 = 0; amp5 <= 15; amp5++) {
-            int t = omp_get_thread_num();
-            memcpy(laBuf[t], data, size);
-            applyInstruction(laBuf[t], size, 5, amp5);
-            double cg = 0.0, cn; int di, da2;
-            while ((cn = FindNextStepST(laBuf[t], size, &di, &da2, 0, laFreq[t])) > 0.0) cg += cn;
+            memcpy(laBuf, data, size);
+            applyInstruction(laBuf, size, 5, amp5);
+            double cg = 0.0, cn; int di, da2, steps = 0;
+            while (steps < 3 && (cn = FindNextStepST(laBuf, size, &di, &da2, 0, laFreq)) > 0.0)
+                { cg += cn; steps++; }
             gains[amp5] = cg - 13.0;
         }
 
-        int bestAmp5 = -1;
-        double bestGain5 = 0.0;
-        for (int amp5 = 0; amp5 <= 15; amp5++)
-            if (gains[amp5] > bestGain5) { bestGain5 = gains[amp5]; bestAmp5 = amp5; }
+        int bestAmp5 = -1; double bestGain5 = 0.0;
+        for (int a = 0; a <= 15; a++)
+            if (gains[a] > bestGain5) { bestGain5 = gains[a]; bestAmp5 = a; }
 
-        if (bestAmp5 < 0 || bestGain5 <= 0.0) break;  /* No profitable instruction 5 found */
+        if (bestAmp5 < 0 || bestGain5 <= 0.0) break;
 
-        /* Apply instruction 5 and loop back for more greedy */
         applyInstruction(data, size, 5, bestAmp5);
         if (seq) InstrSeq_Add(seq, 5, bestAmp5);
         if (hits) hits[5]++;
         lastInstr = 5;
-
-        /* Track instruction 5 reduction */
         if (minReduction && maxReduction && sumReduction) {
             if (bestGain5 < minReduction[5]) minReduction[5] = bestGain5;
             if (bestGain5 > maxReduction[5]) maxReduction[5] = bestGain5;
             sumReduction[5] += bestGain5;
         }
-
         if (verbose)
             printf("  Instruction 5 (deinterleave) amp=%d applied, gained %.1f bits\n", bestAmp5, bestGain5);
-        /* next greedy phase: FindNextStepST clears pFreq at entry */
     }
 
-    for (int t = 0; t < la_threads; t++) { free(laFreq[t]); free(laBuf[t]); }
+    free(laFreq); free(laBuf);
     free(pFreq);
     if (verbose && passes > 0)
         printf("  Greedy completed: %d passes\n", passes);
@@ -1201,7 +1183,7 @@ void main() {
 
     int NUM_CORES = get_num_cores();
     omp_set_max_active_levels(2);  /* allow one level of nested parallelism for lookahead */
-    const int NUM_BLOCKS  = 1;
+    const int NUM_BLOCKS  = 100;
     const int BLOCK_SIZE  = 4096;
     const uint32_t SEED   = 42;
     const int NUM_THREADS = (NUM_BLOCKS < NUM_CORES) ? NUM_BLOCKS : NUM_CORES;
