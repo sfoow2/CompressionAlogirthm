@@ -3,7 +3,8 @@
 #include <math.h>
 #include <stdint.h>
 #include <string.h>
-// #include <omp.h>
+#include <time.h>
+#include <omp.h>
 
 typedef uint8_t u8;
 
@@ -1070,22 +1071,31 @@ static uint8_t seeded_random_byte(void) {
     return (uint8_t)(seed_state >> 24);
 }
 
+static int get_num_cores(void) {
+    return omp_get_num_procs();
+}
+
 void main() {
     /* Initialize h_table[x] = x*log2(x) for sweep search */
     h_table[0] = 0.0;
     for (int x = 1; x <= 8192; x++) h_table[x] = (double)x * log2((double)x);
 
+    int NUM_CORES = get_num_cores();
     const int NUM_BLOCKS  = 1;
     const int BLOCK_SIZE  = 1024 * 4;
-    const uint32_t SEED   = 42; /* reproducible seed; change to time(NULL) for varying runs */
+    const uint32_t SEED   = 42;
+    const int NUM_THREADS = (NUM_BLOCKS < NUM_CORES) ? NUM_BLOCKS : NUM_CORES;
 
     double netPerBlock[200] = {0};
     int    instrHits[300]   = {0};
 
     seed_state = SEED;
     printf("Running %d blocks on %d thread(s)... [seed=%u]\n",
-           NUM_BLOCKS, 1, SEED);
+           NUM_BLOCKS, NUM_THREADS, SEED);
 
+    /* Process blocks in parallel — each block independently */
+    clock_t start = clock();
+    #pragma omp parallel for num_threads(NUM_THREADS)
     for (int b = 0; b < NUM_BLOCKS; b++) {
         u8 *data = malloc(BLOCK_SIZE);
         for (int i = 0; i < BLOCK_SIZE; i++) data[i] = seeded_random_byte();
@@ -1121,7 +1131,6 @@ void main() {
             FindTopK3(data, BLOCK_SIZE, BEAM_K, topK2, BEAM_K, topK3);
 
             /* step 3: parallel beam — apply seed (2 or 3 steps) + RunGreedyST */
-            //#pragma omp parallel for schedule(dynamic)
             for (int k = 0; k < BEAM_K; k++) {
                 if (topK3[k].net <= 0.0) continue;
                 applyInstruction(beamData[k], BLOCK_SIZE, topK3[k].instr1, topK3[k].amp1);
@@ -1250,6 +1259,8 @@ void main() {
         for (int i = 0; i < 300; i++)
             instrHits[i] += localHits[i];
     }
+    clock_t end = clock();
+    double elapsed = (double)(end - start) / CLOCKS_PER_SEC;
 
     double minNet = netPerBlock[0], maxNet = netPerBlock[0], sumNet = 0.0;
     for (int b = 0; b < NUM_BLOCKS; b++) {
@@ -1262,6 +1273,7 @@ void main() {
     for (int i = 0; i < 300; i++) totalPasses += instrHits[i];
 
     printf("\n=== %d blocks, %d MB each ===\n", NUM_BLOCKS, BLOCK_SIZE >> 20);
+    printf("Elapsed time: %.2f seconds\n", elapsed);
     printf("Net savings:  min=%.1f  max=%.1f  avg=%.1f bits\n",
            minNet, maxNet, sumNet / NUM_BLOCKS);
     printf("\nInstruction usage (%d total passes):\n", totalPasses);
