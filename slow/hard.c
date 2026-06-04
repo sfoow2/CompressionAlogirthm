@@ -1192,7 +1192,7 @@ void main() {
 
     int NUM_CORES = get_num_cores();
     const int NUM_BLOCKS  = 1;
-    const int BLOCK_SIZE  = 4096;
+    const int BLOCK_SIZE  = 8192;
     const uint32_t SEED   = 42;
     const int NUM_THREADS = (NUM_BLOCKS < NUM_CORES) ? NUM_BLOCKS : NUM_CORES;
 
