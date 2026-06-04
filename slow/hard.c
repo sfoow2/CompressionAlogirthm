@@ -363,17 +363,16 @@ static double entropyFromFreq(const int *freq, int size) {
  * then evaluate each (instr,amp) candidate in O(256) — no memcpy,    *
  * no data scan per candidate. ~1000× faster than the naïve approach.  *
  * ------------------------------------------------------------------ */
-static double FindNextStepST(u8 *data, int size, int *usedInstr, int verbose) {
+static double FindNextStepST(u8 *data, int size, int *usedInstr, int verbose,
+                              int (*pFreq)[17][256], int (*bf)[256][256]) {
     /* --- build per-stride-phase frequency tables (one pass over data) --- */
     /* pFreq[s][ph][v] = count of bytes with value v at positions i where   */
     /* i mod (s+2) == ph. strides 2..17 → s=0..15, max phase index = 16    */
-    int (*pFreq)[17][256] = calloc(16, sizeof(*pFreq));
     int totalFreq[256] = {0};
 
-    /* bigram tables: built in same pass as pFreq using 8-byte sliding window
-       [0]=stride-1, [1..2]=stride-2 ph0-1, [3..5]=stride-3 ph0-2,
-       [6..9]=stride-4 ph0-3, [10]=stride-8 (all phases combined) */
-    int (*bf)[256][256] = calloc(14, sizeof(int[256][256]));
+    /* Clear pre-allocated buffers */
+    memset(pFreq, 0, 16 * 17 * 256 * sizeof(int));
+    memset(bf, 0, 14 * 256 * 256 * sizeof(int));
     int compound_freq[256] = {0}; /* freq of (data[i]^data[i-4]^data[i-8]) */
     {
         int ph[16] = {0};
@@ -541,8 +540,7 @@ static double FindNextStepST(u8 *data, int size, int *usedInstr, int verbose) {
     /* Stride-sweep search removed — profiling showed all loc_amps end up 0 for random data
        (per-phase distributions too uniform for any XOR/ADD to beat single-phase instruction) */
 
-    free(pFreq);
-    free(bf);
+    /* Buffers freed by caller */
 
     if (bestInstr < 0) {
         if (usedInstr) *usedInstr = -1;
@@ -576,12 +574,14 @@ static double FindNextStepST(u8 *data, int size, int *usedInstr, int verbose) {
  * Covers improvements 1 (full-chain lookahead) and 3 (nested scrambles)*
  * ------------------------------------------------------------------ */
 static double RunChainST(u8 *data, int size, int *hits, int verbose) {
+    int (*pFreq)[17][256] = calloc(16, sizeof(*pFreq));
+    int (*bf)[256][256] = calloc(14, sizeof(int[256][256]));
     double total = 0.0;
 
     for (;;) {
         /* greedy passes until stall */
         int instr; double net;
-        while ((net = FindNextStepST(data, size, &instr, verbose)) > 0.0) {
+        while ((net = FindNextStepST(data, size, &instr, verbose, pFreq, bf)) > 0.0) {
             total += net;
             if (hits) hits[instr]++;
         }
@@ -594,7 +594,7 @@ static double RunChainST(u8 *data, int size, int *hits, int verbose) {
             memcpy(buf, data, size);
             applyInstruction(buf, size, 5, amp);
             double cg = 0.0, n; int dummy;
-            while ((n = FindNextStepST(buf, size, &dummy, 0)) > 0.0) cg += n;
+            while ((n = FindNextStepST(buf, size, &dummy, 0, pFreq, bf)) > 0.0) cg += n;
             double gain = cg - 13.0;
             if (gain > bestGain) { bestGain = gain; bestAmp = amp; }
         }
@@ -612,17 +612,31 @@ static double RunChainST(u8 *data, int size, int *hits, int verbose) {
            and will try another scramble if it stalls again (nested) */
     }
 
+    free(pFreq);
+    free(bf);
     return total;
 }
 
 /* greedy-only chain (no scramble) — safe to call from parallel regions */
 static double RunGreedyST(u8 *data, int size, int *hits, int verbose) {
+    int (*pFreq)[17][256] = calloc(16, sizeof(*pFreq));
+    int (*bf)[256][256] = calloc(14, sizeof(int[256][256]));
+
     double total = 0.0, net;
     int instr;
-    while ((net = FindNextStepST(data, size, &instr, verbose)) > 0.0) {
+    int passes = 0;
+    clock_t find_time = 0, apply_time = 0;
+
+    while ((net = FindNextStepST(data, size, &instr, verbose, pFreq, bf)) > 0.0) {
         total += net;
         if (hits) hits[instr]++;
+        passes++;
     }
+
+    free(pFreq);
+    free(bf);
+    if (verbose && passes > 0)
+        printf("  Greedy completed: %d passes\n", passes);
     return total;
 }
 
@@ -1081,7 +1095,7 @@ void main() {
     for (int x = 1; x <= 8192; x++) h_table[x] = (double)x * log2((double)x);
 
     int NUM_CORES = get_num_cores();
-    const int NUM_BLOCKS  = 1;
+    const int NUM_BLOCKS  = 1000;
     const int BLOCK_SIZE  = 1024 * 4;
     const uint32_t SEED   = 42;
     const int NUM_THREADS = (NUM_BLOCKS < NUM_CORES) ? NUM_BLOCKS : NUM_CORES;
@@ -1103,154 +1117,8 @@ void main() {
         double totalNet = 0.0;
         int localHits[300] = {0};
 
-        /* phase loop: each iteration = FindTopK2 → FindTopK3 → beam(3-step) →
-           commit → scramble lookahead → if scramble: loop back with new beam  */
-        int BEAM_K = 128;
-        Cand2   *topK2    = malloc(BEAM_K * sizeof(Cand2));
-        Cand3   *topK3    = malloc(BEAM_K * sizeof(Cand3));
-        double  *beamNets = malloc(BEAM_K * sizeof(double));
-        u8     **beamData = malloc(BEAM_K * sizeof(u8 *));
-        int    **beamHits = malloc(BEAM_K * sizeof(int *));
-        for (int k = 0; k < BEAM_K; k++) {
-            beamData[k] = malloc(BLOCK_SIZE);
-            beamHits[k] = malloc(300 * sizeof(int));
-        }
-
-        for (int phase = 1; ; phase++) {
-            /* reset beam buffers for this phase */
-            for (int k = 0; k < BEAM_K; k++) {
-                beamNets[k] = 0.0;
-                memcpy(beamData[k], data, BLOCK_SIZE);
-                memset(beamHits[k], 0, 300*sizeof(int));
-            }
-
-            /* step 1: top-K 2-step pairs */
-            FindTopK2(data, BLOCK_SIZE, BEAM_K, topK2);
-
-            /* step 2: extend to top-K 3-step seeds (pairs compete too) */
-            FindTopK3(data, BLOCK_SIZE, BEAM_K, topK2, BEAM_K, topK3);
-
-            /* step 3: parallel beam — apply seed (2 or 3 steps) + RunGreedyST */
-            for (int k = 0; k < BEAM_K; k++) {
-                if (topK3[k].net <= 0.0) continue;
-                applyInstruction(beamData[k], BLOCK_SIZE, topK3[k].instr1, topK3[k].amp1);
-                beamHits[k][topK3[k].instr1]++;
-                applyInstruction(beamData[k], BLOCK_SIZE, topK3[k].instr2, topK3[k].amp2);
-                beamHits[k][topK3[k].instr2]++;
-                if (topK3[k].instr3 >= 0) {
-                    applyInstruction(beamData[k], BLOCK_SIZE, topK3[k].instr3, topK3[k].amp3);
-                    beamHits[k][topK3[k].instr3]++;
-                }
-                beamNets[k] = topK3[k].net + RunGreedyST(beamData[k], BLOCK_SIZE, beamHits[k], 0);
-            }
-
-            /* step 4: scramble-aware selection — for the top-8 beams by greedy,
-               check if a scramble would be profitable and prefer beams that enable one */
-            double *selectNets = malloc(BEAM_K * sizeof(double));
-            for (int k = 0; k < BEAM_K; k++) selectNets[k] = beamNets[k];
-
-            /* find top-8 beam indices by greedy score */
-            int topM[8]; int M = 8;
-            for (int j = 0; j < M; j++) topM[j] = -1;
-            for (int k = 0; k < BEAM_K; k++) {
-                if (topK3[k].net <= 0.0) continue;
-                int worst = 0;
-                for (int j = 1; j < M; j++)
-                    if (topM[j] < 0 || beamNets[k] <= (topM[worst]<0?-1e30:beamNets[topM[worst]]))
-                        worst = j;
-                if (topM[worst] < 0 || beamNets[k] > beamNets[topM[worst]])
-                    topM[worst] = k;
-            }
-
-            //#pragma omp parallel for schedule(dynamic)
-            for (int j = 0; j < M; j++) {
-                int k = topM[j];
-                if (k < 0) continue;
-                u8 *sbuf = malloc(BLOCK_SIZE);
-                double bestSG = 0.0;
-                for (int samp = 0; samp < 32; samp++) {
-                    memcpy(sbuf, beamData[k], BLOCK_SIZE);
-                    applyInstruction(sbuf, BLOCK_SIZE, 5, samp);
-                    double sg = RunGreedyST(sbuf, BLOCK_SIZE, NULL, 0) - 13.0;
-                    if (sg > bestSG) bestSG = sg;
-                }
-                free(sbuf);
-                selectNets[k] += bestSG; /* inflate selection score only */
-            }
-
-            int best = 0;
-            for (int k = 1; k < BEAM_K; k++)
-                if (selectNets[k] > selectNets[best]) best = k;
-            free(selectNets);
-
-            if (topK3[best].net <= 0.0) break;
-
-            /* verbose output for first block */
-            if (b == 0) {
-                printf("  [phase %d | beam %d/%d | seed steps: %d]\n",
-                       phase, best+1, BEAM_K, topK3[best].instr3 >= 0 ? 3 : 2);
-                u8 *rp = malloc(BLOCK_SIZE);
-                memcpy(rp, data, BLOCK_SIZE);
-                double ep = getEntropy(data, BLOCK_SIZE);
-                /* print seed steps */
-                int seed_instrs[3] = {topK3[best].instr1, topK3[best].instr2, topK3[best].instr3};
-                int seed_amps[3]   = {topK3[best].amp1,   topK3[best].amp2,   topK3[best].amp3};
-                int nseed = (topK3[best].instr3 >= 0) ? 3 : 2;
-                for (int si = 0; si < nseed; si++) {
-                    applyInstruction(rp, BLOCK_SIZE, seed_instrs[si], seed_amps[si]);
-                    double en = getEntropy(rp, BLOCK_SIZE);
-                    double sv = (ep-en)*BLOCK_SIZE;
-                    if (seed_instrs[si] >= 220 && seed_instrs[si] <= 222) {
-                        printf("  xd  s%d     amp= --| entropy %.6f -> %.6f | saved=%.1f  net=%.1f bits\n",
-                               seed_instrs[si]-215, ep, en, sv, sv-5.0);
-                    } else if (seed_instrs[si] >= 100) {
-                        int s,ph,op; decodeExt(seed_instrs[si],&s,&ph,&op);
-                        printf("  %s s%dp%d amp=%3d | entropy %.6f -> %.6f | saved=%.1f  net=%.1f bits\n",
-                               op?"ADD":"XOR", s, ph, seed_amps[si], ep, en, sv, sv-15.0);
-                    } else {
-                        printf("  instr=%2d amp=%3d | entropy %.6f -> %.6f | saved=%.1f  net=%.1f bits\n",
-                               seed_instrs[si], seed_amps[si], ep, en,
-                               sv, sv - instrOverhead(seed_instrs[si]));
-                    }
-                    ep = en;
-                }
-                /* print greedy steps verbosely */
-                RunGreedyST(rp, BLOCK_SIZE, NULL, 1);
-                free(rp);
-            }
-
-            /* commit best path */
-            memcpy(data, beamData[best], BLOCK_SIZE);
-            totalNet += beamNets[best];
-            for (int i = 0; i < 300; i++) localHits[i] += beamHits[best][i];
-
-            /* scramble lookahead: try 64 strides (2..65) for better phase-2 coverage */
-            u8 *buf = malloc(BLOCK_SIZE);
-            int bestAmp = -1; double bestGain = 0.0;
-            for (int amp = 0; amp < 64; amp++) {
-                memcpy(buf, data, BLOCK_SIZE);
-                applyInstruction(buf, BLOCK_SIZE, 5, amp);
-                double cg = RunGreedyST(buf, BLOCK_SIZE, NULL, 0);
-                double gain = cg - 13.0;
-                if (gain > bestGain) { bestGain = gain; bestAmp = amp; }
-            }
-            free(buf);
-
-            if (bestAmp < 0) break;   /* no profitable scramble — done */
-
-            /* apply scramble; next phase runs FindTopK2 on scrambled data */
-            applyInstruction(data, BLOCK_SIZE, 5, bestAmp);
-            totalNet -= 13.0;
-            localHits[5]++;
-            if (b == 0)
-                printf("  instr= 5 amp=%3d | deinterleave stride=%-3d        | overhead=13.0  net=-13.0 bits\n",
-                       bestAmp, bestAmp + 2);
-        }
-
-        if (b == 0) printDiagnostic(data, BLOCK_SIZE);
-
-        for (int k = 0; k < BEAM_K; k++) { free(beamData[k]); free(beamHits[k]); }
-        free(topK2); free(topK3); free(beamNets); free(beamData); free(beamHits);
+        /* Pure greedy: just find best action per pass and apply it */
+        totalNet = RunGreedyST(data, BLOCK_SIZE, localHits, (b == 0));
 
         free(data);
         netPerBlock[b] = totalNet;
