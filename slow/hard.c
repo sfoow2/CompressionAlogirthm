@@ -345,15 +345,20 @@ static double instrOverhead(int instr) {
  * Single-threaded step finder — safe to call from any parallel region *
  * scratch is a caller-provided buffer of length `size`               *
  * ------------------------------------------------------------------ */
-/* Entropy from a pre-built 256-bucket frequency table */
+/* Sum of h_table[freq[v]] = Σ freq·log2(freq) over the 256 buckets.
+   h_table[0]==0, so no branch needed. Replaces 256 log2 calls with 256
+   table lookups. NOTE: assumes every freq[v] <= 8192 (BLOCK_SIZE bound). */
+static inline double sumH(const int *freq) {
+    double s = 0.0;
+    for (int v = 0; v < 256; v++) s += h_table[freq[v]];
+    return s;
+}
+
+/* Entropy from a pre-built 256-bucket frequency table.
+   Identity: H = log2(N) - (1/N) * Σ freq·log2(freq), computed via h_table
+   so the per-call cost is one log2 + one divide instead of 256 of each. */
 static double entropyFromFreq(const int *freq, int size) {
-    double e = 0.0;
-    for (int v = 0; v < 256; v++) {
-        if (!freq[v]) continue;
-        double p = (double)freq[v] / size;
-        e -= p * log2(p);
-    }
-    return e;
+    return log2((double)size) - sumH(freq) / size;
 }
 
 /* ------------------------------------------------------------------ *
@@ -363,17 +368,23 @@ static double entropyFromFreq(const int *freq, int size) {
  * then evaluate each (instr,amp) candidate in O(256) — no memcpy,    *
  * no data scan per candidate. ~1000× faster than the naïve approach.  *
  * ------------------------------------------------------------------ */
-static double FindNextStepST(u8 *data, int size, int *usedInstr, int verbose,
-                              int (*pFreq)[17][256], int (*bf)[256][256]) {
+static double FindNextStepST(u8 *data, int size, int *usedInstr, int *usedAmp, int verbose,
+                              int (*pFreq)[17][256]) {
     /* --- build per-stride-phase frequency tables (one pass over data) --- */
     /* pFreq[s][ph][v] = count of bytes with value v at positions i where   */
     /* i mod (s+2) == ph. strides 2..17 → s=0..15, max phase index = 16    */
     int totalFreq[256] = {0};
 
-    /* Clear pre-allocated buffers */
+    /* Clear pre-allocated buffer */
     memset(pFreq, 0, 16 * 17 * 256 * sizeof(int));
-    memset(bf, 0, 14 * 256 * 256 * sizeof(int));
-    int compound_freq[256] = {0}; /* freq of (data[i]^data[i-4]^data[i-8]) */
+
+    /* Delta frequency arrays, accumulated directly in the scan below.
+       dx[k] = freq of (data[i] ^ data[i-k]); da[k] = freq of (data[i]-data[i-k]).
+       This replaces the 3.67 MB bigram table (and its memset + 917K read-back)
+       with these small 256-entry arrays — same delta_e values, far cheaper. */
+    int dx[9][256] = {{0}};        /* xor-delta strides 1..8           */
+    int da[5][256] = {{0}};        /* add-delta strides 2..4 (others unused) */
+    int compound_freq[256] = {0};  /* freq of (data[i]^data[i-4]^data[i-8]) */
     {
         int ph[16] = {0};
         u8 w0=0,w1=0,w2=0,w3=0,w4=0,w5=0,w6=0,w7=0;
@@ -384,55 +395,42 @@ static double FindNextStepST(u8 *data, int size, int *usedInstr, int verbose,
                 pFreq[s][ph[s]][b]++;
                 if (++ph[s] == s+2) ph[s] = 0;
             }
-            if (i>=1) bf[0][w0][b]++;
-            if (i>=2) bf[1+(i&1)][w1][b]++;
-            if (i>=3) bf[3+(i%3)][w2][b]++;
-            if (i>=4) bf[6+(i&3)][w3][b]++;
-            if (i>=5) bf[11][w4][b]++;
-            if (i>=6) bf[12][w5][b]++;
-            if (i>=7) bf[13][w6][b]++;
-            if (i>=8) { bf[10][w7][b]++; compound_freq[b^w3^w7]++; }
+            if (i>=1) dx[1][w0^b]++;
+            if (i>=2) { dx[2][w1^b]++; da[2][(b-w1)&0xFF]++; }
+            if (i>=3) { dx[3][w2^b]++; da[3][(b-w2)&0xFF]++; }
+            if (i>=4) { dx[4][w3^b]++; da[4][(b-w3)&0xFF]++; }
+            if (i>=5) dx[5][w4^b]++;
+            if (i>=6) dx[6][w5^b]++;
+            if (i>=7) dx[7][w6^b]++;
+            if (i>=8) { dx[8][w7^b]++; compound_freq[b^w3^w7]++; }
             w7=w6; w6=w5; w5=w4; w4=w3; w3=w2; w2=w1; w1=w0; w0=b;
         }
     }
 
-    double baseE = entropyFromFreq(totalFreq, size);
+    /* Sbase = Σ h_table[totalFreq]; baseE derived from it. The candidate
+       loop scores via (Snf - Sbase) which equals (baseE - e)*size exactly,
+       so no per-candidate log2/divide is needed. */
+    double Sbase = sumH(totalFreq);
+    double baseE = log2((double)size) - Sbase / size;
     double bestNet = 0.0, bestE = baseE;
     int bestInstr = -1, bestAmp = -1;
 
-    /* pre-evaluate all delta instructions: strides 1,2,3,4,8 + compound
-       Bigrams cover size-k pairs (positions k..size-1), so normalize by
-       size-k to avoid ~k*8-bit phantom profit from wrong normalization. */
+    /* pre-evaluate all delta instructions: strides 1,2,3,4,8 + compound.
+       Each is normalized by its own pair count (size-k) to avoid a phantom
+       profit from wrong normalization. */
     double delta_e[2][9]; /* [0=ADD,1=XOR][stride 0..8] */
-    /* stride 1: xor-delta only */
-    { int nx[256]={0};
-      for (int p=0;p<256;p++) for (int c=0;c<256;c++) nx[p^c]+=bf[0][p][c];
-      delta_e[1][1]=entropyFromFreq(nx,size-1); }
-    /* stride 2: add+xor */
-    { int na[256]={0},nx[256]={0};
-      for (int P=0;P<2;P++) for (int p=0;p<256;p++) for (int c=0;c<256;c++) {
-          int v=bf[1+P][p][c]; na[(c-p)&0xFF]+=v; nx[p^c]+=v; }
-      delta_e[0][2]=entropyFromFreq(na,size-2); delta_e[1][2]=entropyFromFreq(nx,size-2); }
-    /* strides 3-4: add+xor */
-    for (int ds=3; ds<=4; ds++) {
-        int base=ds*(ds-1)/2, na[256]={0}, nx[256]={0};
-        for (int P=0;P<ds;P++) for (int p=0;p<256;p++) for (int c=0;c<256;c++) {
-            int v=bf[base+P][p][c]; na[(c-p)&0xFF]+=v; nx[p^c]+=v; }
-        delta_e[0][ds]=entropyFromFreq(na,size-ds); delta_e[1][ds]=entropyFromFreq(nx,size-ds); }
-    /* strides 5-7: xor-delta only (unphased bigrams bf[11..13]) */
-    for (int ds=5; ds<=7; ds++) {
-        int nx[256]={0};
-        for (int p=0;p<256;p++) for (int c=0;c<256;c++) nx[p^c]+=bf[11+(ds-5)][p][c];
-        delta_e[1][ds]=entropyFromFreq(nx,size-ds); }
-    /* stride 8: xor-delta only */
-    { int nx[256]={0};
-      for (int p=0;p<256;p++) for (int c=0;c<256;c++) nx[p^c]+=bf[10][p][c];
-      delta_e[1][8]=entropyFromFreq(nx,size-8); }
-    /* compound: pre-computed directly in compound_freq */
+    delta_e[1][1]=entropyFromFreq(dx[1],size-1);
+    for (int ds=2; ds<=4; ds++) {
+        delta_e[0][ds]=entropyFromFreq(da[ds],size-ds);
+        delta_e[1][ds]=entropyFromFreq(dx[ds],size-ds);
+    }
+    for (int ds=5; ds<=8; ds++) delta_e[1][ds]=entropyFromFreq(dx[ds],size-ds);
     double compound_e = entropyFromFreq(compound_freq, size-8);
 
     for (int instr = 0; instr < 32; instr++) {
         if (instr == 5) continue;
+        /* Skip rarely-used instructions */
+        if (instr == 13 || instr == 23 || instr == 24 || instr == 30) continue;
         for (int amp = 0; amp < 256; amp++) {
             /* map (instr, amp) → stride, phase, permutation type + value */
             int stride, phase, ptype, pval;
@@ -501,9 +499,10 @@ static double FindNextStepST(u8 *data, int size, int *usedInstr, int verbose,
             case 2: for (int v=0;v<256;v++) nf[(v&0xF0)|((v+pval)&0xF)] += sp[v]; break;
             }
 
-            double e = entropyFromFreq(nf, size);
-            double net = (baseE - e) * size - instrOverhead(instr);
-            if (net > bestNet) { bestNet = net; bestE = e; bestInstr = instr; bestAmp = amp; }
+            double Snf = sumH(nf);
+            double net = Snf - Sbase - instrOverhead(instr);
+            if (net > bestNet) { bestNet = net; bestInstr = instr; bestAmp = amp;
+                                 bestE = log2((double)size) - Snf/size; }
         }
     }
 
@@ -519,6 +518,8 @@ static double FindNextStepST(u8 *data, int size, int *usedInstr, int verbose,
     for (int strd = 4; strd <= 7; strd++) {
         for (int ph = 0; ph < strd; ph++) {
             /* skip ADD stride-4 phases 0,1 — covered by instrs 30,31 with lower overhead */
+            /* skip stride-7 phases 4+ — rarely used, not worth search cost */
+            if (strd==7 && ph>=4) continue;
             const int *sp = pFreq[strd-2][ph];
             for (int op = 0; op <= 1; op++) {
                 if (strd==4 && op==1 && ph<2) continue;
@@ -529,9 +530,10 @@ static double FindNextStepST(u8 *data, int size, int *usedInstr, int verbose,
                     for (int v=0;v<256;v++) nf[v] -= sp[v];
                     if (op==0) for(int v=0;v<256;v++) nf[v^amp]        += sp[v];
                     else       for(int v=0;v<256;v++) nf[(v+amp)&0xFF] += sp[v];
-                    double e = entropyFromFreq(nf, size);
-                    double net = (baseE - e)*size - instrOverhead(instr_ext);
-                    if (net > bestNet) { bestNet=net; bestE=e; bestInstr=instr_ext; bestAmp=amp; }
+                    double Snf = sumH(nf);
+                    double net = Snf - Sbase - instrOverhead(instr_ext);
+                    if (net > bestNet) { bestNet=net; bestInstr=instr_ext; bestAmp=amp;
+                                         bestE = log2((double)size) - Snf/size; }
                 }
             }
         }
@@ -544,9 +546,11 @@ static double FindNextStepST(u8 *data, int size, int *usedInstr, int verbose,
 
     if (bestInstr < 0) {
         if (usedInstr) *usedInstr = -1;
+        if (usedAmp) *usedAmp = 0;
         return 0.0;
     }
     applyInstruction(data, size, bestInstr, bestAmp);
+    if (usedAmp) *usedAmp = bestAmp;
     if (verbose) {
         double sv = (baseE-bestE)*size;
         if (bestInstr >= 250 && bestInstr <= 281) {
@@ -575,13 +579,12 @@ static double FindNextStepST(u8 *data, int size, int *usedInstr, int verbose,
  * ------------------------------------------------------------------ */
 static double RunChainST(u8 *data, int size, int *hits, int verbose) {
     int (*pFreq)[17][256] = calloc(16, sizeof(*pFreq));
-    int (*bf)[256][256] = calloc(14, sizeof(int[256][256]));
     double total = 0.0;
 
     for (;;) {
         /* greedy passes until stall */
-        int instr; double net;
-        while ((net = FindNextStepST(data, size, &instr, verbose, pFreq, bf)) > 0.0) {
+        int instr, amp; double net;
+        while ((net = FindNextStepST(data, size, &instr, &amp, verbose, pFreq)) > 0.0) {
             total += net;
             if (hits) hits[instr]++;
         }
@@ -593,8 +596,8 @@ static double RunChainST(u8 *data, int size, int *hits, int verbose) {
         for (int amp = 0; amp < 32; amp++) {
             memcpy(buf, data, size);
             applyInstruction(buf, size, 5, amp);
-            double cg = 0.0, n; int dummy;
-            while ((n = FindNextStepST(buf, size, &dummy, 0, pFreq, bf)) > 0.0) cg += n;
+            double cg = 0.0, n; int dummy, dummy_amp;
+            while ((n = FindNextStepST(buf, size, &dummy, &dummy_amp, 0, pFreq)) > 0.0) cg += n;
             double gain = cg - 13.0;
             if (gain > bestGain) { bestGain = gain; bestAmp = amp; }
         }
@@ -613,28 +616,121 @@ static double RunChainST(u8 *data, int size, int *hits, int verbose) {
     }
 
     free(pFreq);
-    free(bf);
     return total;
 }
 
-/* greedy-only chain (no scramble) — safe to call from parallel regions */
-static double RunGreedyST(u8 *data, int size, int *hits, int verbose) {
+typedef struct {
+    u8 *instrs;   /* instruction IDs */
+    u8 *amps;     /* amplitudes */
+    int count;
+    int capacity;
+} InstrSeq;
+
+static InstrSeq* InstrSeq_Create(int capacity) {
+    InstrSeq *seq = malloc(sizeof(InstrSeq));
+    seq->instrs = malloc(capacity);
+    seq->amps = malloc(capacity);
+    seq->count = 0;
+    seq->capacity = capacity;
+    return seq;
+}
+
+static void InstrSeq_Add(InstrSeq *seq, int instr, int amp) {
+    if (seq->count >= seq->capacity) {
+        seq->capacity *= 2;
+        seq->instrs = realloc(seq->instrs, seq->capacity);
+        seq->amps = realloc(seq->amps, seq->capacity);
+    }
+    seq->instrs[seq->count] = (u8)instr;
+    seq->amps[seq->count] = (u8)amp;
+    seq->count++;
+}
+
+static void InstrSeq_Free(InstrSeq *seq) {
+    free(seq->instrs);
+    free(seq->amps);
+    free(seq);
+}
+
+/* greedy-only chain with instruction 5 lookahead (repeatable) */
+static double RunGreedyST(u8 *data, int size, int *hits, InstrSeq *seq, int verbose,
+                          double *minReduction, double *maxReduction, double *sumReduction) {
     int (*pFreq)[17][256] = calloc(16, sizeof(*pFreq));
-    int (*bf)[256][256] = calloc(14, sizeof(int[256][256]));
 
     double total = 0.0, net;
-    int instr;
+    int instr, amp;
     int passes = 0;
-    clock_t find_time = 0, apply_time = 0;
+    int lastInstr = -1;  /* track last applied instruction */
 
-    while ((net = FindNextStepST(data, size, &instr, verbose, pFreq, bf)) > 0.0) {
-        total += net;
-        if (hits) hits[instr]++;
-        passes++;
+    u8 *buf = malloc(size);
+
+    for (;;) {
+        /* Greedy phase */
+        while ((net = FindNextStepST(data, size, &instr, &amp, verbose, pFreq)) > 0.0) {
+            total += net;
+            if (hits) hits[instr]++;
+            if (seq) InstrSeq_Add(seq, instr, amp);
+            passes++;
+            lastInstr = instr;
+
+            /* Track min/max/sum entropy reduction per instruction */
+            if (minReduction && maxReduction && sumReduction) {
+                if (net < minReduction[instr]) minReduction[instr] = net;
+                if (net > maxReduction[instr]) maxReduction[instr] = net;
+                sumReduction[instr] += net;
+            }
+        }
+
+        /* Stalled: try instruction 5 with lookahead (only if last instr wasn't 5) */
+        if (lastInstr == 5) break;  /* Don't apply instruction 5 twice in a row */
+
+        int bestAmp5 = -1;
+        double bestGain5 = 0.0;
+
+        for (int amp5 = 0; amp5 <= 15; amp5++) {  /* strides 2-17, reduced range for speed */
+            memcpy(buf, data, size);
+            applyInstruction(buf, size, 5, amp5);
+
+            /* Run greedy on deinterleaved data (FindNextStepST clears pFreq itself) */
+            double chainGain = 0.0;
+            int dummy_instr, dummy_amp;
+            double chain_net;
+            while ((chain_net = FindNextStepST(buf, size, &dummy_instr, &dummy_amp, 0, pFreq)) > 0.0) {
+                chainGain += chain_net;
+            }
+
+            double gain = chainGain - 13.0;  /* subtract cost of instruction 5 */
+            if (gain > bestGain5) {
+                bestGain5 = gain;
+                bestAmp5 = amp5;
+            }
+
+            /* Early exit: if we found a really good gain, stop searching */
+            if (gain > 50.0) break;
+        }
+
+        if (bestAmp5 < 0 || bestGain5 <= 0.0) break;  /* No profitable instruction 5 found */
+
+        /* Apply instruction 5 and loop back for more greedy */
+        applyInstruction(data, size, 5, bestAmp5);
+        if (seq) InstrSeq_Add(seq, 5, bestAmp5);
+        if (hits) hits[5]++;
+        lastInstr = 5;
+
+        /* Track instruction 5 reduction */
+        if (minReduction && maxReduction && sumReduction) {
+            if (bestGain5 < minReduction[5]) minReduction[5] = bestGain5;
+            if (bestGain5 > maxReduction[5]) maxReduction[5] = bestGain5;
+            sumReduction[5] += bestGain5;
+        }
+
+        if (verbose)
+            printf("  Instruction 5 (deinterleave) amp=%d applied, gained %.1f bits\n", bestAmp5, bestGain5);
+        /* next greedy phase: FindNextStepST clears pFreq at entry */
     }
 
+    free(buf);
     free(pFreq);
-    free(bf);
     if (verbose && passes > 0)
         printf("  Greedy completed: %d passes\n", passes);
     return total;
@@ -1085,7 +1181,7 @@ static uint8_t seeded_random_byte(void) {
     return (uint8_t)(seed_state >> 24);
 }
 
-static int get_num_cores(void) {
+static int get_num_cores(void) { 
     return omp_get_num_procs();
 }
 
@@ -1095,20 +1191,32 @@ void main() {
     for (int x = 1; x <= 8192; x++) h_table[x] = (double)x * log2((double)x);
 
     int NUM_CORES = get_num_cores();
-    const int NUM_BLOCKS  = 1000;
-    const int BLOCK_SIZE  = 1024 * 4;
+    const int NUM_BLOCKS  = 1;
+    const int BLOCK_SIZE  = 4096;
     const uint32_t SEED   = 42;
     const int NUM_THREADS = (NUM_BLOCKS < NUM_CORES) ? NUM_BLOCKS : NUM_CORES;
 
     double *netPerBlock = malloc(NUM_BLOCKS * sizeof(double));
     memset(netPerBlock, 0, NUM_BLOCKS * sizeof(double));
     int    instrHits[300]   = {0};
+    double instrMinReduction[300];
+    double instrMaxReduction[300];
+    double instrSumReduction[300];
+
+    for (int i = 0; i < 300; i++) {
+        instrMinReduction[i] = 1e30;
+        instrMaxReduction[i] = -1e30;
+        instrSumReduction[i] = 0.0;
+    }
 
     seed_state = SEED;
     printf("Running %d blocks on %d thread(s)... [seed=%u]\n",
            NUM_BLOCKS, NUM_THREADS, SEED);
 
     /* Process blocks in parallel — each block independently */
+    InstrSeq *firstBlockSeq = InstrSeq_Create(1000);
+    u8 *firstBlockData = NULL;
+
     clock_t start = clock();
     #pragma omp parallel for num_threads(NUM_THREADS)
     for (int b = 0; b < NUM_BLOCKS; b++) {
@@ -1117,16 +1225,43 @@ void main() {
 
         double totalNet = 0.0;
         int localHits[300] = {0};
+        double localMinReduction[300];
+        double localMaxReduction[300];
+        double localSumReduction[300];
+
+        for (int i = 0; i < 300; i++) {
+            localMinReduction[i] = 1e30;
+            localMaxReduction[i] = -1e30;
+            localSumReduction[i] = 0.0;
+        }
+
+        InstrSeq *seq = (b == 0) ? firstBlockSeq : NULL;
 
         /* Pure greedy: just find best action per pass and apply it */
-        totalNet = RunGreedyST(data, BLOCK_SIZE, localHits, (b == 0));
+        totalNet = RunGreedyST(data, BLOCK_SIZE, localHits, seq, (b == 0),
+                              localMinReduction, localMaxReduction, localSumReduction);
+
+        if (b == 0) {
+            firstBlockData = malloc(BLOCK_SIZE);
+            memcpy(firstBlockData, data, BLOCK_SIZE);
+        }
 
         free(data);
         netPerBlock[b] = totalNet;
 
-        //#pragma omp critical
-        for (int i = 0; i < 300; i++)
-            instrHits[i] += localHits[i];
+        #pragma omp critical
+        {
+            for (int i = 0; i < 300; i++) {
+                instrHits[i] += localHits[i];
+                if (localMinReduction[i] < 1e30) {
+                    if (localMinReduction[i] < instrMinReduction[i])
+                        instrMinReduction[i] = localMinReduction[i];
+                    if (localMaxReduction[i] > instrMaxReduction[i])
+                        instrMaxReduction[i] = localMaxReduction[i];
+                    instrSumReduction[i] += localSumReduction[i];
+                }
+            }
+        }
     }
     clock_t end = clock();
     double elapsed = (double)(end - start) / CLOCKS_PER_SEC;
@@ -1149,26 +1284,32 @@ void main() {
 
     free(netPerBlock);
     for (int i = 0; i < 32; i++) {
-        if (instrHits[i] > 0)
-            printf("  instr %2d: %4d uses  (%5.1f%%)\n",
-                   i, instrHits[i], 100.0 * instrHits[i] / totalPasses);
-        else
+        if (instrHits[i] > 0) {
+            double avg = instrSumReduction[i] / instrHits[i];
+            printf("  instr %2d: %4d uses  (%5.1f%%)  |  min=%.1f  max=%.1f  avg=%.1f bits\n",
+                   i, instrHits[i], 100.0 * instrHits[i] / totalPasses,
+                   instrMinReduction[i], instrMaxReduction[i], avg);
+        } else
             printf("  instr %2d:    0 uses  -- NEVER USED\n", i);
     }
     for (int i = 100; i < 220; i++) {
         if (instrHits[i] > 0) {
             int s,ph,op; decodeExt(i,&s,&ph,&op);
-            printf("  %s s%dp%d: %4d uses  (%5.1f%%)\n",
+            double avg = instrSumReduction[i] / instrHits[i];
+            printf("  %s s%dp%d: %4d uses  (%5.1f%%)  |  min=%.1f  max=%.1f  avg=%.1f bits\n",
                    op?"ADD":"XOR", s, ph,
-                   instrHits[i], 100.0*instrHits[i]/totalPasses);
+                   instrHits[i], 100.0*instrHits[i]/totalPasses,
+                   instrMinReduction[i], instrMaxReduction[i], avg);
         }
     }
     for (int ds=5; ds<=7; ds++) {
         int i = 220+(ds-5);
-        if (instrHits[i] > 0)
-            printf("  xd  s%d: %4d uses  (%5.1f%%)\n",
-                   ds, instrHits[i], 100.0*instrHits[i]/totalPasses);
-        else
+        if (instrHits[i] > 0) {
+            double avg = instrSumReduction[i] / instrHits[i];
+            printf("  xd  s%d: %4d uses  (%5.1f%%)  |  min=%.1f  max=%.1f  avg=%.1f bits\n",
+                   ds, instrHits[i], 100.0*instrHits[i]/totalPasses,
+                   instrMinReduction[i], instrMaxReduction[i], avg);
+        } else
             printf("  xd  s%d:    0 uses  -- NEVER USED\n", ds);
     }
     for (int i=250; i<=281; i++) {
@@ -1178,4 +1319,35 @@ void main() {
                    op?"ADD":"XOR", strd, instrHits[i], 100.0*instrHits[i]/totalPasses);
         }
     }
+
+    /* Write first block to binary files */
+    if (firstBlockData && firstBlockSeq->count > 0) {
+        FILE *f = fopen("data.bin", "wb");
+        if (f) {
+            fwrite(firstBlockData, 1, BLOCK_SIZE, f);
+            fclose(f);
+            double outputEntropy = getEntropy(firstBlockData, BLOCK_SIZE);
+            printf("\nWrote %d bytes to data.bin  |  Output entropy: %.6f bits/byte\n",
+                   BLOCK_SIZE, outputEntropy);
+        }
+
+        f = fopen("instructions.bin", "wb");
+        if (f) {
+            u8 instrBytes[1000 * 2];
+            int totalInstrBytes = 0;
+            for (int i = 0; i < firstBlockSeq->count; i++) {
+                instrBytes[totalInstrBytes++] = firstBlockSeq->instrs[i];
+                instrBytes[totalInstrBytes++] = firstBlockSeq->amps[i];
+                fputc(firstBlockSeq->instrs[i], f);
+                fputc(firstBlockSeq->amps[i], f);
+            }
+            fclose(f);
+            double instrEntropy = getEntropy(instrBytes, totalInstrBytes);
+            printf("Wrote %d instruction pairs (%d bytes) to instructions.bin  |  Entropy: %.6f bits/byte\n",
+                   firstBlockSeq->count, firstBlockSeq->count * 2, instrEntropy);
+        }
+    }
+
+    if (firstBlockData) free(firstBlockData);
+    InstrSeq_Free(firstBlockSeq);
 }
