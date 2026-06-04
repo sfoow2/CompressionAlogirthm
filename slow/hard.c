@@ -1100,7 +1100,8 @@ void main() {
     const uint32_t SEED   = 42;
     const int NUM_THREADS = (NUM_BLOCKS < NUM_CORES) ? NUM_BLOCKS : NUM_CORES;
 
-    double netPerBlock[200] = {0};
+    double *netPerBlock = malloc(NUM_BLOCKS * sizeof(double));
+    memset(netPerBlock, 0, NUM_BLOCKS * sizeof(double));
     int    instrHits[300]   = {0};
 
     seed_state = SEED;
@@ -1145,6 +1146,8 @@ void main() {
     printf("Net savings:  min=%.1f  max=%.1f  avg=%.1f bits\n",
            minNet, maxNet, sumNet / NUM_BLOCKS);
     printf("\nInstruction usage (%d total passes):\n", totalPasses);
+
+    free(netPerBlock);
     for (int i = 0; i < 32; i++) {
         if (instrHits[i] > 0)
             printf("  instr %2d: %4d uses  (%5.1f%%)\n",
