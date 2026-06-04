@@ -370,31 +370,20 @@ static double entropyFromFreq(const int *freq, int size) {
  * ------------------------------------------------------------------ */
 static double FindNextStepST(u8 *data, int size, int *usedInstr, int *usedAmp, int verbose,
                               int (*pFreq)[17][256]) {
-    /* --- build per-stride-phase frequency tables (one pass over data) --- */
     /* pFreq[s][ph][v] = count of bytes with value v at positions i where   */
     /* i mod (s+2) == ph. strides 2..17 → s=0..15, max phase index = 16    */
     int totalFreq[256] = {0};
 
-    /* Clear pre-allocated buffer */
-    memset(pFreq, 0, 16 * 17 * 256 * sizeof(int));
-
-    /* Delta frequency arrays, accumulated directly in the scan below.
-       dx[k] = freq of (data[i] ^ data[i-k]); da[k] = freq of (data[i]-data[i-k]).
-       This replaces the 3.67 MB bigram table (and its memset + 917K read-back)
-       with these small 256-entry arrays — same delta_e values, far cheaper. */
-    int dx[9][256] = {{0}};        /* xor-delta strides 1..8           */
-    int da[5][256] = {{0}};        /* add-delta strides 2..4 (others unused) */
-    int compound_freq[256] = {0};  /* freq of (data[i]^data[i-4]^data[i-8]) */
+    /* Pass 0: build totalFreq + delta tables — all tiny (≤9×256 ints), stay in L1.
+       Separated from pFreq build so neither scan pollutes the other's cache. */
+    int dx[9][256] = {{0}};        /* xor-delta strides 1..8  */
+    int da[5][256] = {{0}};        /* add-delta strides 2..4  */
+    int compound_freq[256] = {0};
     {
-        int ph[16] = {0};
         u8 w0=0,w1=0,w2=0,w3=0,w4=0,w5=0,w6=0,w7=0;
         for (int i = 0; i < size; i++) {
             u8 b = data[i];
             totalFreq[b]++;
-            for (int s = 0; s < 16; s++) {
-                pFreq[s][ph[s]][b]++;
-                if (++ph[s] == s+2) ph[s] = 0;
-            }
             if (i>=1) dx[1][w0^b]++;
             if (i>=2) { dx[2][w1^b]++; da[2][(b-w1)&0xFF]++; }
             if (i>=3) { dx[3][w2^b]++; da[3][(b-w2)&0xFF]++; }
@@ -404,6 +393,19 @@ static double FindNextStepST(u8 *data, int size, int *usedInstr, int *usedAmp, i
             if (i>=7) dx[7][w6^b]++;
             if (i>=8) { dx[8][w7^b]++; compound_freq[b^w3^w7]++; }
             w7=w6; w6=w5; w5=w4; w4=w3; w3=w2; w2=w1; w1=w0; w0=b;
+        }
+    }
+
+    /* Passes 1..16: build one pFreq[s] at a time.
+       Write set per pass = (s+2)×256×4 bytes = 2–17 KB → stays in L1 cache.
+       Memset only the entries that actually exist for each stride (155 KB total
+       vs 272 KB if the whole array were cleared at once). */
+    for (int s = 0; s < 16; s++) {
+        memset(pFreq[s], 0, (s+2) * 256 * sizeof(int));
+        int ph = 0;
+        for (int i = 0; i < size; i++) {
+            pFreq[s][ph][data[i]]++;
+            if (++ph == s+2) ph = 0;
         }
     }
 
@@ -431,6 +433,7 @@ static double FindNextStepST(u8 *data, int size, int *usedInstr, int *usedAmp, i
         if (instr == 5) continue;
         /* Skip rarely-used instructions */
         if (instr == 13 || instr == 23 || instr == 24 || instr == 30) continue;
+        double oh = instrOverhead(instr);  /* hoist: constant for all amps */
         for (int amp = 0; amp < 256; amp++) {
             /* map (instr, amp) → stride, phase, permutation type + value */
             int stride, phase, ptype, pval;
@@ -476,7 +479,7 @@ static double FindNextStepST(u8 *data, int size, int *usedInstr, int *usedAmp, i
                 continue;
             }
 
-            /* other delta instructions: use bigram tables */
+            /* other delta instructions: use pre-computed delta tables */
             if (ptype == 4 || ptype == 5) {
                 double e = delta_e[ptype==4 ? 0 : 1][pval];
                 double net = (baseE - e) * size - 5.0;
@@ -484,23 +487,23 @@ static double FindNextStepST(u8 *data, int size, int *usedInstr, int *usedAmp, i
                 continue;
             }
 
-            /* phase % stride: handles phase>=stride for packed instrs with
-               small strides (off-by-a-few-bytes approximation, negligible
-               on 1MB data) */
-            const int *sp = pFreq[stride - 2][phase % stride];
+            /* skip identity transforms (pval=0 → no change, net always negative) */
+            if (pval == 0) continue;
 
-            /* build new freq: remove affected bytes, re-add with permutation */
-            int nf[256];
-            memcpy(nf, totalFreq, 256 * sizeof(int));
-            for (int v = 0; v < 256; v++) nf[v] -= sp[v];
+            /* No-copy candidate evaluation: compute Snf = Σ h_table[new_count[v]]
+               directly from totalFreq and sp, without allocating or copying nf[256].
+               For XOR(pval):   new_count[v] = totalFreq[v] - sp[v] + sp[v^pval]
+               For ADD(pval):   new_count[v] = totalFreq[v] - sp[v] + sp[(v-pval)&0xFF]
+               For nADD(pval):  new_count[v] = totalFreq[v] - sp[v] + sp[(v&0xF0)|((v-pval)&0xF)] */
+            const int *sp = pFreq[stride - 2][phase % stride];
+            double Snf = 0.0;
             switch (ptype) {
-            case 0: for (int v=0;v<256;v++) nf[v^pval]                  += sp[v]; break;
-            case 1: for (int v=0;v<256;v++) nf[(v+pval)&0xFF]           += sp[v]; break;
-            case 2: for (int v=0;v<256;v++) nf[(v&0xF0)|((v+pval)&0xF)] += sp[v]; break;
+            case 0: for (int v=0;v<256;v++) Snf += h_table[totalFreq[v]-sp[v]+sp[v^pval]]; break;
+            case 1: for (int v=0;v<256;v++) Snf += h_table[totalFreq[v]-sp[v]+sp[(v-pval)&0xFF]]; break;
+            case 2: for (int v=0;v<256;v++) Snf += h_table[totalFreq[v]-sp[v]+sp[(v&0xF0)|((v-pval)&0xF)]]; break;
             }
 
-            double Snf = sumH(nf);
-            double net = Snf - Sbase - instrOverhead(instr);
+            double net = Snf - Sbase - oh;
             if (net > bestNet) { bestNet = net; bestInstr = instr; bestAmp = amp;
                                  bestE = log2((double)size) - Snf/size; }
         }
@@ -517,21 +520,20 @@ static double FindNextStepST(u8 *data, int size, int *usedInstr, int *usedAmp, i
     /* extended high-precision: strides 4-7, all phases, XOR and ADD */
     for (int strd = 4; strd <= 7; strd++) {
         for (int ph = 0; ph < strd; ph++) {
-            /* skip ADD stride-4 phases 0,1 — covered by instrs 30,31 with lower overhead */
-            /* skip stride-7 phases 4+ — rarely used, not worth search cost */
             if (strd==7 && ph>=4) continue;
             const int *sp = pFreq[strd-2][ph];
+            /* diff[v] = totalFreq[v] - sp[v], precomputed once for all 255×2 amps */
+            int diff[256];
+            for (int v=0;v<256;v++) diff[v] = totalFreq[v] - sp[v];
             for (int op = 0; op <= 1; op++) {
                 if (strd==4 && op==1 && ph<2) continue;
                 int instr_ext = encodeExt(strd, ph, op);
-                int nf[256];
+                double oh = instrOverhead(instr_ext);  /* constant for all amps */
                 for (int amp = 1; amp < 256; amp++) {
-                    memcpy(nf, totalFreq, 256*sizeof(int));
-                    for (int v=0;v<256;v++) nf[v] -= sp[v];
-                    if (op==0) for(int v=0;v<256;v++) nf[v^amp]        += sp[v];
-                    else       for(int v=0;v<256;v++) nf[(v+amp)&0xFF] += sp[v];
-                    double Snf = sumH(nf);
-                    double net = Snf - Sbase - instrOverhead(instr_ext);
+                    double Snf = 0.0;
+                    if (op==0) { for (int v=0;v<256;v++) Snf += h_table[diff[v]+sp[v^amp]]; }
+                    else       { for (int v=0;v<256;v++) Snf += h_table[diff[v]+sp[(v-amp)&0xFF]]; }
+                    double net = Snf - Sbase - oh;
                     if (net > bestNet) { bestNet=net; bestInstr=instr_ext; bestAmp=amp;
                                          bestE = log2((double)size) - Snf/size; }
                 }
@@ -660,9 +662,23 @@ static double RunGreedyST(u8 *data, int size, int *hits, InstrSeq *seq, int verb
     double total = 0.0, net;
     int instr, amp;
     int passes = 0;
-    int lastInstr = -1;  /* track last applied instruction */
+    int lastInstr = -1;
 
-    u8 *buf = malloc(size);
+    /* Parallel lookahead: use spare cores when blocks don't fill all threads.
+       Each lookahead chain is independent — thread t uses laFreq[t] and laBuf[t]. */
+    int outer_nthreads = omp_get_num_threads();
+    int la_threads = omp_get_max_threads() / outer_nthreads;
+    if (la_threads < 1) la_threads = 1;
+    if (la_threads > 16) la_threads = 16;
+
+    int (*laFreq[16])[17][256];
+    u8  *laBuf[16];
+    for (int t = 0; t < la_threads; t++) {
+        laFreq[t] = calloc(16, sizeof(int[17][256]));
+        laBuf[t]  = malloc(size);
+    }
+
+    u8 *buf = laBuf[0];  /* alias for serial fallback (la_threads==1) */
 
     for (;;) {
         /* Greedy phase */
@@ -682,32 +698,25 @@ static double RunGreedyST(u8 *data, int size, int *hits, InstrSeq *seq, int verb
         }
 
         /* Stalled: try instruction 5 with lookahead (only if last instr wasn't 5) */
-        if (lastInstr == 5) break;  /* Don't apply instruction 5 twice in a row */
+        if (lastInstr == 5) break;
+
+        /* Evaluate all 16 amps in parallel when spare threads are available.
+           Removes the serial early-exit: we now always pick the true best amp. */
+        double gains[16] = {0};
+        #pragma omp parallel for num_threads(la_threads) schedule(static,1)
+        for (int amp5 = 0; amp5 <= 15; amp5++) {
+            int t = omp_get_thread_num();
+            memcpy(laBuf[t], data, size);
+            applyInstruction(laBuf[t], size, 5, amp5);
+            double cg = 0.0, cn; int di, da2;
+            while ((cn = FindNextStepST(laBuf[t], size, &di, &da2, 0, laFreq[t])) > 0.0) cg += cn;
+            gains[amp5] = cg - 13.0;
+        }
 
         int bestAmp5 = -1;
         double bestGain5 = 0.0;
-
-        for (int amp5 = 0; amp5 <= 15; amp5++) {  /* strides 2-17, reduced range for speed */
-            memcpy(buf, data, size);
-            applyInstruction(buf, size, 5, amp5);
-
-            /* Run greedy on deinterleaved data (FindNextStepST clears pFreq itself) */
-            double chainGain = 0.0;
-            int dummy_instr, dummy_amp;
-            double chain_net;
-            while ((chain_net = FindNextStepST(buf, size, &dummy_instr, &dummy_amp, 0, pFreq)) > 0.0) {
-                chainGain += chain_net;
-            }
-
-            double gain = chainGain - 13.0;  /* subtract cost of instruction 5 */
-            if (gain > bestGain5) {
-                bestGain5 = gain;
-                bestAmp5 = amp5;
-            }
-
-            /* Early exit: if we found a really good gain, stop searching */
-            if (gain > 50.0) break;
-        }
+        for (int amp5 = 0; amp5 <= 15; amp5++)
+            if (gains[amp5] > bestGain5) { bestGain5 = gains[amp5]; bestAmp5 = amp5; }
 
         if (bestAmp5 < 0 || bestGain5 <= 0.0) break;  /* No profitable instruction 5 found */
 
@@ -729,7 +738,7 @@ static double RunGreedyST(u8 *data, int size, int *hits, InstrSeq *seq, int verb
         /* next greedy phase: FindNextStepST clears pFreq at entry */
     }
 
-    free(buf);
+    for (int t = 0; t < la_threads; t++) { free(laFreq[t]); free(laBuf[t]); }
     free(pFreq);
     if (verbose && passes > 0)
         printf("  Greedy completed: %d passes\n", passes);
@@ -1191,8 +1200,9 @@ void main() {
     for (int x = 1; x <= 8192; x++) h_table[x] = (double)x * log2((double)x);
 
     int NUM_CORES = get_num_cores();
+    omp_set_max_active_levels(2);  /* allow one level of nested parallelism for lookahead */
     const int NUM_BLOCKS  = 1;
-    const int BLOCK_SIZE  = 8192;
+    const int BLOCK_SIZE  = 4096;
     const uint32_t SEED   = 42;
     const int NUM_THREADS = (NUM_BLOCKS < NUM_CORES) ? NUM_BLOCKS : NUM_CORES;
 
