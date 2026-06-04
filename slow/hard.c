@@ -90,24 +90,21 @@ static int g_sweep_amps[18];
    Based on empirical runs, these instruction types provide the best cost-benefit trade-off. */
 
 static int getHotInstructionOverhead(int instr) {
-    /* Tier-2 baseline configuration: proven 164.6 bits on single block.
-       - Tier 1 (2-bit): ultra-frequent instructions (0, 5, 15)
-       - Tier 2 (3-bit): very hot instructions (1, 8, 9, 16, 17, 20, 21, 25)
-       - Tier 3 (4-bit): selected extended per-phase (strides 4-7, instr 140-200)
-       Achieves 164.6 bits on 1-block test with truly random data. */
+    /* Tier 1 (1-bit) — ultra-hot packed */
+    if (instr == 0 || instr == 5 || instr == 9 || instr == 15 ||
+        instr == 20 || instr == 21) return 1;
 
-    /* Tier 1 (1-bit overhead) — ultra-hot: 0, 5, 9, 15 */
-    if (instr == 0 || instr == 5 || instr == 9 || instr == 15) return 1;
+    /* Tier 2 (2-bit) — active packed + ALL extended strides 2-7 */
+    if (instr == 1  || instr == 2  || instr == 3  || instr == 8  ||
+        instr == 10 || instr == 11 || instr == 12 || instr == 13 ||
+        instr == 14 || instr == 16 || instr == 17 || instr == 24 ||
+        instr == 25 || instr == 30 || instr == 31) return 2;
+    if (instr >= 100 && instr <= 213) return 2;  /* encodeExt strides 2-7, all phases */
 
-    /* Tier 2 (3-bit overhead) — balanced set */
-    if (instr == 1 || instr == 2 || instr == 3 || instr == 8 ||
-        instr == 10 || instr == 14 || instr == 16 || instr == 17 ||
-        instr == 20 || instr == 21 || instr == 25) return 3;
+    /* Tier 3 (3-bit) — extended strides 8-10 */
+    if (instr >= 300 && instr <= 359) return 3;
 
-    /* Tier 3 (2-bit overhead) — extended strides 4-7 */
-    if (instr >= 140 && instr <= 200) return 2;
-
-    /* Not in hot set — return 0 to signal caller to use default overhead */
+    /* Not in hot set */
     return 0;
 }
 
@@ -135,6 +132,11 @@ static int encodeExt2(int stride, int phase, int op) {
 void applyInstruction(u8 *data, int size, int instr, int amp) {
     int i, stride;
     u8 xval, addval;
+    if (instr >= 600 && instr <= 607) {
+        int k = instr - 599;  /* stride: 600→1, 601→2, ..., 607→8 */
+        for (i = size-1; i >= k; i--) data[i] ^= (data[i-k] >> 4);
+        return;
+    }
     if (instr >= 300) {
         int s, ph, op; decodeExt2(instr, &s, &ph, &op);
         if (op == 0) for (i=ph; i<size; i+=s) data[i] ^= (u8)amp;
@@ -290,6 +292,11 @@ typedef struct { int instr1, amp1, instr2, amp2, instr3, amp3; double net; } Can
 /* (instr, amp) → freq-table parameters; returns 0 for invalid/skip instrs */
 typedef struct { int stride, phase, ptype, pval; } IMap;
 static int imap(int instr, int amp, IMap *m) {
+    if (instr >= 600 && instr <= 607) {
+        if (amp != 0) return 0;
+        int k = instr - 599;
+        m->stride=k; m->phase=0; m->ptype=7; m->pval=k; return 1;
+    }
     if (instr >= 220 && instr <= 222) {
         if (amp != 0) return 0;
         int k = instr-215; m->stride=k; m->phase=0; m->ptype=5; m->pval=k; return 1;
@@ -340,6 +347,9 @@ static int imap(int instr, int amp, IMap *m) {
 }
 
 static double instrOverhead(int instr) {
+    /* Nibble-XOR-delta strides 1-8 (600-607): no amplitude, 5-bit overhead */
+    if (instr >= 600 && instr <= 607) return 5.0;
+
     /* Xor-delta strides 5-7 (220-222): fixed 5-bit overhead (no amplitude) */
     if (instr >= 220 && instr <= 222) return 5.0;
 
@@ -396,6 +406,7 @@ static double FindNextStepST(u8 *data, int size, int *usedInstr, int *usedAmp, i
        Separated from pFreq build so neither scan pollutes the other's cache. */
     int dx[9][256] = {{0}};        /* xor-delta strides 1..8  */
     int da[9][256] = {{0}};        /* add-delta strides 1..8  */
+    int nxd[9][256] = {{0}};       /* nibble-xor-delta: data[i] ^ (data[i-k]>>4), strides 1..8 */
     int compound_freq[256] = {0};
     int compound2_freq[256] = {0}; /* data[i]^data[i-1]^data[i-2] */
     {
@@ -403,15 +414,14 @@ static double FindNextStepST(u8 *data, int size, int *usedInstr, int *usedAmp, i
         for (int i = 0; i < size; i++) {
             u8 b = data[i];
             totalFreq[b]++;
-            if (i>=1) { dx[1][w0^b]++; da[1][(b-w0)&0xFF]++; }
-            if (i>=2) { dx[2][w1^b]++; da[2][(b-w1)&0xFF]++; }
-            if (i>=3) { dx[3][w2^b]++; da[3][(b-w2)&0xFF]++; }
-            if (i>=4) { dx[4][w3^b]++; da[4][(b-w3)&0xFF]++; }
-            if (i>=5) { dx[5][w4^b]++; da[5][(b-w4)&0xFF]++; }
-            if (i>=6) { dx[6][w5^b]++; da[6][(b-w5)&0xFF]++; }
-            if (i>=7) { dx[7][w6^b]++; da[7][(b-w6)&0xFF]++; }
-            if (i>=2) compound2_freq[b^w0^w1]++;
-            if (i>=8) { dx[8][w7^b]++; da[8][(b-w7)&0xFF]++; compound_freq[b^w3^w7]++; }
+            if (i>=1) { dx[1][w0^b]++; da[1][(b-w0)&0xFF]++; nxd[1][b^(w0>>4)]++; }
+            if (i>=2) { dx[2][w1^b]++; da[2][(b-w1)&0xFF]++; nxd[2][b^(w1>>4)]++; compound2_freq[b^w0^w1]++; }
+            if (i>=3) { dx[3][w2^b]++; da[3][(b-w2)&0xFF]++; nxd[3][b^(w2>>4)]++; }
+            if (i>=4) { dx[4][w3^b]++; da[4][(b-w3)&0xFF]++; nxd[4][b^(w3>>4)]++; }
+            if (i>=5) { dx[5][w4^b]++; da[5][(b-w4)&0xFF]++; nxd[5][b^(w4>>4)]++; }
+            if (i>=6) { dx[6][w5^b]++; da[6][(b-w5)&0xFF]++; nxd[6][b^(w5>>4)]++; }
+            if (i>=7) { dx[7][w6^b]++; da[7][(b-w6)&0xFF]++; nxd[7][b^(w6>>4)]++; }
+            if (i>=8) { dx[8][w7^b]++; da[8][(b-w7)&0xFF]++; nxd[8][b^(w7>>4)]++; compound_freq[b^w3^w7]++; }
             w7=w6; w6=w5; w5=w4; w4=w3; w3=w2; w2=w1; w1=w0; w0=b;
         }
     }
@@ -458,8 +468,6 @@ static double FindNextStepST(u8 *data, int size, int *usedInstr, int *usedAmp, i
 
     for (int instr = 0; instr < 32; instr++) {
         if (instr == 5) continue;
-        /* Skip rarely-used instructions */
-        if (instr == 11 || instr == 12 || instr == 13 || instr == 23 || instr == 24 || instr == 29 || instr == 30 || instr == 31) continue;
         double oh = instrOverhead(instr);  /* hoist: constant for all amps */
         for (int amp = 0; amp < 256; amp++) {
             /* map (instr, amp) → stride, phase, permutation type + value */
@@ -545,17 +553,24 @@ static double FindNextStepST(u8 *data, int size, int *usedInstr, int *usedAmp, i
         if (net > bestNet) { bestNet=net; bestE=e; bestInstr=instr_xd; bestAmp=0; }
     }
 
-    /* extended high-precision: strides 4-10, all phases, XOR and ADD.
-       Strides 8-10 give sub-phase precision (each phase splits into two sub-groups at stride 2x).
-       Strides 11-12 excluded: 20-slot encoding can't hold 11-12 phases (overflow = wrong decode). */
-    for (int strd = 4; strd <= 10; strd++) {
+    /* nibble-XOR-delta: data[i] ^= (data[i-k]>>4), strides 1-8.
+       Captures high-nibble correlations between neighboring bytes (instr 600-607). */
+    for (int k = 1; k <= 8; k++) {
+        double e = entropyFromFreq(nxd[k], size-k);
+        double net = (baseE - e)*size - 5.0;
+        if (net > bestNet) { bestNet=net; bestE=e; bestInstr=600+k-1; bestAmp=0; }
+    }
+
+    /* extended high-precision: strides 2-10, all phases, XOR and ADD.
+       Strides 2-3: full 8-bit precision replacements for basic instrs 4,10-13,24-25 at 2-bit overhead.
+       Strides 8-10: sub-phase precision at 3-bit overhead.
+       Strides 11-12 excluded: 20-slot encoding overflows for >10 phases. */
+    for (int strd = 2; strd <= 10; strd++) {
         for (int ph = 0; ph < strd; ph++) {
-            if (strd==7 && ph>=4) continue;
             const int *sp = pFreq[strd-2][ph];
             int diff[256];
             for (int v=0;v<256;v++) diff[v] = totalFreq[v] - sp[v];
             for (int op = 0; op <= 1; op++) {
-                if (strd==4 && op==1 && ph<2) continue;
                 int instr_ext = (strd <= 7) ? encodeExt(strd, ph, op) : encodeExt2(strd, ph, op);
                 double oh = instrOverhead(instr_ext);
                 for (int amp = 1; amp < 256; amp++) {
@@ -713,36 +728,77 @@ static double RunGreedyST(u8 *data, int size, int *hits, InstrSeq *seq, int verb
 
         }
 
-        if (lastInstr == 5) break;
+        /* unified gateway lookahead: deinterleave (instr 5) + delta gateways.
+           Delta gateways increase entropy (undo compression); we deduct that cost so
+           the gain criterion is net improvement over the pre-gateway state. This
+           prevents oscillation: gateway only fires if it finds structure greedy missed. */
+        {
+            /* sumH of current data — baseline for entropy-cost correction */
+            int tf0[256] = {0};
+            for (int j=0; j<size; j++) tf0[data[j]]++;
+            double sBase0 = sumH(tf0);
 
-        /* shallow lookahead: try 16 deinterleave strides, each chain capped at 3 steps */
-        double gains[16] = {0};
-        for (int amp5 = 0; amp5 <= 15; amp5++) {
-            memcpy(laBuf, data, size);
-            applyInstruction(laBuf, size, 5, amp5);
-            double cg = 0.0, cn; int di, da2, steps = 0;
-            while (steps < 3 && (cn = FindNextStepST(laBuf, size, &di, &da2, 0, laFreq)) > 0.0)
-                { cg += cn; steps++; }
-            gains[amp5] = cg - 13.0;
+            int   bestGInstr = -1, bestGAmp = 0;
+            double bestGGain = 0.0;
+
+            /* deinterleave amps 0-15 (permutation: entropy cost = 0) */
+            for (int a5 = 0; a5 <= 15; a5++) {
+                memcpy(laBuf, data, size);
+                applyInstruction(laBuf, size, 5, a5);
+                double cg = 0.0, cn; int di, da2, steps = 0;
+                while (steps < 3 && (cn = FindNextStepST(laBuf, size, &di, &da2, 0, laFreq)) > 0.0)
+                    { cg += cn; steps++; }
+                double gain = cg - instrOverhead(5);
+                if (gain > bestGGain) { bestGGain = gain; bestGInstr = 5; bestGAmp = a5; }
+            }
+
+            /* delta gateways with entropy-cost deduction */
+            static const int kGates[] = {7, 18, 19, 22, 26, 27, 28};
+            for (int gi = 0; gi < 7; gi++) {
+                int g = kGates[gi];
+                memcpy(laBuf, data, size);
+                applyInstruction(laBuf, size, g, 0);
+                /* measure sumH after gateway; delta usually lowers sumH (raises entropy) */
+                int tf2[256] = {0};
+                for (int j=0; j<size; j++) tf2[laBuf[j]]++;
+                double sLa = sumH(tf2);
+                double ecost = (sBase0 > sLa) ? (sBase0 - sLa) : 0.0;
+                double cg = 0.0, cn; int di, da2, steps = 0;
+                while (steps < 3 && (cn = FindNextStepST(laBuf, size, &di, &da2, 0, laFreq)) > 0.0)
+                    { cg += cn; steps++; }
+                double gain = cg - instrOverhead(g) - ecost;
+                if (gain > bestGGain) { bestGGain = gain; bestGInstr = g; bestGAmp = 0; }
+            }
+
+            if (bestGInstr < 0 || bestGGain <= 0.0) break;
+
+            /* apply gateway; for delta gateways deduct entropy increase from total
+               so subsequent re-compression of that entropy isn't counted as new gain */
+            {
+                int tfB[256] = {0};
+                for (int j=0; j<size; j++) tfB[data[j]]++;
+                double sBefore = sumH(tfB);
+                applyInstruction(data, size, bestGInstr, bestGAmp);
+                int tfA[256] = {0};
+                for (int j=0; j<size; j++) tfA[data[j]]++;
+                double sAfter = sumH(tfA);
+                if (sBefore > sAfter) total -= (sBefore - sAfter);
+            }
+            if (seq) InstrSeq_Add(seq, bestGInstr, bestGAmp);
+            if (hits) hits[bestGInstr]++;
+            lastInstr = bestGInstr;
+            if (minReduction && maxReduction && sumReduction) {
+                if (bestGGain < minReduction[bestGInstr]) minReduction[bestGInstr] = bestGGain;
+                if (bestGGain > maxReduction[bestGInstr]) maxReduction[bestGInstr] = bestGGain;
+                sumReduction[bestGInstr] += bestGGain;
+            }
+            if (verbose) {
+                if (bestGInstr == 5)
+                    printf("  Instruction 5 (deinterleave) amp=%d applied, gained %.1f bits\n", bestGAmp, bestGGain);
+                else
+                    printf("  Gateway instr=%d applied, gained %.1f bits\n", bestGInstr, bestGGain);
+            }
         }
-
-        int bestAmp5 = -1; double bestGain5 = 0.0;
-        for (int a = 0; a <= 15; a++)
-            if (gains[a] > bestGain5) { bestGain5 = gains[a]; bestAmp5 = a; }
-
-        if (bestAmp5 < 0 || bestGain5 <= 0.0) break;
-
-        applyInstruction(data, size, 5, bestAmp5);
-        if (seq) InstrSeq_Add(seq, 5, bestAmp5);
-        if (hits) hits[5]++;
-        lastInstr = 5;
-        if (minReduction && maxReduction && sumReduction) {
-            if (bestGain5 < minReduction[5]) minReduction[5] = bestGain5;
-            if (bestGain5 > maxReduction[5]) maxReduction[5] = bestGain5;
-            sumReduction[5] += bestGain5;
-        }
-        if (verbose)
-            printf("  Instruction 5 (deinterleave) amp=%d applied, gained %.1f bits\n", bestAmp5, bestGain5);
     }
 
     free(laFreq); free(laBuf);
@@ -1215,12 +1271,12 @@ void main() {
 
     double *netPerBlock = malloc(NUM_BLOCKS * sizeof(double));
     memset(netPerBlock, 0, NUM_BLOCKS * sizeof(double));
-    int    instrHits[500]   = {0};
-    double instrMinReduction[500];
-    double instrMaxReduction[500];
-    double instrSumReduction[500];
+    int    instrHits[700]   = {0};
+    double instrMinReduction[700];
+    double instrMaxReduction[700];
+    double instrSumReduction[700];
 
-    for (int i = 0; i < 500; i++) {
+    for (int i = 0; i < 700; i++) {
         instrMinReduction[i] = 1e30;
         instrMaxReduction[i] = -1e30;
         instrSumReduction[i] = 0.0;
@@ -1241,12 +1297,12 @@ void main() {
         for (int i = 0; i < BLOCK_SIZE; i++) data[i] = seeded_random_byte();
 
         double totalNet = 0.0;
-        int localHits[500] = {0};
-        double localMinReduction[500];
-        double localMaxReduction[500];
-        double localSumReduction[500];
+        int localHits[700] = {0};
+        double localMinReduction[700];
+        double localMaxReduction[700];
+        double localSumReduction[700];
 
-        for (int i = 0; i < 500; i++) {
+        for (int i = 0; i < 700; i++) {
             localMinReduction[i] = 1e30;
             localMaxReduction[i] = -1e30;
             localSumReduction[i] = 0.0;
@@ -1268,7 +1324,7 @@ void main() {
 
         #pragma omp critical
         {
-            for (int i = 0; i < 500; i++) {
+            for (int i = 0; i < 700; i++) {
                 instrHits[i] += localHits[i];
                 if (localMinReduction[i] < 1e30) {
                     if (localMinReduction[i] < instrMinReduction[i])
@@ -1291,7 +1347,7 @@ void main() {
     }
 
     int totalPasses = 0;
-    for (int i = 0; i < 500; i++) totalPasses += instrHits[i];
+    for (int i = 0; i < 700; i++) totalPasses += instrHits[i];
 
     printf("\n=== %d blocks, %d MB each ===\n", NUM_BLOCKS, BLOCK_SIZE >> 20);
     printf("Elapsed time: %.2f seconds\n", elapsed);
@@ -1329,8 +1385,8 @@ void main() {
         } else
             printf("  xd  s%d:    0 uses  -- NEVER USED\n", ds);
     }
-    /* large extended strides 8-12 (dynamic amp range) */
-    for (int i=300; i<500; i++) {
+    /* extended strides 8-10 */
+    for (int i=300; i<=359; i++) {
         if (instrHits[i] > 0) {
             int s,ph,op; decodeExt2(i,&s,&ph,&op);
             double avg = instrSumReduction[i] / instrHits[i];
@@ -1339,6 +1395,17 @@ void main() {
                    instrHits[i], 100.0*instrHits[i]/totalPasses,
                    instrMinReduction[i], instrMaxReduction[i], avg);
         }
+    }
+    /* nibble-XOR-delta strides 1-8 (instr 600-607) */
+    for (int i=600; i<=607; i++) {
+        if (instrHits[i] > 0) {
+            int k = i-599;
+            double avg = instrSumReduction[i] / instrHits[i];
+            printf("  nxd s%d:  %4d uses  (%5.1f%%)  |  min=%.1f  max=%.1f  avg=%.1f bits\n",
+                   k, instrHits[i], 100.0*instrHits[i]/totalPasses,
+                   instrMinReduction[i], instrMaxReduction[i], avg);
+        } else
+            printf("  nxd s%d:     0 uses  -- NEVER USED\n", i-599);
     }
 
     /* Write first block to binary files */
