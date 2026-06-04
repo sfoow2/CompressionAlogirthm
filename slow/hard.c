@@ -41,6 +41,8 @@ overhead per step = 13 bits (5-bit instr ID + 8-bit amp); no-amp instrs (18,19,2
 17: XOR (amp&0x0F),      packed stride, phase 3
 20: XOR (amp&0x0F)<<4,   packed stride, phase 2
 21: XOR (amp&0x0F)<<4,   packed stride, phase 3
+30: ADD (amp&0x0F)<<4,   packed stride, phase 2   [high nibble, ADD, reverse: low4 = (16-v)&0xF]
+31: ADD (amp&0x0F)<<4,   packed stride, phase 3
 
 --- XOR DELTA, fixed stride (amp=0 only; byte[i] ^= byte[i-stride], right-to-left) ---
 18: xor-delta stride=2
@@ -70,9 +72,7 @@ overhead per step = 13 bits (5-bit instr ID + 8-bit amp); no-amp instrs (18,19,2
 28: delta stride=3
 29: delta stride=4  (RGBA / 4-byte interleaved)
 
---- HIGH PRECISION STRIDE 4, phases 0-1 (full 8-bit amp) ---
-30: ADD amp, stride 4, phase 0   reverse: amp = (256-amp)&0xFF
-31: ADD amp, stride 4, phase 1
+--- (30/31 moved to PACKED STRIDE phases 2-3 section above) ---
 
 
 
@@ -98,11 +98,12 @@ static int getHotInstructionOverhead(int instr) {
     if (instr == 1  || instr == 2  || instr == 3  || instr == 8  ||
         instr == 10 || instr == 11 || instr == 12 || instr == 13 ||
         instr == 14 || instr == 16 || instr == 17 || instr == 24 ||
-        instr == 25 || instr == 30 || instr == 31) return 2;
+        instr == 25) return 2;
     if (instr >= 100 && instr <= 213) return 2;  /* encodeExt strides 2-7, all phases */
 
-    /* Tier 3 (3-bit) — extended strides 8-10 */
+    /* Tier 3 (3-bit) — extended strides 8-10; packed ADD high nibble phases 2/3 */
     if (instr >= 300 && instr <= 359) return 3;
+    if (instr == 30 || instr == 31) return 3;
 
     /* Not in hot set */
     return 0;
@@ -275,12 +276,16 @@ void applyInstruction(u8 *data, int size, int instr, int amp) {
     case 27: for (i=size-1; i>=8; i--) data[i]-=data[i-8]; break; /* add-delta stride=8 */
     case 28: for (i=size-1; i>=7; i--) data[i]-=data[i-7]; break; /* add-delta stride=7 */
     case 29: for (i=size-1; i>=4; i--) data[i]-=data[i-4]; break; /* add-delta stride=4 */
-    case 30:
-        for (i = 0; i < size; i += 4) data[i] += (u8)amp;
-        break;
-    case 31:
-        for (i = 1; i < size; i += 4) data[i] += (u8)amp;
-        break;
+    case 30: {
+        int stride = (amp >> 4) + 2;
+        u8 addval = (u8)((amp & 0x0F) << 4);
+        for (i = 2; i < size; i += stride) data[i] += addval;
+        break; }
+    case 31: {
+        int stride = (amp >> 4) + 2;
+        u8 addval = (u8)((amp & 0x0F) << 4);
+        for (i = 3; i < size; i += stride) data[i] += addval;
+        break; }
     }
 }
 
@@ -339,8 +344,8 @@ static int imap(int instr, int amp, IMap *m) {
     case 27: if (amp!=0) return 0; m->stride=8; m->phase=0; m->ptype=4; m->pval=8; break; /* add-delta stride=8 */
     case 28: if (amp!=0) return 0; m->stride=7; m->phase=0; m->ptype=4; m->pval=7; break; /* add-delta stride=7 */
     case 29: if (amp!=0) return 0; m->stride=4; m->phase=0; m->ptype=4; m->pval=4; break;
-    case 30: m->stride=4;          m->phase=0; m->ptype=1; m->pval=amp;           break;
-    case 31: m->stride=4;          m->phase=1; m->ptype=1; m->pval=amp;           break;
+    case 30: m->stride=(amp>>4)+2; m->phase=2; m->ptype=1; m->pval=(amp&0xF)<<4; break;
+    case 31: m->stride=(amp>>4)+2; m->phase=3; m->ptype=1; m->pval=(amp&0xF)<<4; break;
     default: return 0;
     }
     return 1;
@@ -406,7 +411,6 @@ static double FindNextStepST(u8 *data, int size, int *usedInstr, int *usedAmp, i
        Separated from pFreq build so neither scan pollutes the other's cache. */
     int dx[9][256] = {{0}};        /* xor-delta strides 1..8  */
     int da[9][256] = {{0}};        /* add-delta strides 1..8  */
-    int nxd[9][256] = {{0}};       /* nibble-xor-delta: data[i] ^ (data[i-k]>>4), strides 1..8 */
     int compound_freq[256] = {0};
     int compound2_freq[256] = {0}; /* data[i]^data[i-1]^data[i-2] */
     {
@@ -414,14 +418,14 @@ static double FindNextStepST(u8 *data, int size, int *usedInstr, int *usedAmp, i
         for (int i = 0; i < size; i++) {
             u8 b = data[i];
             totalFreq[b]++;
-            if (i>=1) { dx[1][w0^b]++; da[1][(b-w0)&0xFF]++; nxd[1][b^(w0>>4)]++; }
-            if (i>=2) { dx[2][w1^b]++; da[2][(b-w1)&0xFF]++; nxd[2][b^(w1>>4)]++; compound2_freq[b^w0^w1]++; }
-            if (i>=3) { dx[3][w2^b]++; da[3][(b-w2)&0xFF]++; nxd[3][b^(w2>>4)]++; }
-            if (i>=4) { dx[4][w3^b]++; da[4][(b-w3)&0xFF]++; nxd[4][b^(w3>>4)]++; }
-            if (i>=5) { dx[5][w4^b]++; da[5][(b-w4)&0xFF]++; nxd[5][b^(w4>>4)]++; }
-            if (i>=6) { dx[6][w5^b]++; da[6][(b-w5)&0xFF]++; nxd[6][b^(w5>>4)]++; }
-            if (i>=7) { dx[7][w6^b]++; da[7][(b-w6)&0xFF]++; nxd[7][b^(w6>>4)]++; }
-            if (i>=8) { dx[8][w7^b]++; da[8][(b-w7)&0xFF]++; nxd[8][b^(w7>>4)]++; compound_freq[b^w3^w7]++; }
+            if (i>=1) { dx[1][w0^b]++; da[1][(b-w0)&0xFF]++; }
+            if (i>=2) { dx[2][w1^b]++; da[2][(b-w1)&0xFF]++; compound2_freq[b^w0^w1]++; }
+            if (i>=3) { dx[3][w2^b]++; da[3][(b-w2)&0xFF]++; }
+            if (i>=4) { dx[4][w3^b]++; da[4][(b-w3)&0xFF]++; }
+            if (i>=5) { dx[5][w4^b]++; da[5][(b-w4)&0xFF]++; }
+            if (i>=6) { dx[6][w5^b]++; da[6][(b-w5)&0xFF]++; }
+            if (i>=7) { dx[7][w6^b]++; da[7][(b-w6)&0xFF]++; }
+            if (i>=8) { dx[8][w7^b]++; da[8][(b-w7)&0xFF]++; compound_freq[b^w3^w7]++; }
             w7=w6; w6=w5; w5=w4; w4=w3; w3=w2; w2=w1; w1=w0; w0=b;
         }
     }
@@ -468,6 +472,8 @@ static double FindNextStepST(u8 *data, int size, int *usedInstr, int *usedAmp, i
 
     for (int instr = 0; instr < 32; instr++) {
         if (instr == 5) continue;
+        /* 30/31 evaluated after the extended loop so extended instructions win ties */
+        if (instr == 30 || instr == 31) continue;
         double oh = instrOverhead(instr);  /* hoist: constant for all amps */
         for (int amp = 0; amp < 256; amp++) {
             /* map (instr, amp) → stride, phase, permutation type + value */
@@ -502,8 +508,8 @@ static double FindNextStepST(u8 *data, int size, int *usedInstr, int *usedAmp, i
             case 27: if (amp!=0) continue; stride=8; phase=0; ptype=4; pval=8; break;
             case 28: if (amp!=0) continue; stride=7; phase=0; ptype=4; pval=7; break;
             case 29: if (amp!=0) continue; stride=4; phase=0; ptype=4; pval=4; break;
-            case 30: stride=4;          phase=0; ptype=1; pval=amp;           break;
-            case 31: stride=4;          phase=1; ptype=1; pval=amp;           break;
+            case 30: stride=(amp>>4)+2; phase=2; ptype=1; pval=(amp&0xF)<<4; break;
+            case 31: stride=(amp>>4)+2; phase=3; ptype=1; pval=(amp&0xF)<<4; break;
             default: continue;
             }
 
@@ -553,14 +559,6 @@ static double FindNextStepST(u8 *data, int size, int *usedInstr, int *usedAmp, i
         if (net > bestNet) { bestNet=net; bestE=e; bestInstr=instr_xd; bestAmp=0; }
     }
 
-    /* nibble-XOR-delta: data[i] ^= (data[i-k]>>4), strides 1-8.
-       Captures high-nibble correlations between neighboring bytes (instr 600-607). */
-    for (int k = 1; k <= 8; k++) {
-        double e = entropyFromFreq(nxd[k], size-k);
-        double net = (baseE - e)*size - 5.0;
-        if (net > bestNet) { bestNet=net; bestE=e; bestInstr=600+k-1; bestAmp=0; }
-    }
-
     /* extended high-precision: strides 2-10, all phases, XOR and ADD.
        Strides 2-3: full 8-bit precision replacements for basic instrs 4,10-13,24-25 at 2-bit overhead.
        Strides 8-10: sub-phase precision at 3-bit overhead.
@@ -582,6 +580,30 @@ static double FindNextStepST(u8 *data, int size, int *usedInstr, int *usedAmp, i
                                          bestE = log2((double)size) - Snf/size; }
                 }
             }
+        }
+    }
+
+    /* instrs 30/31: ADD high nibble phases 2/3, packed stride — evaluated after extended so
+       extended instructions win ties (same net → extended preferred as more flexible) */
+    {
+        double oh30 = instrOverhead(30), oh31 = instrOverhead(31);
+        for (int amp = 1; amp < 256; amp++) {
+            if ((amp & 0x0F) == 0) continue;  /* pval=0 → identity */
+            int stride = (amp >> 4) + 2;
+            int pval   = (amp & 0x0F) << 4;
+            const int *sp2 = pFreq[stride - 2][2 % stride];
+            const int *sp3 = pFreq[stride - 2][3 % stride];
+            double Snf2 = 0.0, Snf3 = 0.0;
+            for (int v = 0; v < 256; v++) {
+                Snf2 += h_table[totalFreq[v] - sp2[v] + sp2[(v-pval)&0xFF]];
+                Snf3 += h_table[totalFreq[v] - sp3[v] + sp3[(v-pval)&0xFF]];
+            }
+            double net2 = Snf2 - Sbase - oh30;
+            double net3 = Snf3 - Sbase - oh31;
+            if (net2 > bestNet) { bestNet=net2; bestInstr=30; bestAmp=amp;
+                                  bestE = log2((double)size) - Snf2/size; }
+            if (net3 > bestNet) { bestNet=net3; bestInstr=31; bestAmp=amp;
+                                  bestE = log2((double)size) - Snf3/size; }
         }
     }
 
@@ -610,6 +632,11 @@ static double FindNextStepST(u8 *data, int size, int *usedInstr, int *usedAmp, i
             int s, ph, op; decodeExt(bestInstr, &s, &ph, &op);
             printf("  %s s%dp%d amp=%3d | entropy %.6f -> %.6f | saved=%.1f  net=%.1f bits\n",
                    op?"ADD":"XOR", s, ph, bestAmp, baseE, bestE, sv, bestNet);
+        } else if (bestInstr == 30 || bestInstr == 31) {
+            int s = (bestAmp >> 4) + 2, ph = (bestInstr == 30) ? 2 : 3;
+            int v = (bestAmp & 0x0F) << 4;
+            printf("  ADD s%dp%d+%d amp=%3d | entropy %.6f -> %.6f | saved=%.1f  net=%.1f bits\n",
+                   s, ph, v, bestAmp, baseE, bestE, sv, bestNet);
         } else {
             printf("  instr=%2d amp=%3d | entropy %.6f -> %.6f | saved=%.1f  net=%.1f bits\n",
                    bestInstr, bestAmp, baseE, bestE, sv, bestNet);
@@ -733,15 +760,11 @@ static double RunGreedyST(u8 *data, int size, int *hits, InstrSeq *seq, int verb
            the gain criterion is net improvement over the pre-gateway state. This
            prevents oscillation: gateway only fires if it finds structure greedy missed. */
         {
-            /* sumH of current data — baseline for entropy-cost correction */
-            int tf0[256] = {0};
-            for (int j=0; j<size; j++) tf0[data[j]]++;
-            double sBase0 = sumH(tf0);
-
             int   bestGInstr = -1, bestGAmp = 0;
             double bestGGain = 0.0;
 
-            /* deinterleave amps 0-15 (permutation: entropy cost = 0) */
+            /* deinterleave amps 0-15 (permutation: no entropy cost).
+               Depth=2: two lookahead steps balance quality vs speed. */
             for (int a5 = 0; a5 <= 15; a5++) {
                 memcpy(laBuf, data, size);
                 applyInstruction(laBuf, size, 5, a5);
@@ -752,38 +775,9 @@ static double RunGreedyST(u8 *data, int size, int *hits, InstrSeq *seq, int verb
                 if (gain > bestGGain) { bestGGain = gain; bestGInstr = 5; bestGAmp = a5; }
             }
 
-            /* delta gateways with entropy-cost deduction */
-            static const int kGates[] = {7, 18, 19, 22, 26, 27, 28};
-            for (int gi = 0; gi < 7; gi++) {
-                int g = kGates[gi];
-                memcpy(laBuf, data, size);
-                applyInstruction(laBuf, size, g, 0);
-                /* measure sumH after gateway; delta usually lowers sumH (raises entropy) */
-                int tf2[256] = {0};
-                for (int j=0; j<size; j++) tf2[laBuf[j]]++;
-                double sLa = sumH(tf2);
-                double ecost = (sBase0 > sLa) ? (sBase0 - sLa) : 0.0;
-                double cg = 0.0, cn; int di, da2, steps = 0;
-                while (steps < 3 && (cn = FindNextStepST(laBuf, size, &di, &da2, 0, laFreq)) > 0.0)
-                    { cg += cn; steps++; }
-                double gain = cg - instrOverhead(g) - ecost;
-                if (gain > bestGGain) { bestGGain = gain; bestGInstr = g; bestGAmp = 0; }
-            }
-
             if (bestGInstr < 0 || bestGGain <= 0.0) break;
 
-            /* apply gateway; for delta gateways deduct entropy increase from total
-               so subsequent re-compression of that entropy isn't counted as new gain */
-            {
-                int tfB[256] = {0};
-                for (int j=0; j<size; j++) tfB[data[j]]++;
-                double sBefore = sumH(tfB);
-                applyInstruction(data, size, bestGInstr, bestGAmp);
-                int tfA[256] = {0};
-                for (int j=0; j<size; j++) tfA[data[j]]++;
-                double sAfter = sumH(tfA);
-                if (sBefore > sAfter) total -= (sBefore - sAfter);
-            }
+            applyInstruction(data, size, bestGInstr, bestGAmp);
             if (seq) InstrSeq_Add(seq, bestGInstr, bestGAmp);
             if (hits) hits[bestGInstr]++;
             lastInstr = bestGInstr;
@@ -1395,17 +1389,6 @@ void main() {
                    instrHits[i], 100.0*instrHits[i]/totalPasses,
                    instrMinReduction[i], instrMaxReduction[i], avg);
         }
-    }
-    /* nibble-XOR-delta strides 1-8 (instr 600-607) */
-    for (int i=600; i<=607; i++) {
-        if (instrHits[i] > 0) {
-            int k = i-599;
-            double avg = instrSumReduction[i] / instrHits[i];
-            printf("  nxd s%d:  %4d uses  (%5.1f%%)  |  min=%.1f  max=%.1f  avg=%.1f bits\n",
-                   k, instrHits[i], 100.0*instrHits[i]/totalPasses,
-                   instrMinReduction[i], instrMaxReduction[i], avg);
-        } else
-            printf("  nxd s%d:     0 uses  -- NEVER USED\n", i-599);
     }
 
     /* Write first block to binary files */
