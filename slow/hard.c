@@ -121,9 +121,26 @@ static int encodeExt(int stride, int phase, int op) {
     return 100 + (stride-2)*20 + phase*2 + op;
 }
 
+/* Extended large strides: instr = 300 + (stride-8)*20 + phase*2 + op
+   op: 0=XOR, 1=ADD.  Strides 8-12 phases 0..stride-1.  Overhead = 17 bits.
+   Equivalent to "2-amp" at stride/2 — uses sub-phase precision already in pFreq. */
+static void decodeExt2(int instr, int *stride, int *phase, int *op) {
+    int off = instr - 300;
+    *stride = off/20 + 8; *phase = (off%20)/2; *op = off%2;
+}
+static int encodeExt2(int stride, int phase, int op) {
+    return 300 + (stride-8)*20 + phase*2 + op;
+}
+
 void applyInstruction(u8 *data, int size, int instr, int amp) {
     int i, stride;
     u8 xval, addval;
+    if (instr >= 300) {
+        int s, ph, op; decodeExt2(instr, &s, &ph, &op);
+        if (op == 0) for (i=ph; i<size; i+=s) data[i] ^= (u8)amp;
+        else         for (i=ph; i<size; i+=s) data[i] += (u8)amp;
+        return;
+    }
     if (instr >= 220 && instr <= 222) { /* xor-delta strides 5,6,7 */
         int k = instr - 215; /* 220→5, 221→6, 222→7 */
         for (i=size-1; i>=k; i--) data[i] ^= data[i-k];
@@ -277,6 +294,10 @@ static int imap(int instr, int amp, IMap *m) {
         if (amp != 0) return 0;
         int k = instr-215; m->stride=k; m->phase=0; m->ptype=5; m->pval=k; return 1;
     }
+    if (instr >= 300) {
+        int s, ph, op; decodeExt2(instr, &s, &ph, &op);
+        m->stride=s; m->phase=ph; m->ptype=op; m->pval=amp; return 1;
+    }
     if (instr >= 100) {
         int s, ph, op; decodeExt(instr, &s, &ph, &op);
         m->stride=s; m->phase=ph; m->ptype=op; m->pval=amp; return 1;
@@ -334,6 +355,7 @@ static double instrOverhead(int instr) {
     if (instr < 100) return 13.0;
 
     /* Extended per-phase: 15 bits (4-bit stride + 4-bit phase + 1-bit op + 8-bit amp) */
+    if (instr >= 300) return 17.0;  /* large extended strides 8-12 */
     return 15.0;
 }
 
@@ -523,18 +545,19 @@ static double FindNextStepST(u8 *data, int size, int *usedInstr, int *usedAmp, i
         if (net > bestNet) { bestNet=net; bestE=e; bestInstr=instr_xd; bestAmp=0; }
     }
 
-    /* extended high-precision: strides 4-7, all phases, XOR and ADD */
-    for (int strd = 4; strd <= 7; strd++) {
+    /* extended high-precision: strides 4-10, all phases, XOR and ADD.
+       Strides 8-10 give sub-phase precision (each phase splits into two sub-groups at stride 2x).
+       Strides 11-12 excluded: 20-slot encoding can't hold 11-12 phases (overflow = wrong decode). */
+    for (int strd = 4; strd <= 10; strd++) {
         for (int ph = 0; ph < strd; ph++) {
             if (strd==7 && ph>=4) continue;
             const int *sp = pFreq[strd-2][ph];
-            /* diff[v] = totalFreq[v] - sp[v], precomputed once for all 255×2 amps */
             int diff[256];
             for (int v=0;v<256;v++) diff[v] = totalFreq[v] - sp[v];
             for (int op = 0; op <= 1; op++) {
                 if (strd==4 && op==1 && ph<2) continue;
-                int instr_ext = encodeExt(strd, ph, op);
-                double oh = instrOverhead(instr_ext);  /* constant for all amps */
+                int instr_ext = (strd <= 7) ? encodeExt(strd, ph, op) : encodeExt2(strd, ph, op);
+                double oh = instrOverhead(instr_ext);
                 for (int amp = 1; amp < 256; amp++) {
                     double Snf = 0.0;
                     if (op==0) { for (int v=0;v<256;v++) Snf += h_table[diff[v]+sp[v^amp]]; }
@@ -674,7 +697,8 @@ static double RunGreedyST(u8 *data, int size, int *hits, InstrSeq *seq, int verb
     u8  *laBuf = malloc(size);
 
     for (;;) {
-        /* greedy until stall */
+        /* greedy until stall; after each winner, try continuation amps for same
+           extended instruction at 8-bit overhead (just the extra amp, no re-encoding) */
         while ((net = FindNextStepST(data, size, &instr, &amp, verbose, pFreq)) > 0.0) {
             total += net;
             if (hits) hits[instr]++;
@@ -686,6 +710,7 @@ static double RunGreedyST(u8 *data, int size, int *hits, InstrSeq *seq, int verb
                 if (net > maxReduction[instr]) maxReduction[instr] = net;
                 sumReduction[instr] += net;
             }
+
         }
 
         if (lastInstr == 5) break;
@@ -1183,19 +1208,19 @@ void main() {
 
     int NUM_CORES = get_num_cores();
     omp_set_max_active_levels(2);  /* allow one level of nested parallelism for lookahead */
-    const int NUM_BLOCKS  = 100;
+    const int NUM_BLOCKS  = 1;
     const int BLOCK_SIZE  = 4096;
     const uint32_t SEED   = 42;
     const int NUM_THREADS = (NUM_BLOCKS < NUM_CORES) ? NUM_BLOCKS : NUM_CORES;
 
     double *netPerBlock = malloc(NUM_BLOCKS * sizeof(double));
     memset(netPerBlock, 0, NUM_BLOCKS * sizeof(double));
-    int    instrHits[300]   = {0};
-    double instrMinReduction[300];
-    double instrMaxReduction[300];
-    double instrSumReduction[300];
+    int    instrHits[500]   = {0};
+    double instrMinReduction[500];
+    double instrMaxReduction[500];
+    double instrSumReduction[500];
 
-    for (int i = 0; i < 300; i++) {
+    for (int i = 0; i < 500; i++) {
         instrMinReduction[i] = 1e30;
         instrMaxReduction[i] = -1e30;
         instrSumReduction[i] = 0.0;
@@ -1216,12 +1241,12 @@ void main() {
         for (int i = 0; i < BLOCK_SIZE; i++) data[i] = seeded_random_byte();
 
         double totalNet = 0.0;
-        int localHits[300] = {0};
-        double localMinReduction[300];
-        double localMaxReduction[300];
-        double localSumReduction[300];
+        int localHits[500] = {0};
+        double localMinReduction[500];
+        double localMaxReduction[500];
+        double localSumReduction[500];
 
-        for (int i = 0; i < 300; i++) {
+        for (int i = 0; i < 500; i++) {
             localMinReduction[i] = 1e30;
             localMaxReduction[i] = -1e30;
             localSumReduction[i] = 0.0;
@@ -1243,7 +1268,7 @@ void main() {
 
         #pragma omp critical
         {
-            for (int i = 0; i < 300; i++) {
+            for (int i = 0; i < 500; i++) {
                 instrHits[i] += localHits[i];
                 if (localMinReduction[i] < 1e30) {
                     if (localMinReduction[i] < instrMinReduction[i])
@@ -1266,7 +1291,7 @@ void main() {
     }
 
     int totalPasses = 0;
-    for (int i = 0; i < 300; i++) totalPasses += instrHits[i];
+    for (int i = 0; i < 500; i++) totalPasses += instrHits[i];
 
     printf("\n=== %d blocks, %d MB each ===\n", NUM_BLOCKS, BLOCK_SIZE >> 20);
     printf("Elapsed time: %.2f seconds\n", elapsed);
@@ -1304,11 +1329,15 @@ void main() {
         } else
             printf("  xd  s%d:    0 uses  -- NEVER USED\n", ds);
     }
-    for (int i=250; i<=281; i++) {
+    /* large extended strides 8-12 (dynamic amp range) */
+    for (int i=300; i<500; i++) {
         if (instrHits[i] > 0) {
-            int strd=(i-250)/2+2, op=(i-250)%2;
-            printf("  %s sweep s%2d: %4d uses (%5.1f%%)\n",
-                   op?"ADD":"XOR", strd, instrHits[i], 100.0*instrHits[i]/totalPasses);
+            int s,ph,op; decodeExt2(i,&s,&ph,&op);
+            double avg = instrSumReduction[i] / instrHits[i];
+            printf("  %s s%2dp%d: %4d uses  (%5.1f%%)  |  min=%.1f  max=%.1f  avg=%.1f bits\n",
+                   op?"ADD":"XOR", s, ph,
+                   instrHits[i], 100.0*instrHits[i]/totalPasses,
+                   instrMinReduction[i], instrMaxReduction[i], avg);
         }
     }
 
