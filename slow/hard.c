@@ -7,6 +7,7 @@
 #include <omp.h>
 #include <windows.h>
 #include <bcrypt.h>
+#include <zlib.h>
 
 typedef uint8_t u8;
 
@@ -1520,7 +1521,7 @@ void main() {
         }
     }
 
-    /* Write first block to binary files (Huffman + delta-compressed instructions) */
+    /* Write first block to binary files (RLE + delta-compressed instructions) */
     if (firstBlockData && firstBlockSeq->count > 0) {
         FILE *f = fopen("data.bin", "wb");
         if (f) {
@@ -1533,83 +1534,79 @@ void main() {
 
         f = fopen("instructions.bin", "wb");
         if (f) {
-            /* Build frequency table for Huffman */
-            int freq[256] = {0};
-            for (int i = 0; i < firstBlockSeq->count; i++) {
-                int instr = firstBlockSeq->data[i * 2];
-                freq[instr]++;
-            }
+            /* Try both RLE and plain delta, use whichever is smaller */
+            u8 rle_packed[2000], plain_packed[2000];
+            int rle_pos = 0, plain_pos = 0;
+            int rle_groups = 0;
 
-            /* Simple code: most frequent 16 get 4-bit codes, next 32 get 6-bit, rest 8-bit */
-            u8 bitlen[256];
-            for (int i = 0; i < 256; i++) bitlen[i] = (freq[i] == 0) ? 0 : 8;
-
-            /* Find top 16 and assign 4 bits */
-            int topCount = 0;
-            for (int rank = 0; rank < 256 && topCount < 16; rank++) {
-                int maxFreq = 0, maxIdx = -1;
-                for (int i = 0; i < 256; i++) {
-                    if (bitlen[i] == 8 && freq[i] > maxFreq) {
-                        maxFreq = freq[i];
-                        maxIdx = i;
-                    }
-                }
-                if (maxIdx >= 0) {
-                    bitlen[maxIdx] = 4;
-                    topCount++;
-                }
-            }
-
-            /* Find next 32 and assign 6 bits */
-            topCount = 0;
-            for (int rank = 0; rank < 256 && topCount < 32; rank++) {
-                int maxFreq = 0, maxIdx = -1;
-                for (int i = 0; i < 256; i++) {
-                    if (bitlen[i] == 8 && freq[i] > maxFreq) {
-                        maxFreq = freq[i];
-                        maxIdx = i;
-                    }
-                }
-                if (maxIdx >= 0) {
-                    bitlen[maxIdx] = 6;
-                    topCount++;
-                }
-            }
-
-            /* Write code table: count + [instr(8) + bitlen(4)] for non-zero freqs */
-            u8 packed[2000];
-            int packPos = 0;
-            packed[packPos++] = (u8)firstBlockSeq->count;
-
-            int tableSize = 0;
-            for (int i = 0; i < 256; i++) if (bitlen[i] > 0) tableSize++;
-            packed[packPos++] = (u8)tableSize;
-
-            for (int i = 0; i < 256; i++) {
-                if (bitlen[i] > 0) {
-                    packed[packPos++] = (u8)i;
-                    packed[packPos++] = bitlen[i];
-                }
-            }
-
-            /* Encode instructions (simple: just store as-is for now, Huffman encoding is complex) */
+            /* RLE + delta version */
+            rle_packed[rle_pos++] = (u8)firstBlockSeq->count;
             int prevAmp = 128;
+
+            for (int i = 0; i < firstBlockSeq->count; ) {
+                int instr = firstBlockSeq->data[i * 2];
+                int runLen = 1;
+
+                while (i + runLen < firstBlockSeq->count &&
+                       firstBlockSeq->data[(i + runLen) * 2] == instr &&
+                       runLen < 255) {
+                    runLen++;
+                }
+
+                if (runLen > 1) {
+                    rle_packed[rle_pos++] = 0xFF;
+                    rle_packed[rle_pos++] = (u8)runLen;
+                    rle_packed[rle_pos++] = (u8)instr;
+                    rle_groups++;
+
+                    if (!hasNoAmp(instr)) {
+                        for (int j = 0; j < runLen; j++) {
+                            int amp = firstBlockSeq->data[(i + j) * 2 + 1];
+                            int delta = amp - prevAmp;
+                            rle_packed[rle_pos++] = (u8)delta;
+                            prevAmp = amp;
+                        }
+                    }
+                } else {
+                    rle_packed[rle_pos++] = (u8)instr;
+                    if (!hasNoAmp(instr)) {
+                        int amp = firstBlockSeq->data[i * 2 + 1];
+                        int delta = amp - prevAmp;
+                        rle_packed[rle_pos++] = (u8)delta;
+                        prevAmp = amp;
+                    }
+                }
+
+                i += runLen;
+            }
+
+            /* Plain delta version (no RLE) */
+            plain_packed[plain_pos++] = (u8)firstBlockSeq->count;
+            prevAmp = 128;
+
             for (int i = 0; i < firstBlockSeq->count; i++) {
                 int instr = firstBlockSeq->data[i * 2];
                 int amp = firstBlockSeq->data[i * 2 + 1];
-                packed[packPos++] = (u8)instr;
+                plain_packed[plain_pos++] = (u8)instr;
+
                 if (!hasNoAmp(instr)) {
                     int delta = amp - prevAmp;
-                    packed[packPos++] = (u8)delta;
+                    plain_packed[plain_pos++] = (u8)delta;
                     prevAmp = amp;
                 }
             }
 
-            fwrite(packed, 1, packPos, f);
+            /* Use smaller version */
+            int useRLE = rle_pos <= plain_pos;
+            u8 *final_packed = useRLE ? rle_packed : plain_packed;
+            int final_size = useRLE ? rle_pos : plain_pos;
+
+            fwrite(final_packed, 1, final_size, f);
             fclose(f);
-            double instrEntropy = getEntropy(packed, packPos);
-            printf("Wrote %d Huffman-coded instructions (%d bytes: %d table + %d data) to instructions.bin  |  Entropy: %.6f bits/byte\n",
-                   firstBlockSeq->count, packPos, packPos - (firstBlockSeq->count * 2), firstBlockSeq->count * 2, instrEntropy);
+            double instrEntropy = getEntropy(final_packed, final_size);
+            printf("Wrote %d instructions (%d bytes: %s) to instructions.bin  |  Entropy: %.6f bits/byte\n",
+                   firstBlockSeq->count, final_size,
+                   useRLE ? "RLE+delta" : "plain-delta", instrEntropy);
         }
     }
 
