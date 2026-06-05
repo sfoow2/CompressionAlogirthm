@@ -12,6 +12,198 @@
 
 typedef uint8_t u8;
 
+/* ============ ORDER-1 ADAPTIVE ARITHMETIC CODER ============ */
+
+typedef struct {
+    uint32_t low, range;
+    u8 *output;
+    int output_pos;
+    int output_cap;
+} RangeEncoder;
+
+typedef struct {
+    uint32_t low, range;
+    const u8 *input;
+    int input_pos;
+    uint32_t value;
+} RangeDecoder;
+
+static uint32_t f1[256][256];   /* frequency[context][symbol] */
+static uint32_t c1[256][257];   /* cumulative[context] */
+
+static void rebuild_cumulative(int ctx) {
+    c1[ctx][0] = 0;
+    for (int i = 0; i < 256; i++) {
+        c1[ctx][i + 1] = c1[ctx][i] + f1[ctx][i];
+    }
+}
+
+static void init_model() {
+    for (int c = 0; c < 256; c++) {
+        for (int s = 0; s < 256; s++) {
+            f1[c][s] = 1;  /* uniform pseudocount */
+        }
+        rebuild_cumulative(c);
+    }
+}
+
+static void rc_init_encode(RangeEncoder *rc, u8 *output, int cap) {
+    rc->low = 0;
+    rc->range = 0xFFFFFFFFu;
+    rc->output = output;
+    rc->output_pos = 0;
+    rc->output_cap = cap;
+}
+
+static void rc_norm(RangeEncoder *rc) {
+    while (rc->range < (1u << 24)) {
+        if (rc->output_pos >= rc->output_cap) return;
+        rc->output[rc->output_pos++] = (u8)(rc->low >> 24);
+        rc->low <<= 8;
+        rc->range <<= 8;
+    }
+}
+
+static void rc_finish(RangeEncoder *rc) {
+    for (int i = 0; i < 4; i++) {
+        if (rc->output_pos >= rc->output_cap) return;
+        rc->output[rc->output_pos++] = (u8)(rc->low >> 24);
+        rc->low <<= 8;
+    }
+}
+
+static void encode_symbol(RangeEncoder *rc, u8 s, u8 ctx) {
+    uint32_t total = c1[ctx][256];
+    uint64_t r = rc->range;
+    uint32_t lo = c1[ctx][s];
+    uint32_t hi = c1[ctx][s + 1];
+
+    rc->low += (uint32_t)((r * lo) / total);
+    rc->range = (uint32_t)((r * (hi - lo)) / total);
+
+    rc_norm(rc);
+
+    f1[ctx][s]++;
+    rebuild_cumulative(ctx);
+}
+
+static void rc_init_decode(RangeDecoder *rc, const u8 *input, int size) {
+    rc->low = 0;
+    rc->range = 0xFFFFFFFFu;
+    rc->input = input;
+    rc->input_pos = 0;
+    rc->value = 0;
+    for (int i = 0; i < 4 && i < size; i++) {
+        rc->value = (rc->value << 8) | input[i];
+    }
+    rc->input_pos = 4;
+}
+
+static void rc_norm_decode(RangeDecoder *rc, int size) {
+    while (rc->range < (1u << 24)) {
+        rc->value = (rc->value << 8);
+        if (rc->input_pos < size) {
+            rc->value |= rc->input[rc->input_pos++];
+        }
+        rc->low <<= 8;
+        rc->range <<= 8;
+    }
+}
+
+/* Decompress fixed-frequency arithmetic (rebuild model identically) */
+static int decompressFixedFrequencyArithmetic(const u8 *input, int size, u8 *output, int output_size) {
+    /* Read sparse frequency table header (2 bytes for entry count + entries) */
+    int in_pos = 2;
+    int entry_count = ((int)input[0] << 8) | input[1];
+    in_pos += entry_count * 4;  /* Each entry: 4 bytes (ctx, symbol, freq_hi, freq_lo) */
+
+    if (in_pos >= size) return -1;
+
+    /* Rebuild frequency table from entries (same as encoder) */
+    uint32_t freq[256][256];
+    memset(freq, 0, sizeof(freq));
+
+    int entry_idx = 2;
+    for (int i = 0; i < entry_count && i < 1000; i++) {
+        if (entry_idx + 3 >= size) break;
+        u8 ctx = input[entry_idx++];
+        u8 sym = input[entry_idx++];
+        uint32_t f = ((uint32_t)input[entry_idx] << 8) | input[entry_idx + 1];
+        entry_idx += 2;
+        if (ctx < 256 && sym < 256) {
+            freq[ctx][sym] = f;
+        }
+    }
+
+    /* Convert to cumulative frequencies */
+    uint32_t cum[256][257];
+    for (int c = 0; c < 256; c++) {
+        cum[c][0] = 0;
+        for (int s = 0; s < 256; s++) {
+            cum[c][s+1] = cum[c][s] + freq[c][s];
+        }
+    }
+
+    /* Decode with fixed model */
+    RangeDecoder rc;
+    rc_init_decode(&rc, input + in_pos, size - in_pos);
+
+    u8 ctx = 0;
+    int out_pos = 0;
+    while (out_pos < output_size && rc.input_pos < size - in_pos) {
+        u8 s = 0;
+        uint32_t total = cum[ctx][256];
+        uint64_t r = rc.range;
+        uint32_t scaled = (uint32_t)(((uint64_t)(rc.value - rc.low)) / (r / total + 1));
+
+        for (int i = 0; i < 256; i++) {
+            if (cum[ctx][i + 1] > scaled) {
+                s = i;
+                break;
+            }
+        }
+
+        uint32_t lo = cum[ctx][s];
+        uint32_t hi = cum[ctx][s + 1];
+
+        rc.low += (uint32_t)((r * lo) / total);
+        rc.range = (uint32_t)((r * (hi - lo)) / total);
+        rc_norm_decode(&rc, size - in_pos);
+
+        output[out_pos++] = s;
+        ctx = s;
+    }
+
+    return out_pos;
+}
+
+static u8 decode_symbol(RangeDecoder *rc, u8 ctx, int size) {
+    uint32_t total = c1[ctx][256];
+    uint64_t r = rc->range;
+    uint32_t scaled = (uint32_t)(((uint64_t)(rc->value - rc->low)) / (r / total));
+
+    u8 s = 0;
+    for (int i = 0; i < 256; i++) {
+        if (c1[ctx][i + 1] > scaled) {
+            s = i;
+            break;
+        }
+    }
+
+    uint32_t lo = c1[ctx][s];
+    uint32_t hi = c1[ctx][s + 1];
+
+    rc->low += (uint32_t)((r * lo) / total);
+    rc->range = (uint32_t)((r * (hi - lo)) / total);
+
+    rc_norm_decode(rc, size);
+
+    f1[ctx][s]++;
+    rebuild_cumulative(ctx);
+
+    return s;
+}
+
 double getEntropy(const u8* data, int size) {
     int freq[256] = {0};
     for (int i = 0; i < size; i++) freq[data[i]]++;
@@ -94,33 +286,8 @@ static double h_table[8193];
    Based on empirical runs, these instruction types provide the best cost-benefit trade-off. */
 
 static double getHotInstructionOverhead(int instr) {
-    /* Tier 0.25 — ultra-hot packed + delta strides */
-    if (instr == 0 || instr == 5 || instr == 9 || instr == 15 ||
-        instr == 20 || instr == 21 || instr == 18 || instr == 19 ||
-        instr == 22 || instr == 23 || instr == 26 || instr == 27 ||
-        instr == 28 || instr == 29) return 0.25;
-
-    /* Tier 0.5 — active packed + extended strides 2-7 */
-    if (instr == 1  || instr == 2  || instr == 3  || instr == 8  ||
-        instr == 10 || instr == 11 || instr == 12 || instr == 13 ||
-        instr == 14 || instr == 16 || instr == 17 || instr == 24 ||
-        instr == 25) return 0.5;
-    if (instr >= 100 && instr <= 213) return 0.5;  /* encodeExt strides 2-7, all phases */
-
-    /* Tier 0.75 */
-    if (instr >= 300 && instr <= 359) return 0.75;
-    if (instr == 30 || instr == 31) return 0.75;
-
-    /* Tier 0.5 — encodeExt3 strides 11-14, all phases, both ops */
-    if (instr >= 400 && instr <= 500) return 0.5;
-
-    /* Tier 0.25 — new bit-level and adjacent byte ops (exploratory) */
-    if ((instr >= 50 && instr <= 67)) return 0.25;
-
-    if (instr == 32 || instr == 33) return 99;  /* disabled: high overhead prevents firing */
-
-    /* Not in hot set */
-    return 0;
+    (void)instr;
+    return 0;  /* no hot tiers — all overhead calculated from actual storage cost */
 }
 
 /* Extended high-precision instructions: instr = 100 + (stride-2)*20 + phase*2 + op
@@ -451,56 +618,37 @@ static int imap(int instr, int amp, IMap *m) {
     return 1;
 }
 
+/* Check if instruction uses amplitude parameter */
+static inline int hasNoAmp(int instr) {
+    return (instr == 5 || (instr >= 18 && instr <= 29) || instr == 45 ||
+            instr == 50 || instr == 51 || instr == 52 || instr == 53 ||
+            instr == 54 || instr == 55 || instr == 64 || instr == 65);
+}
+
 static double instrOverhead(int instr) {
-    /* Lookup-table predictor: 256-byte table + 5-bit ID = 2053-bit overhead */
-    if (instr == 45) return 2053.0;
+    /* Lookup-table predictor: 256-byte table + 1-byte ID = 257 bytes = 2056 bits */
+    if (instr == 45) return 2056.0;
 
-    /* Xor-delta strides 5-7 (220-222): fixed 5-bit overhead (no amplitude) */
-    if (instr >= 220 && instr <= 222) return 5.0;
-
-    /* Other no-amp instructions (delta, xor-delta strides 1-4, 8): 5-bit overhead */
-    if (instr == 6 || instr == 7 || (instr >= 18 && instr <= 19) || (instr >= 22 && instr <= 23) ||
-        instr == 26 || instr == 27 || (instr >= 28 && instr <= 29)) return 5.0;
-
-    /* Check tiered hot instruction overheads */
-    double hotOH = getHotInstructionOverhead(instr);
-    if (hotOH > 0.0) return hotOH;
-
-    /* Regular instructions: 13 bits (5-bit instr + 8-bit amp) */
-    if (instr < 100) return 13.0;
-
-    /* Extended per-phase: 15 bits (4-bit stride + 4-bit phase + 1-bit op + 8-bit amp) */
-    if (instr >= 400) return 13.0;  /* encodeExt3: strides 11-17, realistic instr+amp cost */
-    if (instr >= 300) return 3.0;   /* encodeExt2: strides 8-10 (was 17, now 3 to match hot tier) */
-    return 15.0;
+    /* Actual file format cost: 1 byte instruction ID + 1 byte amplitude = 16 bits.
+     * No-amp instructions: 1 byte ID only = 8 bits.
+     * Extended instructions (ID >= 256): need 2 bytes for ID + 1 byte amp = 24 bits. */
+    if (hasNoAmp(instr)) return 8.0;
+    if (instr >= 256) return 24.0;
+    return 16.0;
 }
 
 /* ------------------------------------------------------------------ *
  * Single-threaded step finder — safe to call from any parallel region *
  * scratch is a caller-provided buffer of length `size`               *
  * ------------------------------------------------------------------ */
-/* Sum of h_table[freq[v]] = Σ freq·log2(freq) over the 256 buckets.
-   h_table[0]==0, so no branch needed. Replaces 256 log2 calls with 256
-   table lookups. NOTE: assumes every freq[v] <= 8192 (BLOCK_SIZE bound). */
 static inline double sumH(const int *freq) {
     double s = 0.0;
     for (int v = 0; v < 256; v++) s += h_table[freq[v]];
     return s;
 }
 
-/* Entropy from a pre-built 256-bucket frequency table.
-   Identity: H = log2(N) - (1/N) * Σ freq·log2(freq), computed via h_table
-   so the per-call cost is one log2 + one divide instead of 256 of each. */
 static double entropyFromFreq(const int *freq, int size) {
     return log2((double)size) - sumH(freq) / size;
-}
-
-/* Check if instruction uses amplitude parameter */
-static inline int hasNoAmp(int instr) {
-    /* Instructions that don't use amplitude */
-    return (instr == 5 || (instr >= 18 && instr <= 29) || instr == 45 ||
-            instr == 50 || instr == 51 || instr == 52 || instr == 53 ||
-            instr == 54 || instr == 55 || instr == 64 || instr == 65);
 }
 
 /* ------------------------------------------------------------------ *
@@ -982,6 +1130,7 @@ static double RunGreedyST(u8 *data, int size, int *hits, InstrSeq *seq, int verb
             if (bestGInstr < 0 || bestGGain <= 0.0) break;
 
             applyInstruction(data, size, bestGInstr, bestGAmp);
+            total -= instrOverhead(bestGInstr);  /* deduct storage cost; downstream gains count themselves */
             if (seq) InstrSeq_Add(seq, bestGInstr, bestGAmp);
             if (hits) hits[bestGInstr]++;
             if (minReduction && maxReduction && sumReduction) {
@@ -1455,6 +1604,146 @@ static int get_num_cores(void) {
     return omp_get_num_procs();
 }
 
+/* APPROACH 2: Fixed-frequency with sparse header (only non-zero frequencies) */
+static int compressFixedFrequencyArithmetic(const u8 *data, int size, u8 *output, int output_cap) {
+    /* Build frequency table from data */
+    uint32_t freq[256][256];
+    memset(freq, 0, sizeof(freq));
+
+    u8 ctx = 0;
+    for (int i = 0; i < size; i++) {
+        freq[ctx][data[i]]++;
+        ctx = data[i];
+    }
+
+    /* Store sparse frequency table: (context, symbol, frequency) tuples with proper precision */
+    int out_pos = 0;
+    int entry_count = 0;
+    int entry_pos = out_pos;
+    out_pos += 2;  /* reserve 2 bytes for entry count (max 65535 entries) */
+
+    for (int c = 0; c < 256 && out_pos < output_cap - 1000; c++) {
+        for (int s = 0; s < 256 && out_pos < output_cap - 10; s++) {
+            if (freq[c][s] > 0) {
+                output[out_pos++] = (u8)c;
+                output[out_pos++] = (u8)s;
+                output[out_pos++] = (u8)(freq[c][s] >> 8);   /* High byte */
+                output[out_pos++] = (u8)(freq[c][s] & 0xFF); /* Low byte */
+                entry_count++;
+                if (entry_count > 1000) goto done_table;
+            }
+        }
+    }
+done_table:
+    output[entry_pos] = (u8)(entry_count >> 8);
+    output[entry_pos + 1] = (u8)(entry_count & 0xFF);
+    int header_bytes = out_pos;
+
+    /* Convert to cumulative frequencies */
+    uint32_t cum[256][257];
+    for (int c = 0; c < 256; c++) {
+        cum[c][0] = 0;
+        for (int s = 0; s < 256; s++) {
+            cum[c][s+1] = cum[c][s] + freq[c][s];
+        }
+    }
+
+    /* Encode with fixed model */
+    RangeEncoder rc;
+    rc_init_encode(&rc, output + out_pos, output_cap - out_pos);
+
+    ctx = 0;
+    for (int i = 0; i < size; i++) {
+        u8 s = data[i];
+        uint32_t total = cum[ctx][256];
+        uint64_t r = rc.range;
+        uint32_t lo = cum[ctx][s];
+        uint32_t hi = cum[ctx][s + 1];
+
+        if (total == 0) { rc.output_pos = -1; break; }
+
+        rc.low += (uint32_t)((r * lo) / total);
+        rc.range = (uint32_t)((r * (hi - lo)) / total);
+        rc_norm(&rc);
+
+        ctx = s;
+    }
+    rc_finish(&rc);
+
+    return out_pos + rc.output_pos;
+}
+
+/* APPROACH 3: Order-1 context coding (selective, only strong contexts) */
+static int compressSelectiveContext(const u8 *data, int size, u8 *output, int output_cap) {
+    /* Use the same adaptive model but with smarter model initialization */
+    init_model();
+    RangeEncoder rc;
+    rc_init_encode(&rc, output, output_cap);
+
+    /* Start with less aggressive pseudocount for faster adaptation */
+    for (int c = 0; c < 256; c++) {
+        for (int s = 0; s < 256; s++) {
+            f1[c][s] = 1;  /* Minimal pseudocount */
+        }
+        rebuild_cumulative(c);
+    }
+
+    u8 ctx = 0;
+    for (int i = 0; i < size; i++) {
+        encode_symbol(&rc, data[i], ctx);
+        ctx = data[i];
+    }
+    rc_finish(&rc);
+
+    return rc.output_pos;
+}
+
+/* APPROACH 1 (original): Adaptive arithmetic coder */
+static int compressAdaptiveArithmetic(const u8 *data, int size, u8 *output, int output_cap) {
+    init_model();
+    RangeEncoder rc;
+    rc_init_encode(&rc, output, output_cap);
+
+    u8 ctx = 0;
+    for (int i = 0; i < size; i++) {
+        encode_symbol(&rc, data[i], ctx);
+        ctx = data[i];
+    }
+    rc_finish(&rc);
+
+    return rc.output_pos;
+}
+
+static int compressWithArithmetic(const u8 *data, int size, u8 *output, int output_cap) {
+    init_model();
+    RangeEncoder rc;
+    rc_init_encode(&rc, output, output_cap);
+
+    u8 ctx = 0;
+    for (int i = 0; i < size; i++) {
+        encode_symbol(&rc, data[i], ctx);
+        ctx = data[i];
+    }
+    rc_finish(&rc);
+
+    return rc.output_pos;
+}
+
+static int decompressWithArithmetic(const u8 *input, int size, u8 *output, int output_size) {
+    init_model();
+    RangeDecoder rc;
+    rc_init_decode(&rc, input, size);
+
+    u8 ctx = 0;
+    for (int i = 0; i < output_size; i++) {
+        u8 s = decode_symbol(&rc, ctx, size);
+        output[i] = s;
+        ctx = s;
+    }
+
+    return output_size;
+}
+
 static void analyzeByteDistribution(const u8 *data, int size) {
     int freq[256] = {0};
     int distinctBytes = 0;
@@ -1609,8 +1898,10 @@ void main() {
 
     printf("\n=== %d blocks, %d MB each ===\n", NUM_BLOCKS, BLOCK_SIZE >> 20);
     printf("Elapsed time: %.2f seconds\n", elapsed);
-    printf("Net savings:  min=%.1f  max=%.1f  avg=%.1f bits\n",
+    printf("Net savings (entropy reduction - instrOverhead estimates): min=%.1f  max=%.1f  avg=%.1f bits\n",
            minNet, maxNet, sumNet / NUM_BLOCKS);
+    /* NOTE: actual profit = entropy_reduction - real_instruction_bytes*8
+     * That is shown below in FINAL COMPRESSION VERIFICATION using real file sizes. */
 
     /* Analyze the final compressed data */
     if (firstBlockData) {
@@ -1672,15 +1963,18 @@ void main() {
         }
     }
 
+    u8 *compressed = NULL;
+    int compressed_size = 0;
+
     /* Write first block to binary files (RLE + delta-compressed instructions) */
     if (firstBlockData && firstBlockSeq->count > 0) {
         FILE *f = fopen("data.bin", "wb");
         if (f) {
-            fwrite(firstBlockData, 1, BLOCK_SIZE, f);
+            fwrite(compressed ? compressed : firstBlockData, 1, compressed ? compressed_size : BLOCK_SIZE, f);
             fclose(f);
-            double outputEntropy = getEntropy(firstBlockData, BLOCK_SIZE);
+            double outputEntropy = getEntropy(compressed ? compressed : firstBlockData, compressed ? compressed_size : BLOCK_SIZE);
             printf("\nWrote %d bytes to data.bin  |  Output entropy: %.6f bits/byte\n",
-                   BLOCK_SIZE, outputEntropy);
+                   compressed ? compressed_size : BLOCK_SIZE, outputEntropy);
         }
 
         f = fopen("instructions.bin", "wb");
@@ -1763,7 +2057,55 @@ void main() {
 
     if (firstBlockData) {
         printDiagnostic(firstBlockData, BLOCK_SIZE);
+    }
+
+    /* FINAL SUMMARY WITH ACTUAL FILE MEASUREMENTS */
+    printf("\n=== FINAL COMPRESSION VERIFICATION ===\n");
+    printf("Original block size: %d bytes\n\n", BLOCK_SIZE);
+
+    /* Measure actual file sizes written */
+    FILE *data_file = fopen("data.bin", "rb");
+    FILE *instr_file = fopen("instructions.bin", "rb");
+
+    int actual_data_bytes = 0;
+    int actual_instr_bytes = 0;
+
+    if (data_file) {
+        fseek(data_file, 0, SEEK_END);
+        actual_data_bytes = ftell(data_file);
+        fclose(data_file);
+    }
+    if (instr_file) {
+        fseek(instr_file, 0, SEEK_END);
+        actual_instr_bytes = ftell(instr_file);
+        fclose(instr_file);
+    }
+
+    printf("Actual output sizes:\n");
+    printf("  Instructions file: %d bytes\n", actual_instr_bytes);
+    printf("  Compressed data file: %d bytes\n", actual_data_bytes);
+    printf("  TOTAL OUTPUT: %d bytes\n\n", actual_data_bytes + actual_instr_bytes);
+
+    int total_output = actual_data_bytes + actual_instr_bytes;
+    double bits_saved = (BLOCK_SIZE - total_output) * 8.0;
+
+    printf("Savings:\n");
+    printf("  Original - Output = %d - %d = %d bytes\n", BLOCK_SIZE, total_output, BLOCK_SIZE - total_output);
+    printf("  = %.0f bits\n", bits_saved);
+    printf("  = %.1f%% compression\n\n", 100.0 * (1.0 - (double)total_output / BLOCK_SIZE));
+
+    if (bits_saved >= 750.0) {
+        printf("✓✓✓ GOAL ACHIEVED ✓✓✓\n");
+        printf("Compression: %.0f bits > 750 bits (%.1fx goal)\n", bits_saved, bits_saved / 750.0);
+    } else {
+        printf("Goal progress: %.1f%% (%.0f / 750 bits)\n", 100.0 * bits_saved / 750.0, bits_saved);
+    }
+
+    if (firstBlockData) {
         free(firstBlockData);
+    }
+    if (compressed) {
+        free(compressed);
     }
     InstrSeq_Free(firstBlockSeq);
 }
