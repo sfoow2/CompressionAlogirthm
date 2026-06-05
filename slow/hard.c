@@ -7,7 +7,8 @@
 #include <omp.h>
 #include <windows.h>
 #include <bcrypt.h>
-#include <zlib.h>
+/* #include <zlib.h> */
+#include <limits.h>
 
 typedef uint8_t u8;
 
@@ -112,6 +113,9 @@ static double getHotInstructionOverhead(int instr) {
 
     /* Tier 0.5 — encodeExt3 strides 11-14, all phases, both ops */
     if (instr >= 400 && instr <= 500) return 0.5;
+
+    /* Tier 0.25 — new bit-level and adjacent byte ops (exploratory) */
+    if ((instr >= 50 && instr <= 67)) return 0.25;
 
     if (instr == 32 || instr == 33) return 99;  /* disabled: high overhead prevents firing */
 
@@ -337,6 +341,50 @@ void applyInstruction(u8 *data, int size, int instr, int amp) {
         for (i = 3; i < size; i += stride)
             data[i] = (data[i] & 0xF0) | ((data[i] + addval) & 0x0F);
         break; }
+
+    /* --- BIT-LEVEL XOR: flip specific bit across stride --- */
+    case 50: /* bit 0, stride 2 */
+        for (i = 0; i < size; i += 2) data[i] ^= 0x01; break;
+    case 51: /* bit 1, stride 2 */
+        for (i = 0; i < size; i += 2) data[i] ^= 0x02; break;
+    case 52: /* bit 2-3 mask, stride 2 */
+        for (i = 0; i < size; i += 2) data[i] ^= 0x0C; break;
+    case 53: /* bit 4-5 mask, stride 2 */
+        for (i = 0; i < size; i += 2) data[i] ^= 0x30; break;
+    case 54: /* bit 6-7 mask, stride 2 */
+        for (i = 0; i < size; i += 2) data[i] ^= 0xC0; break;
+    case 55: /* bit 0, stride 3 */
+        for (i = 0; i < size; i += 3) data[i] ^= 0x01; break;
+    case 56: /* bit pattern (amp), stride variable */
+        stride = (amp >> 4) + 2;
+        xval = (u8)(amp & 0x0F) << 4 | (amp & 0x0F);
+        for (i = 0; i < size; i += stride) data[i] ^= xval; break;
+    case 57: /* rotate left by (amp&7) bits, stride 2 */
+        { int rot = amp & 7;
+          for (i = 0; i < size; i += 2) {
+              u8 b = data[i];
+              data[i] = (u8)((b << rot) | (b >> (8-rot)));
+          }
+          break; }
+
+    /* --- ADJACENT BYTE OPERATIONS (reads-ahead only, so reversible) --- */
+    case 58: /* XOR each byte with the byte stride positions ahead; reverse: same op right-to-left */
+        stride = (amp >> 4) + 2;
+        for (i = 0; i < size - stride; i++) data[i] ^= data[i + stride]; break;
+    case 60: /* ADD each byte with the byte stride positions ahead; reverse: SUB right-to-left */
+        stride = (amp >> 4) + 2;
+        for (i = 0; i < size - stride; i++) data[i] += data[i + stride]; break;
+
+    /* --- PERMUTATIONS (self-inverse) --- */
+    case 64: /* byte swap adjacent pairs: apply again to undo */
+        for (i = 0; i < size - 1; i += 2) {
+            u8 t = data[i]; data[i] = data[i+1]; data[i+1] = t;
+        }
+        break;
+    case 65: /* reverse nibbles: apply again to undo */
+        for (i = 0; i < size; i++)
+            data[i] = (u8)(((data[i] & 0x0F) << 4) | ((data[i] >> 4) & 0x0F));
+        break;
     }
 }
 
@@ -447,6 +495,14 @@ static double entropyFromFreq(const int *freq, int size) {
     return log2((double)size) - sumH(freq) / size;
 }
 
+/* Check if instruction uses amplitude parameter */
+static inline int hasNoAmp(int instr) {
+    /* Instructions that don't use amplitude */
+    return (instr == 5 || (instr >= 18 && instr <= 29) || instr == 45 ||
+            instr == 50 || instr == 51 || instr == 52 || instr == 53 ||
+            instr == 54 || instr == 55 || instr == 64 || instr == 65);
+}
+
 /* ------------------------------------------------------------------ *
  * Optimised single-threaded FindNextStep using frequency-table cache  *
  * All instructions are permutations of byte values on a position      *
@@ -457,7 +513,7 @@ static double entropyFromFreq(const int *freq, int size) {
 static double FindNextStepST(u8 *data, int size, int *usedInstr, int *usedAmp, int verbose,
                               int (*pFreq)[17][256]) {
     /* pFreq[s][ph][v] = count of bytes with value v at positions i where   */
-    /* i mod (s+2) == ph. strides 2..17 → s=0..15, max phase index = 16    */
+    /* i mod (s+2) == ph. strides 2..14 → s=0..12, max phase index = 14     */
     int totalFreq[256] = {0};
 
     /* Pass 0: build totalFreq + delta tables — all tiny (≤9×256 ints), stay in L1.
@@ -485,8 +541,7 @@ static double FindNextStepST(u8 *data, int size, int *usedInstr, int *usedAmp, i
 
     /* Passes 1..16: build one pFreq[s] at a time.
        Write set per pass = (s+2)×256×4 bytes = 2–17 KB → stays in L1 cache.
-       Memset only the entries that actually exist for each stride (155 KB total
-       vs 272 KB if the whole array were cleared at once). */
+       Memset only the entries that actually exist for each stride (155 KB total). */
     for (int s = 0; s < 16; s++) {
         memset(pFreq[s], 0, (s+2) * 256 * sizeof(int));
         int ph = 0;
@@ -664,6 +719,40 @@ static double FindNextStepST(u8 *data, int size, int *usedInstr, int *usedAmp, i
     /* Stride-sweep search removed — profiling showed all loc_amps end up 0 for random data
        (per-phase distributions too uniform for any XOR/ADD to beat single-phase instruction) */
 
+    /* NEW INSTRUCTION SET: bit-level and adjacent byte operations (direct evaluation) */
+    {
+        u8 *testbuf = malloc(size);
+
+        /* Test bit-level and adjacent operations */
+        /* Only reversible instructions:
+           50-55: fixed bitmask XOR (self-inverse)
+           56:    variable bitmask XOR with stride (self-inverse)
+           58:    XOR with byte ahead (reads unmodified, inverse=same op right-to-left)
+           60:    ADD with byte ahead (inverse=SUB right-to-left)
+           64:    adjacent pair swap (self-inverse)
+           65:    nibble reverse (self-inverse) */
+        int newInstrs[] = {50, 51, 52, 53, 54, 55, 56, 58, 60, 64, 65};
+        for (int ni = 0; ni < 11; ni++) {
+            int instr = newInstrs[ni];
+            double oh = instrOverhead(instr);
+
+            /* For stride-based new instrs (58,60,56) try multiple amp values */
+            int maxTestAmps = hasNoAmp(instr) ? 1 : 16;
+            for (int testAmp = 0; testAmp < maxTestAmps; testAmp++) {
+                int amp = hasNoAmp(instr) ? 0 : (testAmp * 17) & 0xFF;
+                memcpy(testbuf, data, size);
+                applyInstruction(testbuf, size, instr, amp);
+                double newE = getEntropy(testbuf, size);
+                double net = (baseE - newE) * size - oh;
+                if (net > bestNet) {
+                    bestNet = net; bestInstr = instr; bestAmp = amp;
+                    bestE = newE;
+                }
+            }
+        }
+        free(testbuf);
+    }
+
     /* Buffers freed by caller */
 
     if (bestInstr < 0) {
@@ -708,6 +797,13 @@ static double FindNextStepST(u8 *data, int size, int *usedInstr, int *usedAmp, i
             int v = bestAmp & 0x0F;
             printf("  ADDlo s%dp%d+%d amp=%3d | entropy %.6f -> %.6f | saved=%.1f  net=%.1f bits\n",
                    s, ph, v, bestAmp, baseE, bestE, sv, bestNet);
+        } else if (bestInstr >= 50 && bestInstr <= 67) {
+            const char *names[] = {"BIT0_s2", "BIT1_s2", "BIT2-3_s2", "BIT4-5_s2", "BIT6-7_s2",
+                                    "BIT0_s3", "BITPAT", "ROTL", "XOR_NEXT", "XOR_PREV",
+                                    "ADD_NEXT", "ADD_PREV", "XOR_BOTH", "COND_XOR", "SWAPPAIR", "REVNIB",
+                                    "RLE_MARK", "SWAP_STR"};
+            printf("  %s amp=%3d | entropy %.6f -> %.6f | saved=%.1f  net=%.1f bits\n",
+                   bestInstr < 68 ? names[bestInstr-50] : "???", bestAmp, baseE, bestE, sv, bestNet);
         } else {
             printf("  instr=%2d amp=%3d | entropy %.6f -> %.6f | saved=%.1f  net=%.1f bits\n",
                    bestInstr, bestAmp, baseE, bestE, sv, bestNet);
@@ -769,11 +865,6 @@ typedef struct {
     int count;     /* instruction count */
     int capacity;
 } InstrSeq;
-
-static inline int hasNoAmp(int instr) {
-    /* Instructions that don't use amplitude */
-    return (instr == 5 || (instr >= 18 && instr <= 29) || instr == 45);
-}
 
 static InstrSeq* InstrSeq_Create(int capacity) {
     InstrSeq *seq = malloc(sizeof(InstrSeq));
@@ -1360,8 +1451,62 @@ static void fill_random(u8 *buf, int size) {
     }
 }
 
-static int get_num_cores(void) { 
+static int get_num_cores(void) {
     return omp_get_num_procs();
+}
+
+static void analyzeByteDistribution(const u8 *data, int size) {
+    int freq[256] = {0};
+    int distinctBytes = 0;
+    int minFreq = INT_MAX, maxFreq = 0;
+
+    for (int i = 0; i < size; i++) {
+        freq[data[i]]++;
+    }
+
+    for (int i = 0; i < 256; i++) {
+        if (freq[i] > 0) {
+            distinctBytes++;
+            if (freq[i] < minFreq) minFreq = freq[i];
+            if (freq[i] > maxFreq) maxFreq = freq[i];
+        }
+    }
+
+    double avgFreq = (double)size / distinctBytes;
+    double entropyBitsPerByte = getEntropy(data, size);
+    double bitsPerSymbol = log2((double)distinctBytes);
+    double theoreticalUniformBits = distinctBytes > 0 ? log2((double)distinctBytes) : 0.0;
+
+    printf("\n=== BYTE DISTRIBUTION ANALYSIS ===\n");
+    printf("Data size: %d bytes\n", size);
+    printf("Distinct bytes: %d / 256 (%.1f%% alphabet reduction)\n",
+           distinctBytes, 100.0 * (256 - distinctBytes) / 256);
+    printf("Frequency range: min=%d, max=%d, avg=%.1f\n", minFreq, maxFreq, avgFreq);
+    printf("Entropy: %.3f bits/byte\n", entropyBitsPerByte);
+    printf("Theoretical (uniform on %d bytes): %.3f bits/byte\n", distinctBytes, theoreticalUniformBits);
+
+    /* Potential gains from alphabet reduction */
+    if (distinctBytes < 256) {
+        double headerCost = 32.0;  /* bitmap for 256 bytes */
+        double savedBits = (8.0 - theoreticalUniformBits) * size;
+        double netGain = savedBits - headerCost;
+        printf("Sparse alphabet coding: save ~%.0f bits (header ~32 bytes cost)\n", netGain);
+    }
+
+    /* Show most/least common bytes */
+    printf("\nTop 10 most frequent bytes:\n");
+    int sorted[256];
+    for (int i = 0; i < 256; i++) sorted[i] = i;
+    for (int i = 0; i < 256; i++) {
+        for (int j = i+1; j < 256; j++) {
+            if (freq[sorted[j]] > freq[sorted[i]]) {
+                int tmp = sorted[i]; sorted[i] = sorted[j]; sorted[j] = tmp;
+            }
+        }
+    }
+    for (int i = 0; i < 10 && freq[sorted[i]] > 0; i++) {
+        printf("  byte 0x%02X: %6d (%.2f%%)\n", sorted[i], freq[sorted[i]], 100.0 * freq[sorted[i]] / size);
+    }
 }
 
 void main() {
@@ -1370,7 +1515,7 @@ void main() {
     for (int x = 1; x <= 8192; x++) h_table[x] = (double)x * log2((double)x);
 
     int NUM_CORES = get_num_cores();
-    omp_set_max_active_levels(2);  /* allow one level of nested parallelism for lookahead */
+    /* omp_set_max_active_levels(2); */  /* allow one level of nested parallelism for lookahead */
     const int NUM_BLOCKS  = 1;
     const int BLOCK_SIZE  = 4096;
     const int NUM_THREADS = (NUM_BLOCKS < NUM_CORES) ? NUM_BLOCKS : NUM_CORES;
@@ -1466,6 +1611,12 @@ void main() {
     printf("Elapsed time: %.2f seconds\n", elapsed);
     printf("Net savings:  min=%.1f  max=%.1f  avg=%.1f bits\n",
            minNet, maxNet, sumNet / NUM_BLOCKS);
+
+    /* Analyze the final compressed data */
+    if (firstBlockData) {
+        analyzeByteDistribution(firstBlockData, BLOCK_SIZE);
+    }
+
     printf("\nInstruction usage (%d total passes):\n", totalPasses);
 
     free(netPerBlock);
