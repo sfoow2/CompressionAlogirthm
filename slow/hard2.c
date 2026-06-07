@@ -21,7 +21,7 @@
 typedef uint8_t u8;
 
 #define BLOCK_SIZE 4096
-#define NUM_BLOCKS 20
+#define NUM_BLOCKS 1
 
 /* ── log table: hlog[x] = x*log2(x), hlog[0]=0 ─────────────────────────── */
 static double hlog[BLOCK_SIZE + 1];
