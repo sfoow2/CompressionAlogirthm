@@ -2,7 +2,7 @@
  * simple.c — greedy entropy compressor
  *
  * All instructions use the frequency-table trick:
- *   new_freq[v] = total[v] - phF[v] + phF[inverse(v, amp)]
+ *   new_freq[v] = (total[v]-phF[v]) + phF[inverse(v, amp)]
  * evaluating ALL amp values in O(256) per (stride, phase) pair.
  *
  * DUAL_XOR / DUAL_ADD split a (stride, phase) into even/odd occurrences
@@ -55,24 +55,32 @@ static void init_mul_inv(void) {
 /* ── instructions ────────────────────────────────────────────────────────── */
 
 typedef enum {
-    /* 16-bit overhead */
+    /* 17-bit overhead (9 base + 8-bit amp) */
     XOR_PHASE = 0,  /* data[i] ^= amp                                          */
     ADD_PHASE,      /* data[i] += amp  (mod 256)                               */
     MUL_ODD,        /* data[i] *= amp  (amp odd, invertible mod 256)           */
-    COND_LO_XOR,    /* if hi-nibble==(amp>>4): low-nibble ^= (amp&0xF)         */
+    COND_LO_XOR,    /* if hi-nib==(amp>>4): lo-nib ^= (amp&0xF)               */
     ADD_NIBS,       /* lo-nib += (amp&0xF), hi-nib += (amp>>4), no carry       */
-    /* 8-bit overhead */
+    COND_HI_XOR,    /* if lo-nib==(amp&0xF): hi-nib ^= ((amp>>4)<<4)          */
+    COND_LO_ADD,    /* if hi-nib==(amp>>4): lo-nib += (amp&0xF) mod 16        */
+    COND_HI_ADD,    /* if lo-nib==(amp&0xF): hi-nib += (amp>>4) mod 16        */
+    XOR_NIBS,       /* lo-nib ^= (amp&0xF), hi-nib ^= (amp>>4), no condition  */
+    /* 9-bit overhead */
     NIB_SWAP,       /* data[i] = (data[i]<<4)|(data[i]>>4), self-inverse       */
     /* 24-bit overhead */
     AFFINE_PHASE,   /* data[i] = (data[i]*m + c)&0xFF  amp = idx|(c<<7), m=2*idx+3  */
-    DUAL_XOR,       /* even occurrences ^= (amp&0xFF), odd ^= ((amp>>8)&0xFF)  */
-    DUAL_ADD,       /* even occurrences += (amp&0xFF), odd += ((amp>>8)&0xFF)  */
+    /* 25-bit overhead */
+    DUAL_XOR,       /* even ^= (amp&0xFF), odd ^= ((amp>>8)&0xFF)              */
+    DUAL_ADD,       /* even += (amp&0xFF), odd += ((amp>>8)&0xFF)              */
+    /* 23-bit overhead */
+    DUAL_MUL,       /* even *= m_lo, odd *= m_hi; amp = idx_lo|(idx_hi<<7)    */
     NUM_INSTR_TYPES
 } InstrType;
 
 static const char *INSTR_NAMES[NUM_INSTR_TYPES] = {
     "XOR_PHASE", "ADD_PHASE", "MUL_ODD", "COND_LO_XOR", "ADD_NIBS",
-    "NIB_SWAP", "AFFINE_PHASE", "DUAL_XOR", "DUAL_ADD"
+    "COND_HI_XOR", "COND_LO_ADD", "COND_HI_ADD", "XOR_NIBS",
+    "NIB_SWAP", "AFFINE_PHASE", "DUAL_XOR", "DUAL_ADD", "DUAL_MUL"
 };
 
 typedef struct { InstrType type; int stride, phase, amp; } Instr;
@@ -131,6 +139,39 @@ static void applyInstr(u8 *data, int n, Instr t) {
                 data[i] += (u8)(k & 1 ? hi : lo);
             break;
         }
+        case COND_HI_XOR: {
+            int nc = t.amp & 0xF, xv = (t.amp >> 4) & 0xF;
+            for (i = t.phase; i < n; i += t.stride)
+                if ((data[i] & 0xF) == nc) data[i] ^= (u8)(xv << 4);
+            break;
+        }
+        case COND_LO_ADD: {
+            int nc = (t.amp >> 4) & 0xF, av = t.amp & 0xF;
+            for (i = t.phase; i < n; i += t.stride)
+                if ((data[i] >> 4) == nc)
+                    data[i] = (u8)((data[i] & 0xF0) | ((data[i] + av) & 0xF));
+            break;
+        }
+        case COND_HI_ADD: {
+            int nc = t.amp & 0xF, av = (t.amp >> 4) & 0xF;
+            for (i = t.phase; i < n; i += t.stride)
+                if ((data[i] & 0xF) == nc)
+                    data[i] = (u8)((data[i] & 0x0F) | (((data[i] >> 4) + av) & 0xF) << 4);
+            break;
+        }
+        case XOR_NIBS: {
+            int xl = t.amp & 0xF, xh = (t.amp >> 4) & 0xF;
+            for (i = t.phase; i < n; i += t.stride)
+                data[i] = (u8)(((data[i] & 0xF) ^ xl) | ((((data[i] >> 4) ^ xh) & 0xF) << 4));
+            break;
+        }
+        case DUAL_MUL: {
+            int m_lo = (t.amp & 0x7F) * 2 + 3, m_hi = ((t.amp >> 7) & 0x7F) * 2 + 3;
+            int k = 0;
+            for (i = t.phase; i < n; i += t.stride, k++)
+                data[i] = (u8)((data[i] * (k & 1 ? m_hi : m_lo)) & 0xFF);
+            break;
+        }
         default: break;
     }
 }
@@ -139,8 +180,9 @@ static void applyInstr(u8 *data, int n, Instr t) {
 static Instr findBest(const u8 *data, int n, double *netOut) {
     int total[256] = {0};
     for (int i = 0; i < n; i++) total[data[i]]++;
+    double hlt[256];
     double Sbase = 0.0;
-    for (int v = 0; v < 256; v++) Sbase += hlog[total[v]];
+    for (int v = 0; v < 256; v++) { hlt[v] = hlog[total[v]]; Sbase += hlt[v]; }
 
     double bestNet = 0.0;
     Instr  best    = {XOR_PHASE, 2, 0, 1};
@@ -153,16 +195,18 @@ static Instr findBest(const u8 *data, int n, double *netOut) {
             /* build phase-position frequency table */
             memset(phF, 0, sizeof phF);
             for (int i = phase; i < n; i += stride) phF[data[i]]++;
+            int dv[256];
+            for (int v = 0; v < 256; v++) dv[v] = total[v] - phF[v];
 
             /* ── XOR_PHASE and ADD_PHASE ─────────────────────────────────── */
             for (int amp = 1; amp < 256; amp++) {
                 double Sx = 0.0, Sa = 0.0;
                 for (int v = 0; v < 256; v++) {
-                    Sx += hlog[total[v] - phF[v] + phF[v ^ amp]];
-                    Sa += hlog[total[v] - phF[v] + phF[(v - amp) & 0xFF]];
+                    Sx += hlog[dv[v] + phF[v ^ amp]];
+                    Sa += hlog[dv[v] + phF[(v - amp) & 0xFF]];
                 }
-                double nx = (Sx - Sbase) - 16.0;
-                double na = (Sa - Sbase) - 16.0;
+                double nx = (Sx - Sbase) - 17.0;
+                double na = (Sa - Sbase) - 17.0;
                 if (nx > bestNet) { bestNet = nx; best = (Instr){XOR_PHASE, stride, phase, amp}; }
                 if (na > bestNet) { bestNet = na; best = (Instr){ADD_PHASE, stride, phase, amp}; }
             }
@@ -171,8 +215,8 @@ static Instr findBest(const u8 *data, int n, double *netOut) {
             for (int amp = 3; amp < 256; amp += 2) {
                 double Sm = 0.0;
                 for (int v = 0; v < 256; v++)
-                    Sm += hlog[total[v] - phF[v] + phF[(v * mul_inv[amp]) & 0xFF]];
-                double nm = (Sm - Sbase) - 16.0;
+                    Sm += hlog[dv[v] + phF[(v * mul_inv[amp]) & 0xFF]];
+                double nm = (Sm - Sbase) - 17.0;
                 if (nm > bestNet) { bestNet = nm; best = (Instr){MUL_ODD, stride, phase, amp}; }
             }
 
@@ -183,9 +227,9 @@ static Instr findBest(const u8 *data, int n, double *netOut) {
                     for (int lo = 0; lo < 16; lo++) {
                         int v    = (nib_cond << 4) | lo;
                         int v_xv = (nib_cond << 4) | (lo ^ xv);
-                        delta += hlog[total[v] - phF[v] + phF[v_xv]] - hlog[total[v]];
+                        delta += hlog[dv[v] + phF[v_xv]] - hlt[v];
                     }
-                    double nc = delta - 16.0;
+                    double nc = delta - 17.0;
                     if (nc > bestNet) { bestNet = nc; best = (Instr){COND_LO_XOR, stride, phase, (nib_cond << 4) | xv}; }
                 }
             }
@@ -196,9 +240,9 @@ static Instr findBest(const u8 *data, int n, double *netOut) {
                 double Sn = 0.0;
                 for (int v = 0; v < 256; v++) {
                     int old_v = ((v - lo_a) & 0x0F) | (((v >> 4) - hi_a) & 0x0F) << 4;
-                    Sn += hlog[total[v] - phF[v] + phF[old_v]];
+                    Sn += hlog[dv[v] + phF[old_v]];
                 }
-                double nn = (Sn - Sbase) - 16.0;
+                double nn = (Sn - Sbase) - 17.0;
                 if (nn > bestNet) { bestNet = nn; best = (Instr){ADD_NIBS, stride, phase, amp}; }
             }
 
@@ -207,13 +251,55 @@ static Instr findBest(const u8 *data, int n, double *netOut) {
                 double Ssw = 0.0;
                 for (int v = 0; v < 256; v++) {
                     int sv = ((v << 4) | (v >> 4)) & 0xFF;
-                    Ssw += hlog[total[v] - phF[v] + phF[sv]];
+                    Ssw += hlog[dv[v] + phF[sv]];
                 }
-                double nsw = (Ssw - Sbase) - 8.0;
+                double nsw = (Ssw - Sbase) - 9.0;
                 if (nsw > bestNet) { bestNet = nsw; best = (Instr){NIB_SWAP, stride, phase, 0}; }
             }
 
-            /* ── AFFINE_PHASE: v → (v*m + c)&0xFF, m odd 3..255 ────────── */
+            /* ── COND_HI_XOR: if lo-nib==nc: hi-nib ^= xv ─────────────── */
+            for (int nc = 0; nc < 16; nc++) {
+                for (int xv = 1; xv < 16; xv++) {
+                    double delta = 0.0;
+                    for (int hi = 0; hi < 16; hi++) {
+                        int v    = (hi << 4) | nc;
+                        int v_xv = ((hi ^ xv) << 4) | nc;
+                        delta += hlog[dv[v] + phF[v_xv]] - hlt[v];
+                    }
+                    double nc_net = delta - 17.0;
+                    if (nc_net > bestNet) { bestNet = nc_net; best = (Instr){COND_HI_XOR, stride, phase, nc | (xv << 4)}; }
+                }
+            }
+
+            /* ── COND_LO_ADD: if hi-nib==nc: lo-nib += av ───────────── */
+            for (int nc = 0; nc < 16; nc++) {
+                for (int av = 1; av < 16; av++) {
+                    double delta = 0.0;
+                    for (int lo = 0; lo < 16; lo++) {
+                        int v   = (nc << 4) | lo;
+                        int v_a = (nc << 4) | ((lo + av) & 0xF);
+                        delta += hlog[dv[v] + phF[v_a]] - hlt[v];
+                    }
+                    double nc_net = delta - 17.0;
+                    if (nc_net > bestNet) { bestNet = nc_net; best = (Instr){COND_LO_ADD, stride, phase, (nc << 4) | av}; }
+                }
+            }
+
+            /* ── COND_HI_ADD: if lo-nib==nc: hi-nib += av ───────────── */
+            for (int nc = 0; nc < 16; nc++) {
+                for (int av = 1; av < 16; av++) {
+                    double delta = 0.0;
+                    for (int hi = 0; hi < 16; hi++) {
+                        int v   = (hi << 4) | nc;
+                        int v_a = (((hi + av) & 0xF) << 4) | nc;
+                        delta += hlog[dv[v] + phF[v_a]] - hlt[v];
+                    }
+                    double nc_net = delta - 17.0;
+                    if (nc_net > bestNet) { bestNet = nc_net; best = (Instr){COND_HI_ADD, stride, phase, nc | (av << 4)}; }
+                }
+            }
+
+/* ── AFFINE_PHASE: v → (v*m + c)&0xFF, m odd 3..255 ────────── */
             /* Restricted to stride <= 8; slower than XOR/ADD per pair. */
             if (stride <= 8) {
                 for (int m = 3; m <= 255; m += 2) {
@@ -222,9 +308,9 @@ static Instr findBest(const u8 *data, int n, double *netOut) {
                         double Sf = 0.0;
                         for (int v = 0; v < 256; v++) {
                             int old_v = ((v - c) * minv) & 0xFF;
-                            Sf += hlog[total[v] - phF[v] + phF[old_v]];
+                            Sf += hlog[dv[v] + phF[old_v]];
                         }
-                        double nf = (Sf - Sbase) - 23.0;
+                        double nf = (Sf - Sbase) - 24.0;
                         if (nf > bestNet) { bestNet = nf; best = (Instr){AFFINE_PHASE, stride, phase, ((m-3)/2) | (c << 7)}; }
                     }
                 }
@@ -252,6 +338,8 @@ static Instr findBest(const u8 *data, int n, double *netOut) {
                         if (!(k & 1)) phFe[data[i]]++;
                 }
                 /* phFo[v] = phF[v] - phFe[v]  (computed inline below) */
+                int dte[256];
+                for (int v = 0; v < 256; v++) dte[v] = total[v] - phFe[v];
 
                 /* ── DUAL_XOR ── */
                 int    best_lo_xor = 1;
@@ -259,13 +347,13 @@ static Instr findBest(const u8 *data, int n, double *netOut) {
                 for (int amp = 1; amp < 256; amp++) {
                     double S = 0.0;
                     for (int v = 0; v < 256; v++)
-                        S += hlog[total[v] - phFe[v] + phFe[v ^ amp]];
+                        S += hlog[dte[v] + phFe[v ^ amp]];
                     if (S > best_S_xor) { best_S_xor = S; best_lo_xor = amp; }
                 }
                 /* total2[v] = total after applying best_lo_xor to even positions */
                 int t2x[256];
                 for (int v = 0; v < 256; v++)
-                    t2x[v] = total[v] - phFe[v] + phFe[v ^ best_lo_xor];
+                    t2x[v] = dte[v] + phFe[v ^ best_lo_xor];
                 int    best_hi_xor = 1;
                 double best_S2_xor = -1e30;
                 for (int amp = 1; amp < 256; amp++) {
@@ -277,7 +365,7 @@ static Instr findBest(const u8 *data, int n, double *netOut) {
                     }
                     if (S > best_S2_xor) { best_S2_xor = S; best_hi_xor = amp; }
                 }
-                double net_dxor = (best_S2_xor - Sbase) - 24.0;
+                double net_dxor = (best_S2_xor - Sbase) - 25.0;
                 if (net_dxor > bestNet) {
                     bestNet = net_dxor;
                     best = (Instr){DUAL_XOR, stride, phase, best_lo_xor | (best_hi_xor << 8)};
@@ -289,12 +377,12 @@ static Instr findBest(const u8 *data, int n, double *netOut) {
                 for (int amp = 1; amp < 256; amp++) {
                     double S = 0.0;
                     for (int v = 0; v < 256; v++)
-                        S += hlog[total[v] - phFe[v] + phFe[(v - amp) & 0xFF]];
+                        S += hlog[dte[v] + phFe[(v - amp) & 0xFF]];
                     if (S > best_S_add) { best_S_add = S; best_lo_add = amp; }
                 }
                 int t2a[256];
                 for (int v = 0; v < 256; v++)
-                    t2a[v] = total[v] - phFe[v] + phFe[(v - best_lo_add) & 0xFF];
+                    t2a[v] = dte[v] + phFe[(v - best_lo_add) & 0xFF];
                 int    best_hi_add = 1;
                 double best_S2_add = -1e30;
                 for (int amp = 1; amp < 256; amp++) {
@@ -306,11 +394,44 @@ static Instr findBest(const u8 *data, int n, double *netOut) {
                     }
                     if (S > best_S2_add) { best_S2_add = S; best_hi_add = amp; }
                 }
-                double net_dadd = (best_S2_add - Sbase) - 24.0;
+                double net_dadd = (best_S2_add - Sbase) - 25.0;
                 if (net_dadd > bestNet) {
                     bestNet = net_dadd;
                     best = (Instr){DUAL_ADD, stride, phase, best_lo_add | (best_hi_add << 8)};
                 }
+
+                /* ── DUAL_MUL ── */
+                {
+                    int    best_lo_mul = 3;
+                    double best_S_mul  = -1e30;
+                    for (int m = 3; m < 256; m += 2) {
+                        double S = 0.0;
+                        for (int v = 0; v < 256; v++)
+                            S += hlog[dte[v] + phFe[(v * mul_inv[m]) & 0xFF]];
+                        if (S > best_S_mul) { best_S_mul = S; best_lo_mul = m; }
+                    }
+                    int t2m[256];
+                    for (int v = 0; v < 256; v++)
+                        t2m[v] = dte[v] + phFe[(v * mul_inv[best_lo_mul]) & 0xFF];
+                    int    best_hi_mul = 3;
+                    double best_S2_mul = -1e30;
+                    for (int m = 3; m < 256; m += 2) {
+                        double S = 0.0;
+                        for (int v = 0; v < 256; v++) {
+                            int phFo_v   = phF[v]                           - phFe[v];
+                            int phFo_v_m = phF[(v * mul_inv[m]) & 0xFF]     - phFe[(v * mul_inv[m]) & 0xFF];
+                            S += hlog[t2m[v] - phFo_v + phFo_v_m];
+                        }
+                        if (S > best_S2_mul) { best_S2_mul = S; best_hi_mul = m; }
+                    }
+                    double net_dmul = (best_S2_mul - Sbase) - 23.0;
+                    if (net_dmul > bestNet) {
+                        bestNet = net_dmul;
+                        int idx_lo = (best_lo_mul - 3) / 2;
+                        int idx_hi = (best_hi_mul - 3) / 2;
+                        best = (Instr){DUAL_MUL, stride, phase, idx_lo | (idx_hi << 7)};
+                    }
+                } 
             }
         }
     }
