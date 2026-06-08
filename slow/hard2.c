@@ -23,6 +23,13 @@ typedef uint8_t u8;
 #define BLOCK_SIZE 4096
 #define NUM_BLOCKS 1
 
+/* Overhead model: every instruction costs INSTR_BASE (type+stride+phase) + amp bits.
+ * Change INSTR_BASE to experiment; all per-type overheads update automatically.
+ * Amp bits by type: single(8), dual_xor/add(16), dual_mul(14), nib_swap(0), scramble(4).
+ * DELTA/POLY_DELTA have no phase/amp — use separate constants. */
+#define INSTR_BASE     9
+#define INSTR_OHD(ab) ((double)(INSTR_BASE + (ab)))
+
 /* ── log table: hlog[x] = x*log2(x), hlog[0]=0 ─────────────────────────── */
 static double hlog[BLOCK_SIZE + 1];
 static void init_hlog(void) {
@@ -475,13 +482,13 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
             {
                 double Sx;
                 int ax = xor_best_amp(dv, phF, &Sx);
-                double nx = (Sx - Sbase) - 13.0;
+                double nx = (Sx - Sbase) - INSTR_OHD(8);
                 if (nx > bestNet) { bestNet = nx; best = (Instr){XOR_PHASE, stride, phase, ax}; }
             }
             /* ── ADD_PHASE: spike-valley proxy K=6 ──────────────────────── */
             {
                 double Sa; int aa = add_best_amp(dv, phF, 6, &Sa);
-                double na = (Sa - Sbase) - 13.0;
+                double na = (Sa - Sbase) - INSTR_OHD(8);
                 if (na > bestNet) { bestNet = na; best = (Instr){ADD_PHASE, stride, phase, aa}; }
             }
 
@@ -490,7 +497,7 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
                 for (int amp = 3; amp < 256; amp += 2) {
                     double Sm = 0.0;
                     for (int v = 0; v < 256; v++) Sm += hlog[dv[v] + phF[(v*(int)mul_inv[amp])&0xFF]];
-                    double nm = (Sm - Sbase) - 13.0;
+                    double nm = (Sm - Sbase) - INSTR_OHD(8);
                     if (nm > bestNet) { bestNet = nm; best = (Instr){MUL_ODD, stride, phase, amp}; }
                 }
             }
@@ -501,7 +508,7 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
                 double Sgf = 0.0;
                 for (int v = 0; v < 256; v++)
                     Sgf += hlog[dv[v] + phF[gf_mul_tab[v][inv_amp]]];
-                double ngf = (Sgf - Sbase) - 13.0;
+                double ngf = (Sgf - Sbase) - INSTR_OHD(8);
                 if (ngf > bestNet) { bestNet = ngf; best = (Instr){GF_MUL, stride, phase, amp}; }
             }
             }
@@ -516,7 +523,7 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
                         int v_xv = (nib_cond << 4) | (lo ^ xv);
                         delta += hlog[dv[v] + phF[v_xv]] - hlt[v];
                     }
-                    double nc = delta - 13.0;
+                    double nc = delta - INSTR_OHD(8);
                     if (nc > bestNet) { bestNet = nc; best = (Instr){COND_LO_XOR, stride, phase, (nib_cond << 4) | xv}; }
                 }
             }
@@ -525,7 +532,7 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
             /* ── ADD_NIBS: factored nibble proxy ─────────────────────────── */
             {
                 double Sn; int an = add_nibs_best_amp(dv, phF, &Sn);
-                double nn = (Sn - Sbase) - 13.0;
+                double nn = (Sn - Sbase) - INSTR_OHD(8);
                 if (nn > bestNet) { bestNet = nn; best = (Instr){ADD_NIBS, stride, phase, an}; }
             }
 
@@ -536,7 +543,7 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
                     int sv = ((v << 4) | (v >> 4)) & 0xFF;
                     Ssw += hlog[dv[v] + phF[sv]];
                 }
-                double nsw = (Ssw - Sbase) - 9.0;
+                double nsw = (Ssw - Sbase) - INSTR_OHD(0);
                 if (nsw > bestNet) { bestNet = nsw; best = (Instr){NIB_SWAP, stride, phase, 0}; }
             }
 
@@ -551,7 +558,7 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
                         int v_xv = ((hi ^ xv) << 4) | nc;
                         delta += hlog[dv[v] + phF[v_xv]] - hlt[v];
                     }
-                    double nc_net = delta - 13.0;
+                    double nc_net = delta - INSTR_OHD(8);
                     if (nc_net > bestNet) { bestNet = nc_net; best = (Instr){COND_HI_XOR, stride, phase, nc | (xv << 4)}; }
                 }
             }
@@ -564,7 +571,7 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
                         int v_inv = (nc << 4) | ((lo - av) & 0xF);
                         delta += hlog[dv[v] + phF[v_inv]] - hlt[v];
                     }
-                    double nc_net = delta - 13.0;
+                    double nc_net = delta - INSTR_OHD(8);
                     if (nc_net > bestNet) { bestNet = nc_net; best = (Instr){COND_LO_ADD, stride, phase, (nc << 4) | av}; }
                 }
             }
@@ -577,7 +584,7 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
                         int v_inv = (((hi - av) & 0xF) << 4) | nc;
                         delta += hlog[dv[v] + phF[v_inv]] - hlt[v];
                     }
-                    double nc_net = delta - 13.0;
+                    double nc_net = delta - INSTR_OHD(8);
                     if (nc_net > bestNet) { bestNet = nc_net; best = (Instr){COND_HI_ADD, stride, phase, nc | (av << 4)}; }
                 }
             }
@@ -637,7 +644,7 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
                 for (int v = 0; v < 256; v++) { phFo[v] = phF[v]-phFe[v]; a2[v] = t2x[v]-phFo[v]; }
                 double best_S2_xor;
                 int best_hi_xor = xor_best_amp(a2, phFo, &best_S2_xor);
-                double net_dxor = (best_S2_xor - Sbase) - 9.0;
+                double net_dxor = (best_S2_xor - Sbase) - INSTR_OHD(16);
                 if (net_dxor > bestNet) {
                     bestNet = net_dxor;
                     best = (Instr){DUAL_XOR, stride, phase, best_lo_xor | (best_hi_xor << 8)};
@@ -654,7 +661,7 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
                     for (int v = 0; v < 256; v++) { phFo_p2[v] = phF[v]-phFe[v]; a2[v] = t2a[v]-phFo_p2[v]; }
                     double best_S2_add;
                     int best_hi_add = add_best_amp(a2, phFo_p2, 4, &best_S2_add);
-                    double net_dadd = (best_S2_add - Sbase) - 9.0;
+                    double net_dadd = (best_S2_add - Sbase) - INSTR_OHD(16);
                     if (net_dadd > bestNet) {
                         bestNet = net_dadd;
                         best = (Instr){DUAL_ADD, stride, phase, best_lo_add | (best_hi_add << 8)};
@@ -679,7 +686,7 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
                         for (int v = 0; v < 256; v++){int phFo_vm=phFo_m[(v*(int)mul_inv[m])&0xFF];S+=hlog[a2m[v]+phFo_vm];}
                         if (S > best_S2_mul) { best_S2_mul = S; best_hi_mul = m; }
                     }
-                    double net_dmul = (best_S2_mul - Sbase) - 9.0;
+                    double net_dmul = (best_S2_mul - Sbase) - INSTR_OHD(14);
                     if (net_dmul > bestNet) {
                         bestNet = net_dmul;
                         best = (Instr){DUAL_MUL, stride, phase, ((best_lo_mul-3)/2)|(((best_hi_mul-3)/2)<<7)};
@@ -922,7 +929,7 @@ static int try_scramble(u8 *data, int n, double *total_net, int *counts, int ver
             temp_net += net;
         }
 
-        double gain = edelta + temp_net - 9.0;
+        double gain = edelta + temp_net - INSTR_OHD(4);
         if (gain > best_gain) { best_gain = gain; best_si = si; best_edelta = edelta; }
     }
 
@@ -931,20 +938,17 @@ static int try_scramble(u8 *data, int n, double *total_net, int *counts, int ver
     double e0 = entropy(data, n);
     applyInstr(data, n, (Instr){SCRAMBLE, 0, 0, best_si});
     g_ilist[g_ni++] = (Instr){SCRAMBLE, 0, 0, best_si};
-    *total_net += best_edelta - 9.0;
+    *total_net += best_edelta - INSTR_OHD(4);
     counts[SCRAMBLE]++;
     if (verbose)
         printf("  %-14s si=%-7d %.6f -> %.6f  net=%.1f\n",
-               "SCRAMBLE", best_si, e0, entropy(data, n), best_edelta - 9.0);
+               "SCRAMBLE", best_si, e0, entropy(data, n), best_edelta - INSTR_OHD(4));
     return 1;
 }
 
 static double compress(u8 *data, int n, int verbose, int *counts) {
     double total_net = 0.0;
     g_ni = 0;
-
-    /* initial scramble: stride<=32, 4 steps — WHT proxy picks best orientation */
-    try_scramble(data, n, &total_net, counts, verbose, 32, 4);
 
     for (;;) {
         /* phase 1: regular greedy, no SCRAMBLE */
