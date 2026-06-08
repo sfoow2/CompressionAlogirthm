@@ -897,17 +897,19 @@ static int decompress(u8 *data, int n, const Instr *instrs, int ni) {
 static Instr g_ilist[4096];
 static int   g_ni;
 
-/* try every scramble on current data, apply best if gain > 0; returns 1 if fired */
-static int try_scramble(u8 *data, int n, double *total_net, int *counts, int verbose,
-                        int max_stride, int max_steps) {
+/* Last-resort scramble: called when greedy is fully stuck.
+ * For each of the 14 scramble types, runs the full greedy search to convergence
+ * on the scrambled data to measure total unlocked net. Applies the best one if
+ * the total gain (scramble entropy delta + unlocked net - scramble overhead) > 0. */
+static int try_scramble(u8 *data, int n, double *total_net, int *counts, int verbose) {
     int sc_freq[256] = {0};
     for (int i = 0; i < n; i++) sc_freq[data[i]]++;
     double Sbase = 0.0;
     for (int v = 0; v < 256; v++) Sbase += hlog[sc_freq[v]];
 
     static u8 scbuf[BLOCK_SIZE], tmpwork[BLOCK_SIZE];
-    int    best_si    = -1;
-    double best_gain  = 0.0;
+    int    best_si     = -1;
+    double best_gain   = 0.0;
     double best_edelta = 0.0;
 
     for (int si = 0; si < 14; si++) {
@@ -919,11 +921,12 @@ static int try_scramble(u8 *data, int n, double *total_net, int *counts, int ver
         for (int v = 0; v < 256; v++) sc_Sb += hlog[sc_tot[v]];
         double edelta = sc_Sb - Sbase;
 
+        /* run greedy to convergence on the scrambled copy */
         memcpy(tmpwork, scbuf, n);
         double temp_net = 0.0;
-        for (int step = 0; step < max_steps; step++) {
+        for (;;) {
             double net;
-            Instr t2 = findBest(tmpwork, n, &net, max_stride);
+            Instr t2 = findBest(tmpwork, n, &net, 64);
             if (net <= 0.0) break;
             applyInstr(tmpwork, n, t2);
             temp_net += net;
@@ -967,8 +970,8 @@ static double compress(u8 *data, int n, int verbose, int *counts) {
                        e0, entropy(data, n), net);
         }
 
-        /* phase 2: last-resort SCRAMBLE when greedy is stuck */
-        if (!try_scramble(data, n, &total_net, counts, verbose, 16, 6)) break;
+        /* last resort: try every scramble, pick whichever unlocks the most */
+        if (!try_scramble(data, n, &total_net, counts, verbose)) break;
     }
     return total_net;
 }
