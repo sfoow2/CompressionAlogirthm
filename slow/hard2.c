@@ -184,7 +184,7 @@ static void applyInstr(u8 *data, int n, Instr t) {
             u8 a[8] = {ua&0xFF,(ua>>8)&0xFF,(ua>>16)&0xFF,ua>>24,
                        ub&0xFF,(ub>>8)&0xFF,(ub>>16)&0xFF,ub>>24};
             int k = 0;
-            for (i = t.phase; i < n; i += t.stride, k++) data[i] += a[k % 8];
+            for (i = t.phase; i < n; i += t.stride, k++) data[i] += a[k & 7];
             break;
         }
         default: break;
@@ -198,15 +198,29 @@ static void applyInstr(u8 *data, int n, Instr t) {
  */
 static void evalPair(const u8 *data, int n, const int *tot, double Sbase,
                      int stride, int phase, double *bestNet, Instr *best) {
-    int phF[256]; memset(phF, 0, sizeof phF);
-    for (int i = phase; i < n; i += stride) phF[data[i]]++;
+    /* one pass: build 8-group histograms, derive all other frequency arrays */
+    int p8[8][256]; memset(p8, 0, sizeof p8);
+    { int k=0; for (int i=phase; i<n; i+=stride, k++) p8[k&7][data[i]]++; }
+
+    int phF[256], phFe[256], phFo[256], rem[256], reme[256], p4[4][256];
+    for (int v = 0; v < 256; v++) {
+        p4[0][v] = p8[0][v]+p8[4][v];
+        p4[1][v] = p8[1][v]+p8[5][v];
+        p4[2][v] = p8[2][v]+p8[6][v];
+        p4[3][v] = p8[3][v]+p8[7][v];
+        phFe[v]  = p8[0][v]+p8[2][v]+p8[4][v]+p8[6][v];
+        phF[v]   = p4[0][v]+p4[1][v]+p4[2][v]+p4[3][v];
+        phFo[v]  = phF[v] - phFe[v];
+        rem[v]   = tot[v] - phF[v];
+        reme[v]  = tot[v] - phFe[v];
+    }
 
     /* XOR_PHASE + ADD_PHASE */
     for (int amp = 1; amp < 256; amp++) {
         double Sx = 0.0, Sa = 0.0;
         for (int v = 0; v < 256; v++) {
-            Sx += hlog[tot[v] - phF[v] + phF[v ^ amp]];
-            Sa += hlog[tot[v] - phF[v] + phF[(v - amp) & 0xFF]];
+            Sx += hlog[rem[v] + phF[v ^ amp]];
+            Sa += hlog[rem[v] + phF[(v - amp) & 0xFF]];
         }
         double nx = (Sx - Sbase) - 16.0, na = (Sa - Sbase) - 16.0;
         if (nx > *bestNet) { *bestNet = nx; *best = (Instr){XOR_PHASE, stride, phase, amp}; }
@@ -217,7 +231,7 @@ static void evalPair(const u8 *data, int n, const int *tot, double Sbase,
     for (int amp = 3; amp < 256; amp += 2) {
         double Sm = 0.0;
         for (int v = 0; v < 256; v++)
-            Sm += hlog[tot[v] - phF[v] + phF[(v * mul_inv[amp]) & 0xFF]];
+            Sm += hlog[rem[v] + phF[(v * mul_inv[amp]) & 0xFF]];
         double nm = (Sm - Sbase) - 16.0;
         if (nm > *bestNet) { *bestNet = nm; *best = (Instr){MUL_ODD, stride, phase, amp}; }
     }
@@ -228,7 +242,7 @@ static void evalPair(const u8 *data, int n, const int *tot, double Sbase,
             double delta = 0.0;
             for (int lo = 0; lo < 16; lo++) {
                 int v = (nc<<4)|lo, v2 = (nc<<4)|(lo^xv);
-                delta += hlog[tot[v]-phF[v]+phF[v2]] - hlog[tot[v]];
+                delta += hlog[rem[v]+phF[v2]] - hlog[tot[v]];
             }
             double nd = delta - 16.0;
             if (nd > *bestNet) { *bestNet = nd; *best = (Instr){COND_LO_XOR, stride, phase, (nc<<4)|xv}; }
@@ -241,7 +255,7 @@ static void evalPair(const u8 *data, int n, const int *tot, double Sbase,
         double Sn = 0.0;
         for (int v = 0; v < 256; v++) {
             int ov = ((v-la)&0xF) | (((v>>4)-ha)&0xF)<<4;
-            Sn += hlog[tot[v]-phF[v]+phF[ov]];
+            Sn += hlog[rem[v]+phF[ov]];
         }
         double nn = (Sn - Sbase) - 16.0;
         if (nn > *bestNet) { *bestNet = nn; *best = (Instr){ADD_NIBS, stride, phase, amp}; }
@@ -251,11 +265,10 @@ static void evalPair(const u8 *data, int n, const int *tot, double Sbase,
     for (int k = 1; k <= 7; k++) {
         double Sr = 0.0;
         for (int v = 0; v < 256; v++) {
-            /* inverse of ROL(v,k) is ROR(v,k) */
             int rv = (int)(((unsigned)v >> k) | ((unsigned)v << (8-k))) & 0xFF;
-            Sr += hlog[tot[v] - phF[v] + phF[rv]];
+            Sr += hlog[rem[v] + phF[rv]];
         }
-        double nr = (Sr - Sbase) - 8.0;  /* tiny amp field → cheap */
+        double nr = (Sr - Sbase) - 8.0;
         if (nr > *bestNet) { *bestNet = nr; *best = (Instr){ROT_PHASE, stride, phase, k}; }
     }
 
@@ -265,7 +278,7 @@ static void evalPair(const u8 *data, int n, const int *tot, double Sbase,
             double delta = 0.0;
             for (int hi = 0; hi < 16; hi++) {
                 int v = (hi<<4)|nc, v2 = ((hi^xv)<<4)|nc;
-                delta += hlog[tot[v]-phF[v]+phF[v2]] - hlog[tot[v]];
+                delta += hlog[rem[v]+phF[v2]] - hlog[tot[v]];
             }
             double nd = delta - 16.0;
             if (nd > *bestNet) { *bestNet = nd; *best = (Instr){COND_HI_XOR, stride, phase, nc|(xv<<4)}; }
@@ -278,7 +291,7 @@ static void evalPair(const u8 *data, int n, const int *tot, double Sbase,
             double delta = 0.0;
             for (int hi = 0; hi < 16; hi++) {
                 int v = (hi<<4)|nc, v2 = (((hi+av)&0xF)<<4)|nc;
-                delta += hlog[tot[v]-phF[v]+phF[v2]] - hlog[tot[v]];
+                delta += hlog[rem[v]+phF[v2]] - hlog[tot[v]];
             }
             double nd = delta - 16.0;
             if (nd > *bestNet) { *bestNet = nd; *best = (Instr){COND_HI_ADD, stride, phase, nc|(av<<4)}; }
@@ -291,7 +304,7 @@ static void evalPair(const u8 *data, int n, const int *tot, double Sbase,
             double delta = 0.0;
             for (int lo = 0; lo < 16; lo++) {
                 int v = (nc<<4)|lo, v2 = (nc<<4)|((lo+av)&0xF);
-                delta += hlog[tot[v]-phF[v]+phF[v2]] - hlog[tot[v]];
+                delta += hlog[rem[v]+phF[v2]] - hlog[tot[v]];
             }
             double nd = delta - 16.0;
             if (nd > *bestNet) { *bestNet = nd; *best = (Instr){COND_LO_ADD, stride, phase, (nc<<4)|av}; }
@@ -303,7 +316,7 @@ static void evalPair(const u8 *data, int n, const int *tot, double Sbase,
         if (!phF[A]) continue;
         for (int B = A+1; B < 256; B++) {
             if (!phF[B]) continue;
-            double d = hlog[tot[A]-phF[A]+phF[B]] + hlog[tot[B]-phF[B]+phF[A]]
+            double d = hlog[rem[A]+phF[B]] + hlog[rem[B]+phF[A]]
                      - hlog[tot[A]] - hlog[tot[B]];
             double nd = d - 16.0;
             if (nd > *bestNet) {
@@ -313,24 +326,19 @@ static void evalPair(const u8 *data, int n, const int *tot, double Sbase,
         }
     }
 
-    /* --- dual / quad / octet section: build even-subset phFe once, share below --- */
-    int phFe[256]; memset(phFe, 0, sizeof phFe);
-    { int k = 0; for (int i = phase; i < n; i += stride, k++) if (!(k&1)) phFe[data[i]]++; }
-
     /* DUAL_XOR */
     {
         int blo = 1; double bS = -1e30;
         for (int amp = 1; amp < 256; amp++) {
             double S = 0.0;
-            for (int v = 0; v < 256; v++) S += hlog[tot[v]-phFe[v]+phFe[v^amp]];
+            for (int v = 0; v < 256; v++) S += hlog[reme[v]+phFe[v^amp]];
             if (S > bS) { bS = S; blo = amp; }
         }
-        int t2[256]; for (int v=0;v<256;v++) t2[v]=tot[v]-phFe[v]+phFe[v^blo];
+        int rt2[256]; for (int v=0;v<256;v++) rt2[v]=reme[v]+phFe[v^blo]-phFo[v];
         int bhi = 1; double bS2 = -1e30;
         for (int amp = 1; amp < 256; amp++) {
             double S = 0.0;
-            for (int v = 0; v < 256; v++)
-                S += hlog[t2[v]-(phF[v]-phFe[v])+(phF[v^amp]-phFe[v^amp])];
+            for (int v = 0; v < 256; v++) S += hlog[rt2[v]+phFo[v^amp]];
             if (S > bS2) { bS2 = S; bhi = amp; }
         }
         double nd = (bS2 - Sbase) - 24.0;
@@ -342,86 +350,62 @@ static void evalPair(const u8 *data, int n, const int *tot, double Sbase,
         int blo = 1; double bS = -1e30;
         for (int amp = 1; amp < 256; amp++) {
             double S = 0.0;
-            for (int v = 0; v < 256; v++) S += hlog[tot[v]-phFe[v]+phFe[(v-amp)&0xFF]];
+            for (int v = 0; v < 256; v++) S += hlog[reme[v]+phFe[(v-amp)&0xFF]];
             if (S > bS) { bS = S; blo = amp; }
         }
-        int t2[256]; for (int v=0;v<256;v++) t2[v]=tot[v]-phFe[v]+phFe[(v-blo)&0xFF];
+        int rt2[256]; for (int v=0;v<256;v++) rt2[v]=reme[v]+phFe[(v-blo)&0xFF]-phFo[v];
         int bhi = 1; double bS2 = -1e30;
         for (int amp = 1; amp < 256; amp++) {
             double S = 0.0;
-            for (int v = 0; v < 256; v++)
-                S += hlog[t2[v]-(phF[v]-phFe[v])+(phF[(v-amp)&0xFF]-phFe[(v-amp)&0xFF])];
+            for (int v = 0; v < 256; v++) S += hlog[rt2[v]+phFo[(v-amp)&0xFF]];
             if (S > bS2) { bS2 = S; bhi = amp; }
         }
         double nd = (bS2 - Sbase) - 24.0;
         if (nd > *bestNet) { *bestNet = nd; *best = (Instr){DUAL_ADD, stride, phase, blo|(bhi<<8)}; }
     }
 
-    /* QUAD_XOR + QUAD_ADD + OCTET_ADD: 4/4/8-group independent transforms */
+    /* QUAD_XOR: 4-group coordinate descent (running rt[], per-pass rg[]) */
     {
-        int p0[256]={0}, p1[256]={0}, p2[256]={0}, p3[256]={0};
-        { int k=0; for (int i=phase;i<n;i+=stride,k++)
-            switch(k&3){case 0:p0[data[i]]++;break;case 1:p1[data[i]]++;break;
-                         case 2:p2[data[i]]++;break;case 3:p3[data[i]]++;break;} }
-
-        /* ── QUAD_XOR ── */
-        int qx0=1; double qS0=-1e30;
-        for (int a=1;a<256;a++) { double S=0.0; for(int v=0;v<256;v++) S+=hlog[tot[v]-p0[v]+p0[v^a]]; if(S>qS0){qS0=S;qx0=a;} }
-        int tx1[256]; for(int v=0;v<256;v++) tx1[v]=tot[v]-p0[v]+p0[v^qx0];
-        int qx1=1; double qS1=-1e30;
-        for (int a=1;a<256;a++) { double S=0.0; for(int v=0;v<256;v++) S+=hlog[tx1[v]-p1[v]+p1[v^a]]; if(S>qS1){qS1=S;qx1=a;} }
-        int tx2[256]; for(int v=0;v<256;v++) tx2[v]=tx1[v]-p1[v]+p1[v^qx1];
-        int qx2=1; double qS2=-1e30;
-        for (int a=1;a<256;a++) { double S=0.0; for(int v=0;v<256;v++) S+=hlog[tx2[v]-p2[v]+p2[v^a]]; if(S>qS2){qS2=S;qx2=a;} }
-        int tx3[256]; for(int v=0;v<256;v++) tx3[v]=tx2[v]-p2[v]+p2[v^qx2];
-        int qx3=1; double qS3=-1e30;
-        for (int a=1;a<256;a++) { double S=0.0; for(int v=0;v<256;v++) S+=hlog[tx3[v]-p3[v]+p3[v^a]]; if(S>qS3){qS3=S;qx3=a;} }
-        {
-            double nd=(qS3-Sbase)-32.0;
-            if (nd>*bestNet) {
-                unsigned ua=(unsigned)qx0|((unsigned)qx1<<8)|((unsigned)qx2<<16)|((unsigned)qx3<<24);
-                int packed; memcpy(&packed,&ua,4);
-                *bestNet=nd; *best=(Instr){QUAD_XOR,stride,phase,packed};
-            }
+        int qa[4]; int rt[256]; memcpy(rt, tot, 256*sizeof(int)); double fS = Sbase;
+        for (int g = 0; g < 4; g++) {
+            int rg[256]; for(int v=0;v<256;v++) rg[v]=rt[v]-p4[g][v];
+            int ba=1; fS=-1e30;
+            for(int a=1;a<256;a++) { double S=0.; for(int v=0;v<256;v++) S+=hlog[rg[v]+p4[g][v^a]]; if(S>fS){fS=S;ba=a;} }
+            qa[g]=ba; for(int v=0;v<256;v++) rt[v]=rg[v]+p4[g][v^qa[g]];
         }
+        double nd=(fS-Sbase)-32.0;
+        if(nd>*bestNet) {
+            unsigned ua=(unsigned)qa[0]|((unsigned)qa[1]<<8)|((unsigned)qa[2]<<16)|((unsigned)qa[3]<<24);
+            int packed; memcpy(&packed,&ua,4);
+            *bestNet=nd; *best=(Instr){QUAD_XOR,stride,phase,packed};
+        }
+    }
 
-        /* ── QUAD_ADD ── */
-        int qa0=1; double qaS0=-1e30;
-        for (int a=1;a<256;a++) { double S=0.0; for(int v=0;v<256;v++) S+=hlog[tot[v]-p0[v]+p0[(v-a)&0xFF]]; if(S>qaS0){qaS0=S;qa0=a;} }
-        int ta1[256]; for(int v=0;v<256;v++) ta1[v]=tot[v]-p0[v]+p0[(v-qa0)&0xFF];
-        int qa1=1; double qaS1=-1e30;
-        for (int a=1;a<256;a++) { double S=0.0; for(int v=0;v<256;v++) S+=hlog[ta1[v]-p1[v]+p1[(v-a)&0xFF]]; if(S>qaS1){qaS1=S;qa1=a;} }
-        int ta2[256]; for(int v=0;v<256;v++) ta2[v]=ta1[v]-p1[v]+p1[(v-qa1)&0xFF];
-        int qa2=1; double qaS2=-1e30;
-        for (int a=1;a<256;a++) { double S=0.0; for(int v=0;v<256;v++) S+=hlog[ta2[v]-p2[v]+p2[(v-a)&0xFF]]; if(S>qaS2){qaS2=S;qa2=a;} }
-        int ta3[256]; for(int v=0;v<256;v++) ta3[v]=ta2[v]-p2[v]+p2[(v-qa2)&0xFF];
-        int qa3=1; double qaS3=-1e30;
-        for (int a=1;a<256;a++) { double S=0.0; for(int v=0;v<256;v++) S+=hlog[ta3[v]-p3[v]+p3[(v-a)&0xFF]]; if(S>qaS3){qaS3=S;qa3=a;} }
-        {
-            double nd=(qaS3-Sbase)-32.0;
-            if (nd>*bestNet) {
-                unsigned ua=(unsigned)qa0|((unsigned)qa1<<8)|((unsigned)qa2<<16)|((unsigned)qa3<<24);
-                int packed; memcpy(&packed,&ua,4);
-                *bestNet=nd; *best=(Instr){QUAD_ADD,stride,phase,packed};
-            }
+    /* QUAD_ADD */
+    {
+        int qa[4]; int rt[256]; memcpy(rt, tot, 256*sizeof(int)); double fS = Sbase;
+        for (int g = 0; g < 4; g++) {
+            int rg[256]; for(int v=0;v<256;v++) rg[v]=rt[v]-p4[g][v];
+            int ba=1; fS=-1e30;
+            for(int a=1;a<256;a++) { double S=0.; for(int v=0;v<256;v++) S+=hlog[rg[v]+p4[g][(v-a)&0xFF]]; if(S>fS){fS=S;ba=a;} }
+            qa[g]=ba; for(int v=0;v<256;v++) rt[v]=rg[v]+p4[g][(v-qa[g])&0xFF];
+        }
+        double nd=(fS-Sbase)-32.0;
+        if(nd>*bestNet) {
+            unsigned ua=(unsigned)qa[0]|((unsigned)qa[1]<<8)|((unsigned)qa[2]<<16)|((unsigned)qa[3]<<24);
+            int packed; memcpy(&packed,&ua,4);
+            *bestNet=nd; *best=(Instr){QUAD_ADD,stride,phase,packed};
         }
     }
 
     /* OCTET_ADD: 8-group coordinate descent ADD */
     {
-        int p[8][256]; memset(p, 0, sizeof p);
-        { int k=0; for(int i=phase;i<n;i+=stride,k++) p[k%8][data[i]]++; }
-
-        int a[8]; int rt[256]; memcpy(rt, tot, 256*sizeof(int)); double fS=Sbase;
-        for(int g=0; g<8; g++) {
+        int a[8]; int rt[256]; memcpy(rt, tot, 256*sizeof(int)); double fS = Sbase;
+        for (int g = 0; g < 8; g++) {
+            int rg[256]; for(int v=0;v<256;v++) rg[v]=rt[v]-p8[g][v];
             int ba=1; fS=-1e30;
-            for(int av=1;av<256;av++) {
-                double S=0.0;
-                for(int v=0;v<256;v++) S+=hlog[rt[v]-p[g][v]+p[g][(v-av)&0xFF]];
-                if(S>fS){fS=S;ba=av;}
-            }
-            a[g]=ba;
-            for(int v=0;v<256;v++) rt[v]=rt[v]-p[g][v]+p[g][(v-a[g])&0xFF];
+            for(int av=1;av<256;av++) { double S=0.; for(int v=0;v<256;v++) S+=hlog[rg[v]+p8[g][(v-av)&0xFF]]; if(S>fS){fS=S;ba=av;} }
+            a[g]=ba; for(int v=0;v<256;v++) rt[v]=rg[v]+p8[g][(v-a[g])&0xFF];
         }
         double nd=(fS-Sbase)-40.0;
         if(nd>*bestNet) {
