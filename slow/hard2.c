@@ -7,9 +7,12 @@
  *
  * 16 instruction types:
  *   0  XOR_PHASE     1  ADD_PHASE     2  MUL_ODD       3  COND_LO_XOR
- *   4  ADD_NIBS      5  DELTA_PHASE   6  DUAL_XOR      7  DUAL_ADD
- *   8  DUAL_XOR_ADD  9  ROT_PHASE    10  COND_HI_XOR  11  COND_HI_ADD
- *  12  COND_LO_ADD  13  QUAD_XOR     14  QUAD_ADD     15  MUL_NIBS
+ *   4  ADD_NIBS      5  DUAL_XOR      6  DUAL_ADD      7  ROT_PHASE
+ *   8  COND_HI_XOR   9  COND_HI_ADD  10  COND_LO_ADD  11  QUAD_XOR
+ *  12  QUAD_ADD     13  VALUE_SWAP   14  OCTET_ADD
+ *     VALUE_SWAP: swap values A↔B in phase group; amp = A|(B<<8); cost = 16
+ *     OCTET_ADD:  8-group ADD; amp = a0..a3, mask = a4..a7; cost = 40
+ *  (removed: DELTA_PHASE, DUAL_XOR_ADD, MUL_NIBS — never fired, save 4-bit type)
  */
 
 #include <stdio.h>
@@ -48,15 +51,11 @@ static void fill_random(u8 *buf, int n) {
 
 /* ── inverse tables mod 256 and mod 16 ──────────────────────────────────── */
 static u8 mul_inv[256];    /* mod-256 inverse for odd values */
-static u8 nib_inv[16];     /* mod-16  inverse for odd nibble values */
 
 static void init_inv_tables(void) {
     for (int k = 1; k < 256; k += 2)
         for (int inv = 1; inv < 256; inv += 2)
             if (((k * inv) & 0xFF) == 1) { mul_inv[k] = (u8)inv; break; }
-    for (int k = 1; k < 16; k += 2)
-        for (int inv = 1; inv < 16; inv += 2)
-            if (((k * inv) & 0xF) == 1) { nib_inv[k] = (u8)inv; break; }
 }
 
 /* ── instructions ────────────────────────────────────────────────────────── */
@@ -66,36 +65,35 @@ typedef enum {
     MUL_ODD      =  2, /* data[i] *= amp (amp odd 3-255) */
     COND_LO_XOR  =  3, /* if hi-nib==(amp>>4): lo-nib ^= (amp&0xF) */
     ADD_NIBS     =  4, /* lo+=(amp&0xF), hi+=(amp>>4) mod 16 */
-    DELTA_PHASE  =  5, /* data[i] -= data[i-stride] running diff; no amp */
-    DUAL_XOR     =  6, /* even^=lo, odd^=hi; amp=lo|(hi<<8) */
-    DUAL_ADD     =  7, /* even+=lo, odd+=hi */
-    DUAL_XOR_ADD =  8, /* even^=lo, odd+=hi */
-    ROT_PHASE    =  9, /* ROL(data[i], amp) for amp=1..7 (amp=4 == old NIB_SWAP) */
-    COND_HI_XOR  = 10, /* if lo-nib==(amp&0xF): hi-nib ^= ((amp>>4)<<4) */
-    COND_HI_ADD  = 11, /* if lo-nib==(amp&0xF): hi-nib += (amp>>4) mod 16 */
-    COND_LO_ADD  = 12, /* if hi-nib==(amp>>4): lo-nib += (amp&0xF) mod 16 */
-    QUAD_XOR     = 13, /* 4-group XOR; amp=a0|(a1<<8)|(a2<<16)|(a3<<24) */
-    QUAD_ADD     = 14, /* 4-group ADD */
-    MUL_NIBS     = 15, /* lo=(lo*m_lo)%16, hi=(hi*m_hi)%16; amp=m_lo|(m_hi<<4), both odd */
+    DUAL_XOR     =  5, /* even^=lo, odd^=hi; amp=lo|(hi<<8) */
+    DUAL_ADD     =  6, /* even+=lo, odd+=hi */
+    ROT_PHASE    =  7, /* ROL(data[i], amp) for amp=1..7 */
+    COND_HI_XOR  =  8, /* if lo-nib==(amp&0xF): hi-nib ^= ((amp>>4)<<4) */
+    COND_HI_ADD  =  9, /* if lo-nib==(amp&0xF): hi-nib += (amp>>4) mod 16 */
+    COND_LO_ADD  = 10, /* if hi-nib==(amp>>4): lo-nib += (amp&0xF) mod 16 */
+    QUAD_XOR     = 11, /* 4-group XOR; amp=a0|(a1<<8)|(a2<<16)|(a3<<24) */
+    QUAD_ADD     = 12, /* 4-group ADD */
+    VALUE_SWAP   = 13, /* swap values A↔B in phase group; amp = A|(B<<8) */
+    OCTET_ADD    = 14, /* 8-group ADD cycling k%8; amp=a0..a3, mask=a4..a7 */
     NUM_INSTR_TYPES
 } InstrType;
 
 static const char *INSTR_NAMES[NUM_INSTR_TYPES] = {
-    "XOR_PHASE",  "ADD_PHASE",  "MUL_ODD",     "COND_LO_XOR",
-    "ADD_NIBS",   "DELTA_PHASE","DUAL_XOR",     "DUAL_ADD",
-    "DUAL_XOR_ADD","ROT_PHASE", "COND_HI_XOR",  "COND_HI_ADD",
-    "COND_LO_ADD","QUAD_XOR",   "QUAD_ADD",     "MUL_NIBS"
+    "XOR_PHASE",  "ADD_PHASE",  "MUL_ODD",    "COND_LO_XOR",
+    "ADD_NIBS",   "DUAL_XOR",   "DUAL_ADD",   "ROT_PHASE",
+    "COND_HI_XOR","COND_HI_ADD","COND_LO_ADD","QUAD_XOR",
+    "QUAD_ADD",   "VALUE_SWAP", "OCTET_ADD"
 };
 
 /* overhead bits per instruction type (used in net = entropy_gain - overhead) */
 static const double INSTR_COST[NUM_INSTR_TYPES] = {
     16, 16, 16, 16,   /* XOR ADD MUL COND_LO_XOR */
-    16,  8, 24, 24,   /* ADD_NIBS DELTA(no amp) DUAL_XOR DUAL_ADD */
-    24,  8, 16, 16,   /* DUAL_XOR_ADD ROT(tiny amp) COND_HI_XOR COND_HI_ADD */
-    16, 32, 32, 16    /* COND_LO_ADD QUAD_XOR QUAD_ADD MUL_NIBS */
+    16, 24, 24,  8,   /* ADD_NIBS DUAL_XOR DUAL_ADD ROT */
+    16, 16, 16, 32,   /* COND_HI_XOR COND_HI_ADD COND_LO_ADD QUAD_XOR */
+    32, 16, 40        /* QUAD_ADD VALUE_SWAP OCTET_ADD */
 };
 
-typedef struct { InstrType type; int stride, phase, amp; } Instr;
+typedef struct { InstrType type; int stride, phase, amp; unsigned mask; } Instr;
 
 /* ── apply ───────────────────────────────────────────────────────────────── */
 static void applyInstr(u8 *data, int n, Instr t) {
@@ -123,16 +121,6 @@ static void applyInstr(u8 *data, int n, Instr t) {
                 data[i] = (u8)(((data[i] + lo) & 0xF) | ((((data[i]>>4) + hi) & 0xF) << 4));
             break;
         }
-        case DELTA_PHASE: {
-            /* each byte becomes (current - previous) in its phase sequence */
-            u8 prev = 0;
-            for (i = t.phase; i < n; i += t.stride) {
-                u8 cur = data[i];
-                data[i] = (u8)(cur - prev);
-                prev = cur;
-            }
-            break;
-        }
         case DUAL_XOR: {
             int lo = t.amp & 0xFF, hi = (t.amp >> 8) & 0xFF, k = 0;
             for (i = t.phase; i < n; i += t.stride, k++)
@@ -143,12 +131,6 @@ static void applyInstr(u8 *data, int n, Instr t) {
             int lo = t.amp & 0xFF, hi = (t.amp >> 8) & 0xFF, k = 0;
             for (i = t.phase; i < n; i += t.stride, k++)
                 data[i] += (u8)(k & 1 ? hi : lo);
-            break;
-        }
-        case DUAL_XOR_ADD: {
-            int lo = t.amp & 0xFF, hi = (t.amp >> 8) & 0xFF, k = 0;
-            for (i = t.phase; i < n; i += t.stride, k++)
-                if (k & 1) data[i] += (u8)hi; else data[i] ^= (u8)lo;
             break;
         }
         case ROT_PHASE: {
@@ -191,11 +173,18 @@ static void applyInstr(u8 *data, int n, Instr t) {
             for (i = t.phase; i < n; i += t.stride, k++) data[i] += (u8)a[k & 3];
             break;
         }
-        case MUL_NIBS: {
-            int ml = t.amp & 0xF, mh = (t.amp >> 4) & 0xF;
+        case VALUE_SWAP: {
+            u8 A = (u8)(t.amp & 0xFF), B = (u8)((t.amp >> 8) & 0xFF);
             for (i = t.phase; i < n; i += t.stride)
-                data[i] = (u8)(((data[i] & 0xF) * ml & 0xF) |
-                               ((((data[i]>>4) * mh) & 0xF) << 4));
+                if (data[i] == A) data[i] = B; else if (data[i] == B) data[i] = A;
+            break;
+        }
+        case OCTET_ADD: {
+            unsigned ua = (unsigned)t.amp, ub = t.mask;
+            u8 a[8] = {ua&0xFF,(ua>>8)&0xFF,(ua>>16)&0xFF,ua>>24,
+                       ub&0xFF,(ub>>8)&0xFF,(ub>>16)&0xFF,ub>>24};
+            int k = 0;
+            for (i = t.phase; i < n; i += t.stride, k++) data[i] += a[k % 8];
             break;
         }
         default: break;
@@ -258,17 +247,6 @@ static void evalPair(const u8 *data, int n, const int *tot, double Sbase,
         if (nn > *bestNet) { *bestNet = nn; *best = (Instr){ADD_NIBS, stride, phase, amp}; }
     }
 
-    /* DELTA_PHASE: running difference — compute the delta distribution directly */
-    {
-        int phFd[256]; memset(phFd, 0, sizeof phFd);
-        u8 prev = 0;
-        for (int i = phase; i < n; i += stride) { phFd[(data[i]-prev)&0xFF]++; prev=data[i]; }
-        double Sd = 0.0;
-        for (int v = 0; v < 256; v++) Sd += hlog[tot[v] - phF[v] + phFd[v]];
-        double nd = (Sd - Sbase) - 8.0;  /* no amp → cheap */
-        if (nd > *bestNet) { *bestNet = nd; *best = (Instr){DELTA_PHASE, stride, phase, 0}; }
-    }
-
     /* ROT_PHASE: bit rotation k=1..7 (k=4 replaces old NIB_SWAP) */
     for (int k = 1; k <= 7; k++) {
         double Sr = 0.0;
@@ -320,22 +298,22 @@ static void evalPair(const u8 *data, int n, const int *tot, double Sbase,
         }
     }
 
-    /* MUL_NIBS: lo=(lo*m_lo)%16, hi=(hi*m_hi)%16 — m_lo,m_hi both odd */
-    for (int ml = 1; ml < 16; ml += 2) {
-        for (int mh = 1; mh < 16; mh += 2) {
-            if (ml == 1 && mh == 1) continue; /* identity */
-            int il = nib_inv[ml], ih = nib_inv[mh];
-            double Smn = 0.0;
-            for (int v = 0; v < 256; v++) {
-                int ov = (il*(v&0xF)&0xF) | ((ih*((v>>4)&0xF)&0xF)<<4);
-                Smn += hlog[tot[v] - phF[v] + phF[ov]];
+    /* VALUE_SWAP: swap two byte values A↔B in phase group */
+    for (int A = 0; A < 255; A++) {
+        if (!phF[A]) continue;
+        for (int B = A+1; B < 256; B++) {
+            if (!phF[B]) continue;
+            double d = hlog[tot[A]-phF[A]+phF[B]] + hlog[tot[B]-phF[B]+phF[A]]
+                     - hlog[tot[A]] - hlog[tot[B]];
+            double nd = d - 16.0;
+            if (nd > *bestNet) {
+                *bestNet = nd;
+                *best = (Instr){VALUE_SWAP, stride, phase, A|(B<<8), 0};
             }
-            double nmn = (Smn - Sbase) - 16.0;
-            if (nmn > *bestNet) { *bestNet = nmn; *best = (Instr){MUL_NIBS, stride, phase, ml|(mh<<4)}; }
         }
     }
 
-    /* --- dual / quad section: build even-subset phFe once, share below --- */
+    /* --- dual / quad / octet section: build even-subset phFe once, share below --- */
     int phFe[256]; memset(phFe, 0, sizeof phFe);
     { int k = 0; for (int i = phase; i < n; i += stride, k++) if (!(k&1)) phFe[data[i]]++; }
 
@@ -379,27 +357,7 @@ static void evalPair(const u8 *data, int n, const int *tot, double Sbase,
         if (nd > *bestNet) { *bestNet = nd; *best = (Instr){DUAL_ADD, stride, phase, blo|(bhi<<8)}; }
     }
 
-    /* DUAL_XOR_ADD: even^=lo, odd+=hi */
-    {
-        int blo = 1; double bS = -1e30;
-        for (int amp = 1; amp < 256; amp++) {
-            double S = 0.0;
-            for (int v = 0; v < 256; v++) S += hlog[tot[v]-phFe[v]+phFe[v^amp]];
-            if (S > bS) { bS = S; blo = amp; }
-        }
-        int t2[256]; for (int v=0;v<256;v++) t2[v]=tot[v]-phFe[v]+phFe[v^blo];
-        int bhi = 1; double bS2 = -1e30;
-        for (int amp = 1; amp < 256; amp++) {
-            double S = 0.0;
-            for (int v = 0; v < 256; v++)
-                S += hlog[t2[v]-(phF[v]-phFe[v])+(phF[(v-amp)&0xFF]-phFe[(v-amp)&0xFF])];
-            if (S > bS2) { bS2 = S; bhi = amp; }
-        }
-        double nd = (bS2 - Sbase) - 24.0;
-        if (nd > *bestNet) { *bestNet = nd; *best = (Instr){DUAL_XOR_ADD, stride, phase, blo|(bhi<<8)}; }
-    }
-
-    /* QUAD_XOR + QUAD_ADD: 4-group independent transforms */
+    /* QUAD_XOR + QUAD_ADD + OCTET_ADD: 4/4/8-group independent transforms */
     {
         int p0[256]={0}, p1[256]={0}, p2[256]={0}, p3[256]={0};
         { int k=0; for (int i=phase;i<n;i+=stride,k++)
@@ -446,6 +404,31 @@ static void evalPair(const u8 *data, int n, const int *tot, double Sbase,
                 int packed; memcpy(&packed,&ua,4);
                 *bestNet=nd; *best=(Instr){QUAD_ADD,stride,phase,packed};
             }
+        }
+    }
+
+    /* OCTET_ADD: 8-group coordinate descent ADD */
+    {
+        int p[8][256]; memset(p, 0, sizeof p);
+        { int k=0; for(int i=phase;i<n;i+=stride,k++) p[k%8][data[i]]++; }
+
+        int a[8]; int rt[256]; memcpy(rt, tot, 256*sizeof(int)); double fS=Sbase;
+        for(int g=0; g<8; g++) {
+            int ba=1; fS=-1e30;
+            for(int av=1;av<256;av++) {
+                double S=0.0;
+                for(int v=0;v<256;v++) S+=hlog[rt[v]-p[g][v]+p[g][(v-av)&0xFF]];
+                if(S>fS){fS=S;ba=av;}
+            }
+            a[g]=ba;
+            for(int v=0;v<256;v++) rt[v]=rt[v]-p[g][v]+p[g][(v-a[g])&0xFF];
+        }
+        double nd=(fS-Sbase)-40.0;
+        if(nd>*bestNet) {
+            unsigned lo=(unsigned)a[0]|((unsigned)a[1]<<8)|((unsigned)a[2]<<16)|((unsigned)a[3]<<24);
+            unsigned hi=(unsigned)a[4]|((unsigned)a[5]<<8)|((unsigned)a[6]<<16)|((unsigned)a[7]<<24);
+            int packed; memcpy(&packed,&lo,4);
+            *bestNet=nd; *best=(Instr){OCTET_ADD,stride,phase,packed,hi};
         }
     }
 }
@@ -501,7 +484,7 @@ static double compress(u8 *data, int n, int verbose, int *counts) {
     int findBest_calls = 0;
 
     for (;;) {
-        /* ── primary greedy loop ─────────────────────────────────────────── */
+        /* ── primary greedy loop ────────────────────────────────────────── */
         for (;;) {
             double net;
             Instr t = findBest(data, n, &net);
