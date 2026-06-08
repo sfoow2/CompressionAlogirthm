@@ -1,12 +1,12 @@
 /*
- * simple.c — greedy entropy compressor
+ * simple.c â€” greedy entropy compressor
  *
  * All instructions use the frequency-table trick:
  *   new_freq[v] = (total[v]-phF[v]) + phF[inverse(v, amp)]
  * evaluating ALL amp values in O(256) per (stride, phase) pair.
  *
  * DUAL_XOR / DUAL_ADD split a (stride, phase) into even/odd occurrences
- * and apply independent amps to each — same pattern as two XOR_PHASE calls
+ * and apply independent amps to each â€” same pattern as two XOR_PHASE calls
  * at stride*2, but packed into one instruction (24 bits vs 32 bits overhead).
  */
 
@@ -26,18 +26,18 @@ typedef uint8_t u8;
 /* Overhead model: every instruction costs INSTR_BASE (type+stride+phase) + amp bits.
  * Change INSTR_BASE to experiment; all per-type overheads update automatically.
  * Amp bits by type: single(8), dual_xor/add(16), dual_mul(14), nib_swap(0), scramble(4).
- * DELTA/POLY_DELTA have no phase/amp — use separate constants. */
+ * DELTA/POLY_DELTA have no phase/amp â€” use separate constants. */
 #define INSTR_BASE     9
 #define INSTR_OHD(ab) ((double)(INSTR_BASE + (ab)))
 
-/* ── log table: hlog[x] = x*log2(x), hlog[0]=0 ─────────────────────────── */
+/* â”€â”€ log table: hlog[x] = x*log2(x), hlog[0]=0 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 static double hlog[BLOCK_SIZE + 1];
 static void init_hlog(void) {
     hlog[0] = 0.0;
     for (int i = 1; i <= BLOCK_SIZE; i++) hlog[i] = i * log2(i);
 }
 
-/* ── entropy ─────────────────────────────────────────────────────────────── */
+/* â”€â”€ entropy â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 static double entropy(const u8 *data, int n) {
     int f[256] = {0};
     for (int i = 0; i < n; i++) f[data[i]]++;
@@ -46,12 +46,12 @@ static double entropy(const u8 *data, int n) {
     return log2(n) - s / n;
 }
 
-/* ── data ────────────────────────────────────────────────────────────────── */
+/* â”€â”€ data â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 static void fill_random(u8 *buf, int n) {
     BCryptGenRandom(NULL, buf, (ULONG)n, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
 }
 
-/* ── multiply-inverse table mod 256 ─────────────────────────────────────── */
+/* â”€â”€ multiply-inverse table mod 256 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 static u8 mul_inv[256];
 static void init_mul_inv(void) {
     for (int k = 1; k < 256; k += 2)
@@ -59,7 +59,7 @@ static void init_mul_inv(void) {
             if (((k * inv) & 0xFF) == 1) { mul_inv[k] = (u8)inv; break; }
 }
 
-/* ── GF(2^8) multiply using AES polynomial (x^8+x^4+x^3+x+1 = 0x11B) ─── */
+/* â”€â”€ GF(2^8) multiply using AES polynomial (x^8+x^4+x^3+x+1 = 0x11B) â”€â”€â”€ */
 static u8 gf_mul_tab[256][256];
 static u8 gf_inv_tab[256];
 static void init_gf_tables(void) {
@@ -84,7 +84,7 @@ static void init_gf_tables(void) {
             if (gf_mul_tab[a][b] == 1) { gf_inv_tab[a] = (u8)b; break; }
 }
 
-/* ── instructions ────────────────────────────────────────────────────────── */
+/* â”€â”€ instructions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 
 typedef enum {
     /* 17-bit overhead (9 base + 8-bit amp) */
@@ -100,8 +100,8 @@ typedef enum {
     NIB_SWAP,       /* data[i] = (data[i]<<4)|(data[i]>>4), self-inverse       */
     /* 12-bit overhead (9 base + 3-bit k) */
     BIT_ROTATE,     /* data[i] = rotl(data[i], k); inverse is rotl(_, 8-k)    */
-    /* 23-bit overhead (9 base + 7+7 bits; amps < 128 so MSB preserved) */
-    VALUE_XOR,      /* lo-half ^= (amp&0x7F); hi-half ^= ((amp>>7)&0x7F)      */
+    /* 23-bit overhead (9 base + INSTR_OHD(14)); k=amp&7, alo=amp>>3, ahi=amp>>11 */
+    VALUE_XOR,      /* (data[i]>>k)&1 ? ^ahi : ^alo; amps have bit k=0, self-inv */
     /* 25-bit overhead */
     DUAL_XOR,       /* even ^= (amp&0xFF), odd ^= ((amp>>8)&0xFF)              */
     DUAL_ADD,       /* even += (amp&0xFF), odd += ((amp>>8)&0xFF)              */
@@ -115,12 +115,17 @@ typedef enum {
     POLY_DELTA_XOR, /* data[i] ^= data[i-s1]^data[i-s2] for i>=s2             */
     /* 13-bit overhead */
     SCRAMBLE,       /* position rearrangement; amp encodes scramble type        */
-    /* 33-bit overhead (9 base + 3×8 amp) */
+    /* 33-bit overhead (9 base + 3Ã—8 amp) */
     TRIPLE_XOR,     /* group0 ^= a0, group1 ^= a1, group2 ^= a2 (pos mod 3)   */
     TRIPLE_ADD,     /* group0 += a0, group1 += a1, group2 += a2 (pos mod 3)   */
-    /* 30-bit overhead (9 base + 3×7 amp) */
+    /* 30-bit overhead (9 base + 3Ã—7 amp) */
     TRIPLE_MUL,     /* group0 *= m0, group1 *= m1, group2 *= m2; idx per 7b   */
-    NUM_INSTR_TYPES /* 19 total */
+    /* 41-bit overhead (9 base + 4x8 amp packed as uint32) */
+    QUAD_XOR,       /* group0^a0, group1^a1, group2^a2, group3^a3 (pos mod 4) */
+    QUAD_ADD,       /* group0+=a0, group1+=a1, group2+=a2, group3+=a3         */
+    /* 37-bit overhead (9 base + 4x7 amp) */
+    QUAD_MUL,       /* group0*=m0, ..., group3*=m3; idx per 7b (pos mod 4)    */
+    NUM_INSTR_TYPES /* 24 total */
 } InstrType;
 
 static const char *INSTR_NAMES[NUM_INSTR_TYPES] = {
@@ -129,10 +134,11 @@ static const char *INSTR_NAMES[NUM_INSTR_TYPES] = {
     "BIT_ROTATE", "VALUE_XOR",
     "DUAL_XOR", "DUAL_ADD", "DUAL_MUL", "GF_MUL",
     "DELTA_SUB", "POLY_DELTA_XOR", "SCRAMBLE",
-    "TRIPLE_XOR", "TRIPLE_ADD", "TRIPLE_MUL"
+    "TRIPLE_XOR", "TRIPLE_ADD", "TRIPLE_MUL",
+    "QUAD_XOR", "QUAD_ADD", "QUAD_MUL"
 };
 
-typedef struct { InstrType type; int stride, phase, amp; } Instr;
+typedef struct { InstrType type; int stride, phase; unsigned int amp; } Instr;
 
 static void interleave_stride(const u8 *src, u8 *dst, int n, int s);
 static void bit_plane_sep(const u8 *src, u8 *dst, int n);
@@ -181,9 +187,10 @@ static void applyInstr(u8 *data, int n, Instr t) {
             break;
         }
         case VALUE_XOR: {
-            int alo = t.amp & 0x7F, ahi = (t.amp >> 7) & 0x7F;
+            int k = t.amp & 7, mask = 1 << k;
+            int alo = (t.amp >> 3) & 0xFF, ahi = (t.amp >> 11) & 0xFF;
             for (i = t.phase; i < n; i += t.stride)
-                data[i] ^= (u8)(data[i] & 0x80 ? ahi : alo);
+                data[i] ^= (u8)((data[i] & mask) ? ahi : alo);
             break;
         }
         case DUAL_XOR: {
@@ -291,11 +298,30 @@ static void applyInstr(u8 *data, int n, Instr t) {
             }
             break;
         }
+        case QUAD_XOR: {
+            unsigned a0=t.amp&0xFF, a1=(t.amp>>8)&0xFF, a2=(t.amp>>16)&0xFF, a3=t.amp>>24;
+            unsigned aa[4]={a0,a1,a2,a3}; int k=0;
+            for (i=t.phase; i<n; i+=t.stride, k++) data[i]^=(u8)aa[k&3];
+            break;
+        }
+        case QUAD_ADD: {
+            unsigned a0=t.amp&0xFF, a1=(t.amp>>8)&0xFF, a2=(t.amp>>16)&0xFF, a3=t.amp>>24;
+            unsigned aa[4]={a0,a1,a2,a3}; int k=0;
+            for (i=t.phase; i<n; i+=t.stride, k++) data[i]+=(u8)aa[k&3];
+            break;
+        }
+        case QUAD_MUL: {
+            int m0=(t.amp&0x7F)*2+3, m1=((t.amp>>7)&0x7F)*2+3;
+            int m2=((t.amp>>14)&0x7F)*2+3, m3=((t.amp>>21)&0x7F)*2+3;
+            int mm[4]={m0,m1,m2,m3}; int k=0;
+            for (i=t.phase; i<n; i+=t.stride, k++) data[i]=(u8)((data[i]*mm[k&3])&0xFF);
+            break;
+        }
         default: break;
     }
 }
 
-/* ── Walsh-Hadamard helpers for fast XOR-amp search ─────────────────────── */
+/* â”€â”€ Walsh-Hadamard helpers for fast XOR-amp search â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 
 /* In-place Walsh-Hadamard Transform, n=256 */
 static void wht256(int *a) {
@@ -307,6 +333,54 @@ static void wht256(int *a) {
             }
 }
 
+/* WHT for 128 elements */
+static void wht128(int *a) {
+    for (int len = 1; len < 128; len <<= 1)
+        for (int i = 0; i < 128; i += len << 1)
+            for (int j = 0; j < len; j++) {
+                int u = a[i+j], v = a[i+j+len];
+                a[i+j] = u+v; a[i+j+len] = u-v;
+            }
+}
+
+/* XOR best amp (idx 1..127) for 128-element remapped arrays. Same structure as
+ * xor_best_amp. Used by VALUE_XOR search for each bit-k split subgroup. */
+static int xor_best_amp_128(const int *A, const int *B, double *Sout) {
+    int ha[128], hb[128];
+    for (int i = 0; i < 128; i++) { ha[i] = A[i]; hb[i] = B[i]; }
+    wht128(ha); wht128(hb);
+    long long prod[128];
+    for (int k = 0; k < 128; k++) prod[k] = (long long)ha[k] * hb[k];
+    for (int len = 1; len < 128; len <<= 1)
+        for (int i = 0; i < 128; i += len << 1)
+            for (int j = 0; j < len; j++) {
+                long long u = prod[i+j], v = prod[i+j+len];
+                prod[i+j] = u+v; prod[i+j+len] = u-v;
+            }
+    long long c0 = INT64_MIN, c1 = INT64_MIN, c2 = INT64_MIN;
+    int a0 = 1, a1 = 2, a2 = 3;
+    for (int amp = 1; amp < 128; amp++) {
+        long long c = prod[amp];
+        if      (c > c0) { c2=c1;a2=a1; c1=c0;a1=a0; c0=c;a0=amp; }
+        else if (c > c1) { c2=c1;a2=a1; c1=c;a1=amp; }
+        else if (c > c2) { c2=c;a2=amp; }
+    }
+    int best_amp = a0; double best_S = -1e30;
+    int cands[3] = {a0, a1, a2};
+    for (int t = 0; t < 3; t++) {
+        double S = 0.0;
+        for (int i = 0; i < 128; i++) S += hlog[A[i] + B[i ^ cands[t]]];
+        if (S > best_S) { best_S = S; best_amp = cands[t]; }
+    }
+    *Sout = best_S;
+    return best_amp;
+}
+
+/* Insert 0 at bit-k position into 7-bit idx to produce a value in G0 (bit k=0) */
+static int vxor_ins(int idx, int k) {
+    return ((idx >> k) << (k + 1)) | (idx & ((1 << k) - 1));
+}
+
 /* Find best XOR amp (1..255) for sum_v hlog[A[v] + B[v^amp]].
  * Uses WHT XOR-correlation to find top-3 candidates, then exact verify.
  * Returns best amp; stores exact S in *Sout. */
@@ -314,7 +388,7 @@ static int xor_best_amp(const int *A, const int *B, double *Sout) {
     int ha[256], hb[256];
     for (int i = 0; i < 256; i++) { ha[i] = A[i]; hb[i] = B[i]; }
     wht256(ha); wht256(hb);
-    /* pointwise product → IWHT gives XOR-correlation × 256 */
+    /* pointwise product â†’ IWHT gives XOR-correlation Ã— 256 */
     long long prod[256];
     for (int k = 0; k < 256; k++) prod[k] = (long long)ha[k] * hb[k];
     for (int len = 1; len < 256; len <<= 1)
@@ -344,18 +418,18 @@ static int xor_best_amp(const int *A, const int *B, double *Sout) {
     return best_amp;
 }
 
-/* ── fast amp-search helpers ─────────────────────────────────────────────── */
+/* â”€â”€ fast amp-search helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 
 /* Best cyclic-ADD amp via double-buffer sequential cross-correlation.
- * Stores phF twice so each rotation is a stride-1 slice → auto-vectorises.
- * Top-8 peaks of C[k] = Σ dv[v]*phF[(v-k)] verified exactly with hlog.
+ * Stores phF twice so each rotation is a stride-1 slice â†’ auto-vectorises.
+ * Top-8 peaks of C[k] = Î£ dv[v]*phF[(v-k)] verified exactly with hlog.
  * Reliable for near-uniform BCrypt data where spike-valley proxy fails. */
 static int add_best_amp(const int *dv, const int *phF, int _K, double *Sout) {
     (void)_K;
     /* double-buffer: phF2[v] = phF2[v+256] = phF[v]  (512 ints, 2 KB) */
     int phF2[512];
     for (int v = 0; v < 256; v++) phF2[v] = phF2[v + 256] = phF[v];
-    /* C[k] = dot(dv, phF2[256-k .. 511-k])  —  stride-1 access, vectorisable */
+    /* C[k] = dot(dv, phF2[256-k .. 511-k])  â€”  stride-1 access, vectorisable */
     int corr[256];
     for (int k = 1; k < 256; k++) {
         const int *p = phF2 + (256 - k);
@@ -407,7 +481,7 @@ static int add_nibs_best_amp(const int *dv, const int *phF, double *Sout) {
 }
 
 /* Best odd multiplier: 2-level coarse+fine search.
- * Coarse: 8 amps at every 32nd odd (3,35,67,...,227). Fine: ±16 odd steps around top-3.
+ * Coarse: 8 amps at every 32nd odd (3,35,67,...,227). Fine: Â±16 odd steps around top-3.
  * Reliable for near-uniform data; ~85% coverage of 127 odd amps per pass. */
 static int mul_best_amp(const int *dv, const int *phF, double *Sout) {
     /* Level 1: 8 coarse odd amps */
@@ -420,7 +494,7 @@ static int mul_best_amp(const int *dv, const int *phF, double *Sout) {
         else if (S > top3s[1]) { top3s[2]=top3s[1];top3a[2]=top3a[1]; top3s[1]=S;top3a[1]=m; }
         else if (S > top3s[2]) { top3s[2]=S;top3a[2]=m; }
     }
-    /* Level 2: brute force ±16 odd steps (±32 in value) around each top-3 */
+    /* Level 2: brute force Â±16 odd steps (Â±32 in value) around each top-3 */
     int best_amp = top3a[0]; double best_S = top3s[0];
     for (int ci = 0; ci < 3; ci++) {
         int base = top3a[ci];
@@ -435,7 +509,7 @@ static int mul_best_amp(const int *dv, const int *phF, double *Sout) {
     *Sout = best_S; return best_amp;
 }
 
-/* ── find best instruction ───────────────────────────────────────────────── */
+/* â”€â”€ find best instruction â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
     int total[256] = {0};
     for (int i = 0; i < n; i++) total[data[i]]++;
@@ -449,7 +523,7 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
     int phF[256];
 
     for (int stride = 1; stride <= max_stride; stride++) {
-        /* ── DELTA_SUB: data[i] -= data[i-stride], no phase/amp ─────────── */
+        /* â”€â”€ DELTA_SUB: data[i] -= data[i-stride], no phase/amp â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
         {
             int dsfreq[256] = {0};
             for (int i = 0; i < stride && i < n; i++) dsfreq[data[i]]++;
@@ -459,7 +533,7 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
             double nds = (Sds - Sbase) - 10.0;
             if (nds > bestNet) { bestNet = nds; best = (Instr){DELTA_SUB, stride, 0, 0}; }
         }
-        /* ── POLY_DELTA_XOR: limit to stride<=32 to keep search fast ───── */
+        /* â”€â”€ POLY_DELTA_XOR: limit to stride<=32 to keep search fast â”€â”€â”€â”€â”€ */
         if (stride <= 32) {
         for (int s1 = 1; s1 < stride; s1++) {
             int pdfreq[256] = {0};
@@ -483,21 +557,21 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
             int dv[256];
             for (int v = 0; v < 256; v++) dv[v] = total[v] - phF[v];
 
-            /* ── XOR_PHASE: WHT proxy + top-3 exact verify ──────────────── */
+            /* â”€â”€ XOR_PHASE: WHT proxy + top-3 exact verify â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
             {
                 double Sx;
                 int ax = xor_best_amp(dv, phF, &Sx);
                 double nx = (Sx - Sbase) - INSTR_OHD(8);
                 if (nx > bestNet) { bestNet = nx; best = (Instr){XOR_PHASE, stride, phase, ax}; }
             }
-            /* ── ADD_PHASE: spike-valley proxy K=6 ──────────────────────── */
+            /* â”€â”€ ADD_PHASE: spike-valley proxy K=6 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
             {
                 double Sa; int aa = add_best_amp(dv, phF, 6, &Sa);
                 double na = (Sa - Sbase) - INSTR_OHD(8);
                 if (na > bestNet) { bestNet = na; best = (Instr){ADD_PHASE, stride, phase, aa}; }
             }
 
-            /* ── MUL_ODD: brute force for stride<=32 ────────────────────── */
+            /* â”€â”€ MUL_ODD: brute force for stride<=32 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
             if (stride <= 32) {
                 for (int amp = 3; amp < 256; amp += 2) {
                     double Sm = 0.0;
@@ -506,7 +580,7 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
                     if (nm > bestNet) { bestNet = nm; best = (Instr){MUL_ODD, stride, phase, amp}; }
                 }
             }
-            /* ── GF_MUL: stride<=8 only to keep overhead manageable ────── */
+            /* â”€â”€ GF_MUL: stride<=8 only to keep overhead manageable â”€â”€â”€â”€â”€â”€ */
             if (stride <= 8) {
             for (int amp = 1; amp < 256; amp++) {
                 u8 inv_amp = gf_inv_tab[amp];
@@ -518,7 +592,7 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
             }
             }
 
-            /* ── COND_LO_XOR: stride<=32 ────────────────────────────────── */
+            /* â”€â”€ COND_LO_XOR: stride<=32 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
             if (stride <= 32) {
             for (int nib_cond = 0; nib_cond < 16; nib_cond++) {
                 for (int xv = 1; xv < 16; xv++) {
@@ -534,14 +608,14 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
             }
             }
 
-            /* ── ADD_NIBS: factored nibble proxy ─────────────────────────── */
+            /* â”€â”€ ADD_NIBS: factored nibble proxy â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
             {
                 double Sn; int an = add_nibs_best_amp(dv, phF, &Sn);
                 double nn = (Sn - Sbase) - INSTR_OHD(8);
                 if (nn > bestNet) { bestNet = nn; best = (Instr){ADD_NIBS, stride, phase, an}; }
             }
 
-            /* ── NIB_SWAP: self-inverse, cost 8 bits ─────────────────────── */
+            /* â”€â”€ NIB_SWAP: self-inverse, cost 8 bits â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
             {
                 double Ssw = 0.0;
                 for (int v = 0; v < 256; v++) {
@@ -552,7 +626,7 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
                 if (nsw > bestNet) { bestNet = nsw; best = (Instr){NIB_SWAP, stride, phase, 0}; }
             }
 
-            /* ── BIT_ROTATE: rotate bits of each byte by k=1..7 ─────────── */
+            /* â”€â”€ BIT_ROTATE: rotate bits of each byte by k=1..7 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
             for (int k = 1; k <= 7; k++) {
                 double Sbr = 0.0;
                 for (int v = 0; v < 256; v++) {
@@ -563,33 +637,38 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
                 if (nbr > bestNet) { bestNet = nbr; best = (Instr){BIT_ROTATE, stride, phase, k}; }
             }
 
-            /* ── VALUE_XOR: split by MSB, independent XOR amps (both <128) ─
-             * Groups are disjoint under XOR with amp<128, so score is separable.
-             * Best amp_lo maximises Σ_{v<128} hlog[dv[v]+phF[v^a]]; similarly hi. */
-            {
+            /* â”€â”€ VALUE_XOR: split by any bit k (0-7); amps have bit k=0 â”€â”€â”€â”€â”€
+             * Groups are disjoint under XOR with amp having bit k=0, separable.
+             * Search all 8 bit positions; pick the best-net (k, alo, ahi). */
+            for (int k = 0; k < 8; k++) {
+                int mask = 1 << k;
                 int balo = 0; double bSlo = -1e30;
-                for (int a = 1; a < 128; a++) {
+                for (int a = 0; a < 256; a++) {
+                    if (a & mask) continue;
                     double S = 0.0;
-                    for (int v = 0; v < 128; v++) S += hlog[dv[v] + phF[v ^ a]];
+                    for (int v = 0; v < 256; v++) if (!(v & mask)) S += hlog[dv[v] + phF[v ^ a]];
                     if (S > bSlo) { bSlo = S; balo = a; }
                 }
                 int bahi = 0; double bShi = -1e30;
-                for (int a = 1; a < 128; a++) {
+                for (int a = 0; a < 256; a++) {
+                    if (a & mask) continue;
                     double S = 0.0;
-                    for (int v = 128; v < 256; v++) S += hlog[dv[v] + phF[v ^ a]];
+                    for (int v = 0; v < 256; v++) if (v & mask) S += hlog[dv[v] + phF[v ^ a]];
                     if (S > bShi) { bShi = S; bahi = a; }
                 }
-                /* full score: sum both halves plus the unchanged complement */
                 double Svx = 0.0;
                 for (int v = 0; v < 256; v++) {
-                    int vx = (v < 128) ? (v ^ balo) : (v ^ bahi);
+                    int vx = v ^ ((v & mask) ? bahi : balo);
                     Svx += hlog[dv[v] + phF[vx]];
                 }
                 double nvx = (Svx - Sbase) - INSTR_OHD(14);
-                if (nvx > bestNet) { bestNet = nvx; best = (Instr){VALUE_XOR, stride, phase, balo | (bahi << 7)}; }
+                if (nvx > bestNet) {
+                    bestNet = nvx;
+                    best = (Instr){VALUE_XOR, stride, phase, k | (balo << 3) | (bahi << 11)};
+                }
             }
 
-            /* ── COND_HI_XOR / COND_LO_ADD / COND_HI_ADD: stride<=32 ──── */
+            /* â”€â”€ COND_HI_XOR / COND_LO_ADD / COND_HI_ADD: stride<=32 â”€â”€â”€â”€ */
             if (stride <= 32) {
 
             for (int nc = 0; nc < 16; nc++) {
@@ -634,7 +713,7 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
             } /* end stride<=32 for COND instructions */
 
             /*
-             * ── DUAL_XOR and DUAL_ADD ─────────────────────────────────────
+             * â”€â”€ DUAL_XOR and DUAL_ADD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
              *
              * Split (stride, phase) into even-indexed (k=0,2,...) and
              * odd-indexed (k=1,3,...) occurrences and apply independent amps
@@ -658,7 +737,7 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
                 int dte[256];
                 for (int v = 0; v < 256; v++) dte[v] = total[v] - phFe[v];
 
-                /* ── DUAL_XOR: WHT for both coordinate-descent passes ── */
+                /* â”€â”€ DUAL_XOR: WHT for both coordinate-descent passes â”€â”€ */
                 double best_S_xor;
                 int best_lo_xor = xor_best_amp(dte, phFe, &best_S_xor);
                 int t2x[256];
@@ -675,7 +754,7 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
                     best = (Instr){DUAL_XOR, stride, phase, best_lo_xor | (best_hi_xor << 8)};
                 }
 
-                /* ── DUAL_ADD: spike-valley proxy both passes ── */
+                /* â”€â”€ DUAL_ADD: spike-valley proxy both passes â”€â”€ */
                 {
                     double best_S_add;
                     int best_lo_add = add_best_amp(dte, phFe, 6, &best_S_add);
@@ -693,7 +772,7 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
                     }
                 }
 
-                /* ── DUAL_MUL: brute force all strides ── */
+                /* â”€â”€ DUAL_MUL: brute force all strides â”€â”€ */
                 {
                     int    best_lo_mul = 3; double best_S_mul  = -1e30;
                     for (int m = 3; m < 256; m += 2) {
@@ -719,10 +798,10 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
                 }
             }
 
-            /* ── TRIPLE_XOR / TRIPLE_ADD / TRIPLE_MUL: 3-way position split ──────
+            /* â”€â”€ TRIPLE_XOR / TRIPLE_ADD / TRIPLE_MUL: 3-way position split â”€â”€â”€â”€â”€â”€
              * Splits the (stride, phase) sequence into 3 groups by pos mod 3.
              * Overhead: 9+24=33 bits (XOR/ADD), 9+21=30 bits (MUL).
-             * Replaces up to 3 individual instructions at 3×17=51 or 3×17=51 bits. */
+             * Replaces up to 3 individual instructions at 3Ã—17=51 or 3Ã—17=51 bits. */
             {
                 int phF0[256]={0}, phF1[256]={0}, phF2[256]={0};
                 { int k=0; for (int i=phase; i<n; i+=stride, k++) {
@@ -790,6 +869,99 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
                     }
                 }
             }
+
+            /* ── QUAD_XOR / QUAD_ADD / QUAD_MUL: 4-way position split ──────────
+             * Splits (stride, phase) into 4 groups by pos mod 4.
+             * Overhead: INSTR_OHD(32)=41 (XOR/ADD), INSTR_OHD(28)=37 (MUL).
+             * Replaces up to 4 XOR_PHASE at 4×17=68 bits — saves 27 bits. */
+            {
+                int phF0[256]={0}, phF1[256]={0}, phF2[256]={0}, phF3[256]={0};
+                { int k=0; for (int i=phase; i<n; i+=stride, k++) {
+                    if      ((k&3)==0) phF0[data[i]]++;
+                    else if ((k&3)==1) phF1[data[i]]++;
+                    else if ((k&3)==2) phF2[data[i]]++;
+                    else               phF3[data[i]]++;
+                }}
+                int td0[256], tx1[256], dx1[256], tx2[256], dx2[256], tx3[256], dx3[256];
+                for (int v=0;v<256;v++) td0[v]=total[v]-phF0[v];
+
+                /* QUAD_XOR: 4 WHT passes */
+                {
+                    double Sq1; int qa0=xor_best_amp(td0,phF0,&Sq1);
+                    for (int v=0;v<256;v++) tx1[v]=td0[v]+phF0[v^qa0];
+                    for (int v=0;v<256;v++) dx1[v]=tx1[v]-phF1[v];
+                    double Sq2; int qa1=xor_best_amp(dx1,phF1,&Sq2);
+                    for (int v=0;v<256;v++) tx2[v]=dx1[v]+phF1[v^qa1];
+                    for (int v=0;v<256;v++) dx2[v]=tx2[v]-phF2[v];
+                    double Sq3; int qa2=xor_best_amp(dx2,phF2,&Sq3);
+                    for (int v=0;v<256;v++) tx3[v]=dx2[v]+phF2[v^qa2];
+                    for (int v=0;v<256;v++) dx3[v]=tx3[v]-phF3[v];
+                    double Sq4; int qa3=xor_best_amp(dx3,phF3,&Sq4);
+                    double nqx=(Sq4-Sbase)-INSTR_OHD(32);
+                    if (nqx>bestNet) {
+                        bestNet=nqx;
+                        best=(Instr){QUAD_XOR,stride,phase,
+                            (unsigned)qa0|((unsigned)qa1<<8)|((unsigned)qa2<<16)|((unsigned)qa3<<24)};
+                    }
+                }
+
+                /* QUAD_ADD: 4 cross-correlation passes */
+                {
+                    double Sa1; int qa0=add_best_amp(td0,phF0,6,&Sa1);
+                    for (int v=0;v<256;v++) tx1[v]=td0[v]+phF0[(v-qa0)&0xFF];
+                    for (int v=0;v<256;v++) dx1[v]=tx1[v]-phF1[v];
+                    double Sa2; int qa1=add_best_amp(dx1,phF1,6,&Sa2);
+                    for (int v=0;v<256;v++) tx2[v]=dx1[v]+phF1[(v-qa1)&0xFF];
+                    for (int v=0;v<256;v++) dx2[v]=tx2[v]-phF2[v];
+                    double Sa3; int qa2=add_best_amp(dx2,phF2,6,&Sa3);
+                    for (int v=0;v<256;v++) tx3[v]=dx2[v]+phF2[(v-qa2)&0xFF];
+                    for (int v=0;v<256;v++) dx3[v]=tx3[v]-phF3[v];
+                    double Sa4; int qa3=add_best_amp(dx3,phF3,6,&Sa4);
+                    double nqa=(Sa4-Sbase)-INSTR_OHD(32);
+                    if (nqa>bestNet) {
+                        bestNet=nqa;
+                        best=(Instr){QUAD_ADD,stride,phase,
+                            (unsigned)qa0|((unsigned)qa1<<8)|((unsigned)qa2<<16)|((unsigned)qa3<<24)};
+                    }
+                }
+
+                /* QUAD_MUL: brute force 4 passes, stride<=8 only */
+                if (stride<=8) {
+                    int bm0=3; double bSm0=-1e30;
+                    for (int m=3;m<256;m+=2) {
+                        double S=0.0;
+                        for (int v=0;v<256;v++) S+=hlog[td0[v]+phF0[(v*(int)mul_inv[m])&0xFF]];
+                        if (S>bSm0) { bSm0=S; bm0=m; }
+                    }
+                    for (int v=0;v<256;v++) tx1[v]=td0[v]+phF0[(v*(int)mul_inv[bm0])&0xFF];
+                    for (int v=0;v<256;v++) dx1[v]=tx1[v]-phF1[v];
+                    int bm1=3; double bSm1=-1e30;
+                    for (int m=3;m<256;m+=2) {
+                        double S=0.0; for (int v=0;v<256;v++) S+=hlog[dx1[v]+phF1[(v*(int)mul_inv[m])&0xFF]];
+                        if (S>bSm1) { bSm1=S; bm1=m; }
+                    }
+                    for (int v=0;v<256;v++) tx2[v]=dx1[v]+phF1[(v*(int)mul_inv[bm1])&0xFF];
+                    for (int v=0;v<256;v++) dx2[v]=tx2[v]-phF2[v];
+                    int bm2=3; double bSm2=-1e30;
+                    for (int m=3;m<256;m+=2) {
+                        double S=0.0; for (int v=0;v<256;v++) S+=hlog[dx2[v]+phF2[(v*(int)mul_inv[m])&0xFF]];
+                        if (S>bSm2) { bSm2=S; bm2=m; }
+                    }
+                    for (int v=0;v<256;v++) tx3[v]=dx2[v]+phF2[(v*(int)mul_inv[bm2])&0xFF];
+                    for (int v=0;v<256;v++) dx3[v]=tx3[v]-phF3[v];
+                    int bm3=3; double bSm3=-1e30;
+                    for (int m=3;m<256;m+=2) {
+                        double S=0.0; for (int v=0;v<256;v++) S+=hlog[dx3[v]+phF3[(v*(int)mul_inv[m])&0xFF]];
+                        if (S>bSm3) { bSm3=S; bm3=m; }
+                    }
+                    double nqm=(bSm3-Sbase)-INSTR_OHD(28);
+                    if (nqm>bestNet) {
+                        bestNet=nqm;
+                        best=(Instr){QUAD_MUL,stride,phase,
+                            (unsigned)((bm0-3)/2)|(unsigned)(((bm1-3)/2)<<7)|(unsigned)(((bm2-3)/2)<<14)|(unsigned)(((bm3-3)/2)<<21)};
+                    }
+                }
+            }
         }
     }
 
@@ -798,7 +970,7 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
     return best;
 }
 
-/* ── scramble helpers ────────────────────────────────────────────────────── */
+/* â”€â”€ scramble helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 static void interleave_stride(const u8 *src, u8 *dst, int n, int s) {
     int w = n / s;
     for (int i = 0; i < n; i++) dst[(i % s) * w + (i / s)] = src[i];
@@ -827,7 +999,7 @@ static void xor_fold_scramble(const u8 *src, u8 *dst, int n) {
     memcpy(dst + h, src + h, h);
 }
 
-/* ── apply scramble type si to dst from src ─────────────────────────────── */
+/* â”€â”€ apply scramble type si to dst from src â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 static int apply_scramble(int si, const u8 *src, u8 *dst, int n) {
     if      (si == 0 && n%2==0)    { interleave_stride(src, dst, n, 2);    return 1; }
     else if (si == 1 && n%4==0)    { interleave_stride(src, dst, n, 4);    return 1; }
@@ -847,12 +1019,12 @@ static int apply_scramble(int si, const u8 *src, u8 *dst, int n) {
     return 0;
 }
 
-/* ── decompressor helpers ────────────────────────────────────────────────── */
+/* â”€â”€ decompressor helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 
 /* Apply the inverse of scramble si in-place. */
 static void invert_scramble(u8 *data, int n, int si) {
     u8 tmp[BLOCK_SIZE];
-    /* Inverse map: IL-s → IL-(n/s); bit_plane_sep, block_reverse, xor_fold self-inverse */
+    /* Inverse map: IL-s â†’ IL-(n/s); bit_plane_sep, block_reverse, xor_fold self-inverse */
     int inv_si = -1;
     switch (si) {
         case 1:  inv_si=10; break;
@@ -959,7 +1131,22 @@ static int decompress(u8 *data, int n, const Instr *instrs, int ni) {
             int m0=idx0*2+3, m1=idx1*2+3, m2=idx2*2+3;
             int inv0=(mul_inv[m0]-3)/2, inv1=(mul_inv[m1]-3)/2, inv2=(mul_inv[m2]-3)/2;
             applyInstr(data, n, (Instr){TRIPLE_MUL, t.stride, t.phase,
-                inv0|(inv1<<7)|(inv2<<14)}); break;
+                (unsigned)inv0|((unsigned)inv1<<7)|((unsigned)inv2<<14)}); break;
+        }
+        case QUAD_XOR:
+            applyInstr(data, n, t); break;  /* XOR self-inverse */
+        case QUAD_ADD: {
+            unsigned a0=t.amp&0xFF, a1=(t.amp>>8)&0xFF, a2=(t.amp>>16)&0xFF, a3=t.amp>>24;
+            applyInstr(data, n, (Instr){QUAD_ADD, t.stride, t.phase,
+                ((256-a0)&0xFF)|(((256-a1)&0xFF)<<8)|(((256-a2)&0xFF)<<16)|(((256-a3)&0xFF)<<24)}); break;
+        }
+        case QUAD_MUL: {
+            int idx0=t.amp&0x7F, idx1=(t.amp>>7)&0x7F, idx2=(t.amp>>14)&0x7F, idx3=(t.amp>>21)&0x7F;
+            int m0=idx0*2+3, m1=idx1*2+3, m2=idx2*2+3, m3=idx3*2+3;
+            int inv0=(mul_inv[m0]-3)/2, inv1=(mul_inv[m1]-3)/2;
+            int inv2=(mul_inv[m2]-3)/2, inv3=(mul_inv[m3]-3)/2;
+            applyInstr(data, n, (Instr){QUAD_MUL, t.stride, t.phase,
+                (unsigned)inv0|((unsigned)inv1<<7)|((unsigned)inv2<<14)|((unsigned)inv3<<21)}); break;
         }
         default: break;
         }
@@ -967,7 +1154,7 @@ static int decompress(u8 *data, int n, const Instr *instrs, int ni) {
     return 1;
 }
 
-/* ── greedy compress ─────────────────────────────────────────────────────── */
+/* â”€â”€ greedy compress â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 
 /* Global instruction list for current block (reset at start of compress). */
 static Instr g_ilist[4096];
@@ -1041,7 +1228,7 @@ static double compress(u8 *data, int n, int verbose, int *counts) {
             total_net += net;
             counts[t.type]++;
             if (verbose)
-                printf("  %-14s s%-2d p%-2d a%-6d  %.6f -> %.6f  net=%.1f\n",
+                printf("  %-14s s%-2d p%-2d a%-8u  %.6f -> %.6f  net=%.1f\n",
                        INSTR_NAMES[t.type], t.stride, t.phase, t.amp,
                        e0, entropy(data, n), net);
         }
@@ -1052,7 +1239,7 @@ static double compress(u8 *data, int n, int verbose, int *counts) {
     return total_net;
 }
 
-/* ── main ────────────────────────────────────────────────────────────────── */
+/* â”€â”€ main â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 int main(void) {
     init_hlog();
     init_mul_inv();
@@ -1060,7 +1247,7 @@ int main(void) {
     int counts[NUM_INSTR_TYPES] = {0};
     double sum = 0.0;
 
-    /* load or generate seed data — seed.bin ensures reproducible runs */
+    /* load or generate seed data â€” seed.bin ensures reproducible runs */
     static u8 alldata[NUM_BLOCKS * BLOCK_SIZE];
     {
         FILE *sf = fopen("seed.bin", "rb");
