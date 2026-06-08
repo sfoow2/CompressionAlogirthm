@@ -74,16 +74,27 @@ typedef enum {
     DUAL_ADD,       /* even += (amp&0xFF), odd += ((amp>>8)&0xFF)              */
     /* 23-bit overhead */
     DUAL_MUL,       /* even *= m_lo, odd *= m_hi; amp = idx_lo|(idx_hi<<7)    */
+    /* 10-bit overhead (4 type + 6 stride, no phase, no amp) */
+    DELTA_XOR,      /* data[i] ^= data[i-stride] for all i>=stride (right-to-left) */
+    /* 13-bit overhead */
+    SCRAMBLE,       /* position rearrangement; amp = 0:IL2 1:IL4 2:IL8 3:IL16 4:IL32 5:IL64 6:BITPL 7:NIBPL 8:REV 9:XORFOLD */
     NUM_INSTR_TYPES
 } InstrType;
 
 static const char *INSTR_NAMES[NUM_INSTR_TYPES] = {
     "XOR_PHASE", "ADD_PHASE", "MUL_ODD", "COND_LO_XOR", "ADD_NIBS",
     "COND_HI_XOR", "COND_LO_ADD", "COND_HI_ADD", "XOR_NIBS",
-    "NIB_SWAP", "AFFINE_PHASE", "DUAL_XOR", "DUAL_ADD", "DUAL_MUL"
+    "NIB_SWAP", "AFFINE_PHASE", "DUAL_XOR", "DUAL_ADD", "DUAL_MUL",
+    "DELTA_XOR", "SCRAMBLE"
 };
 
 typedef struct { InstrType type; int stride, phase, amp; } Instr;
+
+static void interleave_stride(const u8 *src, u8 *dst, int n, int s);
+static void bit_plane_sep(const u8 *src, u8 *dst, int n);
+static void nib_plane_sep(const u8 *src, u8 *dst, int n);
+static void block_reverse(const u8 *src, u8 *dst, int n);
+static void xor_fold_scramble(const u8 *src, u8 *dst, int n);
 
 static void applyInstr(u8 *data, int n, Instr t) {
     int i;
@@ -172,12 +183,81 @@ static void applyInstr(u8 *data, int n, Instr t) {
                 data[i] = (u8)((data[i] * (k & 1 ? m_hi : m_lo)) & 0xFF);
             break;
         }
+        case DELTA_XOR:
+            for (i = n - 1; i >= t.stride; i--)
+                data[i] ^= data[i - t.stride];
+            break;
+        case SCRAMBLE: {
+            u8 tmp[BLOCK_SIZE];
+            int sc = t.amp & 0xF;
+            if      (sc == 0) interleave_stride(data, tmp, n, 2);
+            else if (sc == 1) interleave_stride(data, tmp, n, 4);
+            else if (sc == 2) interleave_stride(data, tmp, n, 8);
+            else if (sc == 3) interleave_stride(data, tmp, n, 16);
+            else if (sc == 4) interleave_stride(data, tmp, n, 32);
+            else if (sc == 5) interleave_stride(data, tmp, n, 64);
+            else if (sc == 6) bit_plane_sep(data, tmp, n);
+            else if (sc == 7) nib_plane_sep(data, tmp, n);
+            else if (sc == 8) block_reverse(data, tmp, n);
+            else              xor_fold_scramble(data, tmp, n);
+            memcpy(data, tmp, n);
+            break;
+        }
         default: break;
     }
 }
 
+/* ── Walsh-Hadamard helpers for fast XOR-amp search ─────────────────────── */
+
+/* In-place Walsh-Hadamard Transform, n=256 */
+static void wht256(int *a) {
+    for (int len = 1; len < 256; len <<= 1)
+        for (int i = 0; i < 256; i += len << 1)
+            for (int j = 0; j < len; j++) {
+                int u = a[i+j], v = a[i+j+len];
+                a[i+j] = u+v; a[i+j+len] = u-v;
+            }
+}
+
+/* Find best XOR amp (1..255) for sum_v hlog[A[v] + B[v^amp]].
+ * Uses WHT XOR-correlation to find top-3 candidates, then exact verify.
+ * Returns best amp; stores exact S in *Sout. */
+static int xor_best_amp(const int *A, const int *B, double *Sout) {
+    int ha[256], hb[256];
+    for (int i = 0; i < 256; i++) { ha[i] = A[i]; hb[i] = B[i]; }
+    wht256(ha); wht256(hb);
+    /* pointwise product → IWHT gives XOR-correlation × 256 */
+    long long prod[256];
+    for (int k = 0; k < 256; k++) prod[k] = (long long)ha[k] * hb[k];
+    for (int len = 1; len < 256; len <<= 1)
+        for (int i = 0; i < 256; i += len << 1)
+            for (int j = 0; j < len; j++) {
+                long long u = prod[i+j], v = prod[i+j+len];
+                prod[i+j] = u+v; prod[i+j+len] = u-v;
+            }
+    /* find top-3 amps by proxy (skip amp=0) */
+    long long c0 = INT64_MIN, c1 = INT64_MIN, c2 = INT64_MIN;
+    int       a0 = 1,         a1 = 2,          a2 = 3;
+    for (int amp = 1; amp < 256; amp++) {
+        long long c = prod[amp];
+        if      (c > c0) { c2=c1; a2=a1; c1=c0; a1=a0; c0=c; a0=amp; }
+        else if (c > c1) { c2=c1; a2=a1; c1=c; a1=amp; }
+        else if (c > c2) { c2=c; a2=amp; }
+    }
+    /* exact verify top-3 */
+    int best_amp = a0; double best_S = -1e30;
+    int cands[3] = {a0, a1, a2};
+    for (int t = 0; t < 3; t++) {
+        double S = 0.0;
+        for (int v = 0; v < 256; v++) S += hlog[A[v] + B[v ^ cands[t]]];
+        if (S > best_S) { best_S = S; best_amp = cands[t]; }
+    }
+    *Sout = best_S;
+    return best_amp;
+}
+
 /* ── find best instruction ───────────────────────────────────────────────── */
-static Instr findBest(const u8 *data, int n, double *netOut) {
+static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
     int total[256] = {0};
     for (int i = 0; i < n; i++) total[data[i]]++;
     double hlt[256];
@@ -189,7 +269,18 @@ static Instr findBest(const u8 *data, int n, double *netOut) {
 
     int phF[256];
 
-    for (int stride = 1; stride <= 64; stride++) {
+    for (int stride = 1; stride <= max_stride; stride++) {
+        /* ── DELTA_XOR: data[i] ^= data[i-stride], no phase/amp ─────────── */
+        {
+            int dxfreq[256] = {0};
+            for (int i = 0; i < stride && i < n; i++) dxfreq[data[i]]++;
+            for (int i = stride; i < n; i++) dxfreq[data[i] ^ data[i - stride]]++;
+            double Sdx = 0.0;
+            for (int v = 0; v < 256; v++) Sdx += hlog[dxfreq[v]];
+            double ndx = (Sdx - Sbase) - 10.0;
+            if (ndx > bestNet) { bestNet = ndx; best = (Instr){DELTA_XOR, stride, 0, 0}; }
+        }
+
         for (int phase = 0; phase < stride; phase++) {
 
             /* build phase-position frequency table */
@@ -198,16 +289,19 @@ static Instr findBest(const u8 *data, int n, double *netOut) {
             int dv[256];
             for (int v = 0; v < 256; v++) dv[v] = total[v] - phF[v];
 
-            /* ── XOR_PHASE and ADD_PHASE ─────────────────────────────────── */
-            for (int amp = 1; amp < 256; amp++) {
-                double Sx = 0.0, Sa = 0.0;
-                for (int v = 0; v < 256; v++) {
-                    Sx += hlog[dv[v] + phF[v ^ amp]];
-                    Sa += hlog[dv[v] + phF[(v - amp) & 0xFF]];
-                }
+            /* ── XOR_PHASE: WHT proxy + top-3 exact verify ──────────────── */
+            {
+                double Sx;
+                int ax = xor_best_amp(dv, phF, &Sx);
                 double nx = (Sx - Sbase) - 17.0;
+                if (nx > bestNet) { bestNet = nx; best = (Instr){XOR_PHASE, stride, phase, ax}; }
+            }
+            /* ── ADD_PHASE: brute force ──────────────────────────────────── */
+            for (int amp = 1; amp < 256; amp++) {
+                double Sa = 0.0;
+                for (int v = 0; v < 256; v++)
+                    Sa += hlog[dv[v] + phF[(v - amp) & 0xFF]];
                 double na = (Sa - Sbase) - 17.0;
-                if (nx > bestNet) { bestNet = nx; best = (Instr){XOR_PHASE, stride, phase, amp}; }
                 if (na > bestNet) { bestNet = na; best = (Instr){ADD_PHASE, stride, phase, amp}; }
             }
 
@@ -276,9 +370,9 @@ static Instr findBest(const u8 *data, int n, double *netOut) {
                 for (int av = 1; av < 16; av++) {
                     double delta = 0.0;
                     for (int lo = 0; lo < 16; lo++) {
-                        int v   = (nc << 4) | lo;
-                        int v_a = (nc << 4) | ((lo + av) & 0xF);
-                        delta += hlog[dv[v] + phF[v_a]] - hlt[v];
+                        int v     = (nc << 4) | lo;
+                        int v_inv = (nc << 4) | ((lo - av) & 0xF);
+                        delta += hlog[dv[v] + phF[v_inv]] - hlt[v];
                     }
                     double nc_net = delta - 17.0;
                     if (nc_net > bestNet) { bestNet = nc_net; best = (Instr){COND_LO_ADD, stride, phase, (nc << 4) | av}; }
@@ -299,9 +393,9 @@ static Instr findBest(const u8 *data, int n, double *netOut) {
                 }
             }
 
-/* ── AFFINE_PHASE: v → (v*m + c)&0xFF, m odd 3..255 ────────── */
-            /* Restricted to stride <= 8; slower than XOR/ADD per pair. */
-            if (stride <= 8) {
+/* ── AFFINE_PHASE: disabled (O(127×256×256) per small-stride phase,
+             *   never fires on BCrypt; re-enable if needed for other data) ── */
+            if (0 && stride <= 8) {
                 for (int m = 3; m <= 255; m += 2) {
                     int minv = mul_inv[m];
                     for (int c = 0; c < 256; c++) {
@@ -341,30 +435,17 @@ static Instr findBest(const u8 *data, int n, double *netOut) {
                 int dte[256];
                 for (int v = 0; v < 256; v++) dte[v] = total[v] - phFe[v];
 
-                /* ── DUAL_XOR ── */
-                int    best_lo_xor = 1;
-                double best_S_xor  = -1e30;
-                for (int amp = 1; amp < 256; amp++) {
-                    double S = 0.0;
-                    for (int v = 0; v < 256; v++)
-                        S += hlog[dte[v] + phFe[v ^ amp]];
-                    if (S > best_S_xor) { best_S_xor = S; best_lo_xor = amp; }
-                }
-                /* total2[v] = total after applying best_lo_xor to even positions */
+                /* ── DUAL_XOR: WHT for both coordinate-descent passes ── */
+                double best_S_xor;
+                int best_lo_xor = xor_best_amp(dte, phFe, &best_S_xor);
                 int t2x[256];
                 for (int v = 0; v < 256; v++)
                     t2x[v] = dte[v] + phFe[v ^ best_lo_xor];
-                int    best_hi_xor = 1;
-                double best_S2_xor = -1e30;
-                for (int amp = 1; amp < 256; amp++) {
-                    double S = 0.0;
-                    for (int v = 0; v < 256; v++) {
-                        int phFo_v     = phF[v]       - phFe[v];
-                        int phFo_v_amp = phF[v ^ amp] - phFe[v ^ amp];
-                        S += hlog[t2x[v] - phFo_v + phFo_v_amp];
-                    }
-                    if (S > best_S2_xor) { best_S2_xor = S; best_hi_xor = amp; }
-                }
+                /* pass 2: hlog[t2x[v] - phFo[v] + phFo[v^amp]] = hlog[a2[v] + phFo[v^amp]] */
+                int phFo[256], a2[256];
+                for (int v = 0; v < 256; v++) { phFo[v] = phF[v]-phFe[v]; a2[v] = t2x[v]-phFo[v]; }
+                double best_S2_xor;
+                int best_hi_xor = xor_best_amp(a2, phFo, &best_S2_xor);
                 double net_dxor = (best_S2_xor - Sbase) - 25.0;
                 if (net_dxor > bestNet) {
                     bestNet = net_dxor;
@@ -436,6 +517,7 @@ static Instr findBest(const u8 *data, int n, double *netOut) {
         }
     }
 
+
     if (netOut) *netOut = bestNet;
     return best;
 }
@@ -469,14 +551,81 @@ static void xor_fold_scramble(const u8 *src, u8 *dst, int n) {
     memcpy(dst + h, src + h, h);
 }
 
+/* ── apply scramble type si to dst from src ─────────────────────────────── */
+static int apply_scramble(int si, const u8 *src, u8 *dst, int n) {
+    if      (si == 0 && n%2==0)  { interleave_stride(src, dst, n, 2);  return 1; }
+    else if (si == 1 && n%4==0)  { interleave_stride(src, dst, n, 4);  return 1; }
+    else if (si == 2 && n%8==0)  { interleave_stride(src, dst, n, 8);  return 1; }
+    else if (si == 3 && n%16==0) { interleave_stride(src, dst, n, 16); return 1; }
+    else if (si == 4 && n%32==0) { interleave_stride(src, dst, n, 32); return 1; }
+    else if (si == 5 && n%64==0) { interleave_stride(src, dst, n, 64); return 1; }
+    else if (si == 6 && n%8==0)  { bit_plane_sep(src, dst, n);         return 1; }
+    else if (si == 7 && n%2==0)  { nib_plane_sep(src, dst, n);         return 1; }
+    else if (si == 8)            { block_reverse(src, dst, n);          return 1; }
+    else if (si == 9 && n%2==0)  { xor_fold_scramble(src, dst, n);     return 1; }
+    return 0;
+}
+
 /* ── greedy compress ─────────────────────────────────────────────────────── */
+/* try every scramble on current data, apply best if gain > 0; returns 1 if fired */
+static int try_scramble(u8 *data, int n, double *total_net, int *counts, int verbose,
+                        int max_stride, int max_steps) {
+    int sc_freq[256] = {0};
+    for (int i = 0; i < n; i++) sc_freq[data[i]]++;
+    double Sbase = 0.0;
+    for (int v = 0; v < 256; v++) Sbase += hlog[sc_freq[v]];
+
+    static u8 scbuf[BLOCK_SIZE], tmpwork[BLOCK_SIZE];
+    int    best_si    = -1;
+    double best_gain  = 0.0;
+    double best_edelta = 0.0;
+
+    for (int si = 0; si < 10; si++) {
+        if (!apply_scramble(si, data, scbuf, n)) continue;
+
+        int sc_tot[256] = {0};
+        for (int i = 0; i < n; i++) sc_tot[scbuf[i]]++;
+        double sc_Sb = 0.0;
+        for (int v = 0; v < 256; v++) sc_Sb += hlog[sc_tot[v]];
+        double edelta = sc_Sb - Sbase;
+
+        memcpy(tmpwork, scbuf, n);
+        double temp_net = 0.0;
+        for (int step = 0; step < max_steps; step++) {
+            double net;
+            Instr t2 = findBest(tmpwork, n, &net, max_stride);
+            if (net <= 0.0) break;
+            applyInstr(tmpwork, n, t2);
+            temp_net += net;
+        }
+
+        double gain = edelta + temp_net - 9.0;
+        if (gain > best_gain) { best_gain = gain; best_si = si; best_edelta = edelta; }
+    }
+
+    if (best_si < 0) return 0;
+
+    double e0 = entropy(data, n);
+    applyInstr(data, n, (Instr){SCRAMBLE, 0, 0, best_si});
+    *total_net += best_edelta - 9.0;
+    counts[SCRAMBLE]++;
+    if (verbose)
+        printf("  %-14s si=%-7d %.6f -> %.6f  net=%.1f\n",
+               "SCRAMBLE", best_si, e0, entropy(data, n), best_edelta - 9.0);
+    return 1;
+}
+
 static double compress(u8 *data, int n, int verbose, int *counts) {
     double total_net = 0.0;
 
+    /* initial scramble: WHT proxy, stride<=32, 4 steps — picks best orientation fast */
+    try_scramble(data, n, &total_net, counts, verbose, 32, 4);
+
     for (;;) {
+        /* phase 1: regular greedy, no SCRAMBLE */
         for (;;) {
             double net;
-            Instr t = findBest(data, n, &net);
+            Instr t = findBest(data, n, &net, 64);
             if (net <= 0.0) break;
             double e0 = entropy(data, n);
             applyInstr(data, n, t);
@@ -488,45 +637,8 @@ static double compress(u8 *data, int n, int verbose, int *counts) {
                        e0, entropy(data, n), net);
         }
 
-        int found = 0;
-        double E0 = entropy(data, n);
-        u8 *temp  = malloc(n);
-        u8 *after = malloc(n);
-
-#define TRY_SCRAMBLE(label, cond, scramble_call) \
-        if (!found && (cond)) { \
-            scramble_call; \
-            double net2; Instr t2 = findBest(temp, n, &net2); \
-            memcpy(after, temp, n); applyInstr(after, n, t2); \
-            double true_net = (E0 - entropy(after, n)) * n - 8.0; \
-            if (true_net > 0) { \
-                memcpy(data, temp, n); \
-                double e0 = entropy(data, n); \
-                applyInstr(data, n, t2); \
-                total_net += true_net; counts[t2.type]++; found = 1; \
-                if (verbose) \
-                    printf("  [%-14s] %-14s s%-2d p%-2d a%-6d  %.6f -> %.6f  net=%.1f\n", \
-                           label, INSTR_NAMES[t2.type], t2.stride, t2.phase, t2.amp, \
-                           e0, entropy(data, n), true_net); \
-            } \
-        }
-
-        TRY_SCRAMBLE("INTERLEAVE-2",  n%2==0,  interleave_stride(data, temp, n, 2))
-        TRY_SCRAMBLE("INTERLEAVE-4",  n%4==0,  interleave_stride(data, temp, n, 4))
-        TRY_SCRAMBLE("INTERLEAVE-8",  n%8==0,  interleave_stride(data, temp, n, 8))
-        TRY_SCRAMBLE("INTERLEAVE-16", n%16==0, interleave_stride(data, temp, n, 16))
-        TRY_SCRAMBLE("INTERLEAVE-32", n%32==0, interleave_stride(data, temp, n, 32))
-        TRY_SCRAMBLE("INTERLEAVE-64", n%64==0, interleave_stride(data, temp, n, 64))
-        TRY_SCRAMBLE("BIT-PLANE-SEP", n%8==0,  bit_plane_sep(data, temp, n))
-        TRY_SCRAMBLE("NIB-PLANE-SEP", n%2==0,  nib_plane_sep(data, temp, n))
-        TRY_SCRAMBLE("BLOCK-REVERSE", 1,       block_reverse(data, temp, n))
-        TRY_SCRAMBLE("XOR-FOLD-SCR",  n%2==0,  xor_fold_scramble(data, temp, n))
-
-#undef TRY_SCRAMBLE
-
-        free(after);
-        free(temp);
-        if (!found) break;
+        /* phase 2: last-resort SCRAMBLE when greedy is stuck */
+        if (!try_scramble(data, n, &total_net, counts, verbose, 16, 6)) break;
     }
     return total_net;
 }
@@ -538,9 +650,34 @@ int main(void) {
     int counts[NUM_INSTR_TYPES] = {0};
     double sum = 0.0;
 
+    /* load or generate seed data — seed.bin ensures reproducible runs */
+    static u8 alldata[NUM_BLOCKS * BLOCK_SIZE];
+    {
+        FILE *sf = fopen("seed.bin", "rb");
+        int loaded = 0;
+        if (sf) {
+            size_t got = fread(alldata, 1, sizeof alldata, sf);
+            fclose(sf);
+            if (got == sizeof alldata) {
+                printf("loaded seed.bin (%d bytes)\n", (int)sizeof alldata);
+                loaded = 1;
+            } else {
+                printf("seed.bin wrong size (%d/%d bytes), regenerating\n",
+                       (int)got, (int)sizeof alldata);
+            }
+        }
+        if (!loaded) {
+            for (int b = 0; b < NUM_BLOCKS; b++)
+                fill_random(alldata + b * BLOCK_SIZE, BLOCK_SIZE);
+            sf = fopen("seed.bin", "wb");
+            if (sf) { fwrite(alldata, 1, sizeof alldata, sf); fclose(sf); }
+            printf("generated and saved seed.bin (%d bytes)\n", (int)sizeof alldata);
+        }
+    }
+
     for (int b = 0; b < NUM_BLOCKS; b++) {
         u8 *data = malloc(BLOCK_SIZE);
-        fill_random(data, BLOCK_SIZE);
+        memcpy(data, alldata + b * BLOCK_SIZE, BLOCK_SIZE);
         double e0 = entropy(data, BLOCK_SIZE);
         double net = compress(data, BLOCK_SIZE, /*verbose=*/ b == 0, counts);
         double e1 = entropy(data, BLOCK_SIZE);
