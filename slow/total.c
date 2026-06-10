@@ -15,6 +15,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 
 typedef uint8_t  u8;
 typedef uint32_t u32;
@@ -24,11 +25,14 @@ typedef uint32_t u32;
 #define MAX_CHUNKS  20         /* how many 4096-byte chunks to process (SINGLE_BLOCK=0) */
 #define BLOCK_SIZE  4096
 #define SINGLE_BLOCK       0   /* 1 = treat entire ANS output as one block (no chunking) */
-#define VERBOSE            1   /* 1 = print per-instruction detail                       */
-#define ANALYSE            1   /* 1 = print pattern profile before entropy reduction      */
+#define VERBOSE            0   /* 1 = print per-instruction detail                       */
+#define ANALYSE            0   /* 1 = print pattern profile before entropy reduction      */
 #define ANALYSE_MAX_STRIDE 64  /* stride scan for findBest/verification (1..N)           */
 #define ANALYSE_TRI_MAX    32  /* stride scan for TRIPLE category (<=ANALYSE_MAX_STRIDE) */
 #define HLOG_MAX  (MAX_CHUNKS * BLOCK_SIZE * 2 + 2)  /* hlog/hlogf table size */
+#define SKIP_NEVER_FIRE 1  /* 1 = skip instruction types that never fire on near-entropy ANS output   */
+#define ACORR_COMPARE  0   /* 1 = run filtered findBest alongside exhaustive to measure quality delta */
+#define ACORR_TOP_K   12   /* # strides kept by autocorrelation pre-filter in filtered mode           */
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  ANS CODER  (Subbotin carryless range coder + adaptive order-0 model)
@@ -132,6 +136,10 @@ static void init_hlog(void) {
 #define ANA_MODE           1   /* 0=off  1=always (runs every round) */
 #define ANA_MAX_INTERLEAVE 128 /* max round slots per chunk (greedy+analytic each get own slot) */
 
+/* One interleave slot per chunk.  K==0 → greedy pass (g_ni instructions stored
+ * in the per-chunk ilist).  K>0 → analytic pass (period-K XOR/ADD pattern,
+ * no ilist entry; op=0 XOR, op=1 ADD).  Greedy and analytic slots alternate
+ * so the analytic sub-loop can piggyback on each greedy pass's output. */
 typedef struct { u8 pat[ANA_MAX_K]; int K; int op; int g_ni; } RoundInfo;
 
 static float hlogf[HLOG_MAX];
@@ -154,7 +162,12 @@ static void undo_analytic(u8 *data, int n, u8 *pat, int K, int op) {
     else         for (int i = 0; i < n; i++) data[i] = (u8)((data[i] - pat[i % K] + 256) & 0xFF);
 }
 
-/* Returns net gain in bits (0 = no improvement). Fills best_pat[0..(*best_K)-1]. */
+/* Analytic period-K transform: apply the same K-byte pattern cyclically.
+ * For each K, find the pattern p[0..K-1] that minimises H of the merged
+ * frequency table.  Uses coordinate descent: fix all but one phase slot,
+ * optimise that slot by trying all 256 values in O(256 × nz) per slot,
+ * repeat until no slot changes.  Key cost = 8K + 4 bits.
+ * op=0 → XOR, op=1 → ADD.  Returns net gain in bits (0 = no improvement). */
 static double find_best_analytic(u8 *data, int n, u8 *best_pat, int *best_K, int op) {
     int freq0[256] = {0};
     for (int i = 0; i < n; i++) freq0[data[i]]++;
@@ -362,6 +375,10 @@ static double find_best_ctx256_xor(const u8 *data, int n, u8 *amp_out) {
     return net;  /* caller checks > 0 before applying */
 }
 
+/* Instruction overhead model: cost in bits to store one instruction in the key.
+ * INSTR_BASE (12 bits) = type (5 bits) + stride (4 bits) + phase (3 bits).
+ * INSTR_BASE_NOPHASE (5 bits) = type only (no stride/phase, e.g. LAG_XOR).
+ * ab = additional bits needed for the amplitude field (varies per instruction). */
 #define INSTR_BASE          12
 #define INSTR_BASE_NOPHASE   5
 #define INSTR_OHD(ab)         ((double)(INSTR_BASE         + (ab)))
@@ -550,6 +567,9 @@ static void applyInstr(u8 *data, int n, Instr t) {
         int m2=((t.amp>>14)&0x7F)*2+3,m3=((t.amp>>21)&0x7F)*2+3;
         int mm[4]={m0,m1,m2,m3}; int k=0;
         for(i=t.phase;i<n;i+=t.stride,k++) data[i]=(u8)((data[i]*mm[k&3])&0xFF); break; }
+    /* CTX4: context = top 2 bits of PREVIOUS OUTPUT byte (post-transform).
+     * prev tracks the already-transformed value so the context at decode time
+     * is reconstructed the same way (decoder reads the compressed stream). */
     case CTX4_XOR: { u8 a[4]={(u8)(t.amp&0xFF),(u8)((t.amp>>8)&0xFF),(u8)((t.amp>>16)&0xFF),(u8)(t.amp>>24)};
         u8 prev=0;
         for(i=0;i<n;i++){data[i]^=a[(prev>>6)&3]; prev=data[i];} break; }
@@ -664,9 +684,11 @@ static double mul_eval_S(const int *dv, const int *phF, int m) {
     for(int v=0;v<256;v++) S+=hlog[dv[v]+phF[(v*(int)mul_inv[m])&0xFF]];
     return S;
 }
+/* MUL amp search: only odd values 3..255 are valid (must be coprime to 256).
+ * Coarse scan at stride 32 (8 probes) finds the rough neighbourhood, then
+ * three ±32 refinement windows around the top-3 coarse hits find the exact peak.
+ * S(m) is memoized so each distinct m is evaluated at most once per call. */
 static int mul_best_amp(const int *dv, const int *phF, double *Sout) {
-    /* memoize S(m): the refine windows overlap each other and the coarse
-       probes, so each distinct m is evaluated once (values unchanged) */
     double Sc[256]; u8 seen[256]={0};
     int top3a[3]={3,35,67}; double top3s[3]={-1e30,-1e30,-1e30};
     for(int m=3;m<256;m+=32){
@@ -734,8 +756,16 @@ static void invert_scramble(u8 *data, int n, int si) {
     else if(inv_si>=0){apply_scramble(inv_si,data,tmp,n);memcpy(data,tmp,n);}
 }
 
-/* ── findBest (verbatim from simple.c) ──────────────────────────────────── */
-static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
+/* findBest: exhaustive search over all instruction types and strides.
+ * Returns the single instruction with the highest net gain (entropy reduction
+ * in bits minus key overhead).  net > 0 means that instruction is worth using.
+ *
+ * Sbase = Σ hlog[total[v]] = n × log2(n) − n × H(data), the reference score.
+ * For any candidate transform, score S = Σ hlog[merged_freq[v]].
+ * Net gain = (S − Sbase) − overhead_bits.  Higher S = lower H = better.
+ *
+ * set_freq_cache(total) must be called before xor_best_amp / add_cyclic_corr. */
+static Instr findBest_impl(const u8 *data, int n, double *netOut, int max_stride, const int *only_strides) {
     int total[256]={0};
     for(int i=0;i<n;i++) total[data[i]]++;
     double hlt[256],Sbase=0.0;
@@ -746,6 +776,7 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
     Instr  best={XOR_PHASE,2,0,1};
     int phF[256];
 
+#if !SKIP_NEVER_FIRE
     /* LAG_XOR */
     for(int lag=1;lag<n&&lag<=255;lag++){
         int lxfreq[256]; for(int v=0;v<256;v++) lxfreq[v]=total[v];
@@ -761,6 +792,7 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
         double Sla=0.0; for(int v=0;v<256;v++) Sla+=hlog[lafreq[v]];
         double nla=(Sla-Sbase)-INSTR_OHD_NOPHASE(8);
         if(nla>bestNet){bestNet=nla;best=(Instr){LAG_ADD,0,0,(unsigned)lag};}}
+#endif
 
     /* CTX4_XOR / CTX4_ADD: 4 contexts keyed on top 2 bits of previous byte */
     {
@@ -769,11 +801,13 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
         for(int i=0;i<n;i++){phF4[(prevC>>6)&3][data[i]]++; prevC=data[i];}
         int dv4[4][256];
         for(int c=0;c<4;c++) for(int v=0;v<256;v++) dv4[c][v]=total[v]-phF4[c][v];
+#if !SKIP_NEVER_FIRE
         double S4x=0.0; unsigned amp4x=0;
         for(int c=0;c<4;c++){double Sc; int ac=xor_best_amp(dv4[c],phF4[c],&Sc);
             S4x+=Sc; amp4x|=(unsigned)(ac&0xFF)<<(c*8);}
         double n4x=S4x-4.0*Sbase-INSTR_OHD(32);
         if(n4x>bestNet){bestNet=n4x; best=(Instr){CTX4_XOR,1,0,amp4x};}
+#endif
         double S4a=0.0; unsigned amp4a=0;
         for(int c=0;c<4;c++){double Sc; int ac=add_best_amp(dv4[c],phF4[c],6,&Sc);
             S4a+=Sc; amp4a|=(unsigned)(ac&0xFF)<<(c*8);}
@@ -782,6 +816,8 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
     }
 
     for(int stride=1;stride<=max_stride;stride++){
+        if(only_strides && !only_strides[stride]) continue;
+#if !SKIP_NEVER_FIRE
         /* POLY_DELTA_XOR */
         if(stride<=32){
         for(int s1=1;s1<stride;s1++){
@@ -791,6 +827,7 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
             double Spd=0.0; for(int v=0;v<256;v++) Spd+=hlog[pdfreq[v]];
             double npd=(Spd-Sbase)-INSTR_OHD(6);
             if(npd>bestNet){bestNet=npd;best=(Instr){POLY_DELTA_XOR,s1,stride,0};}}}
+#endif
 
         for(int phase=0;phase<stride;phase++){
             memset(phF,0,sizeof phF);
@@ -800,6 +837,7 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
             /* XOR_PHASE */ { double Sx; int ax=xor_best_amp(dv,phF,&Sx);
                 double nx=(Sx-Sbase)-INSTR_OHD(8);
                 if(nx>bestNet){bestNet=nx;best=(Instr){XOR_PHASE,stride,phase,ax};}}
+#if !SKIP_NEVER_FIRE
             /* ADD_PHASE */ { double Sa; int aa=add_best_amp(dv,phF,6,&Sa);
                 double na=(Sa-Sbase)-INSTR_OHD(8);
                 if(na>bestNet){bestNet=na;best=(Instr){ADD_PHASE,stride,phase,aa};}}
@@ -823,28 +861,24 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
                 double ncpx=(Sx0-Sbase)+(Sx1-Sbase)-INSTR_OHD(16);
                 if(ncpx>bestNet){bestNet=ncpx;best=(Instr){COND_PREV_XOR,stride,phase,
                     (unsigned)(ax0|(ax1<<8))};}}
+#endif
             /* COND_LO_XOR */ {
                 double best_sub=-1e30; unsigned best_sub_amp=0x11;
                 for(int nib=0;nib<16;nib++){
-                    int cf[256]={0}; for(int v=0;v<256;v++) if((v>>4)==nib) cf[v]=phF[v];
-                    int bg[256]; for(int v=0;v<256;v++) bg[v]=total[v]-cf[v];
-                    int remap[16]={0},remapc[16]={0};
-                    for(int v=0;v<256;v++) if((v>>4)==nib){remap[v&0xF]+=cf[v];remapc[v&0xF]+=bg[v];}
-                    double Sr=-1e30; int ar=1;
-                    {int ha2[128],hb2[128];
-                    for(int i=0;i<16;i++){ha2[i]=remapc[i];hb2[i]=remap[i];}
-                    for(int i=16;i<128;i++){ha2[i]=0;hb2[i]=0;}
-                    int cands2[3]={1,2,3}; long long best_pr=INT64_MIN;
-                    {int wa[128],wb[128]; memcpy(wa,ha2,128*sizeof(int)); memcpy(wb,hb2,128*sizeof(int));
-                    wht128(wa); wht128(wb);
-                    for(int kk=1;kk<16;kk++){long long pp=(long long)wa[kk]*wb[kk];
-                        if(pp>best_pr){best_pr=pp;cands2[0]=kk;}}}
-                    for(int t=0;t<1;t++){double S2=0.0;
-                        for(int i=0;i<16;i++) S2+=hlog[remapc[i]+remap[i^cands2[t]]];
-                        if(S2>Sr){Sr=S2;ar=cands2[t];}}
+                    int base=nib<<4;
+                    int remap[16],remapc[16];
+                    /* direct O(16) build — equivalent to the original O(256) cf/bg/remap loops */
+                    for(int lo=0;lo<16;lo++){remap[lo]=phF[base+lo];remapc[lo]=total[base+lo]-phF[base+lo];}
+                    /* 16-pt WHT: identical to the original 128-pt WHT on zero-padded input
+                       because WHT_128([a0..a15,0..0])[k] == WHT_16([a0..a15])[k] for k<16 */
+                    int wa[16],wb[16]; memcpy(wa,remapc,16*sizeof(int)); memcpy(wb,remap,16*sizeof(int));
+                    for(int len=1;len<16;len<<=1) for(int i=0;i<16;i+=len<<1) for(int j=0;j<len;j++){int u=wa[i+j],v2=wa[i+j+len];wa[i+j]=u+v2;wa[i+j+len]=u-v2;}
+                    for(int len=1;len<16;len<<=1) for(int i=0;i<16;i+=len<<1) for(int j=0;j<len;j++){int u=wb[i+j],v2=wb[i+j+len];wb[i+j]=u+v2;wb[i+j+len]=u-v2;}
+                    long long best_pr=INT64_MIN; int ar=1;
+                    for(int kk=1;kk<16;kk++){long long pp=(long long)wa[kk]*wb[kk];if(pp>best_pr){best_pr=pp;ar=kk;}}
                     double gain_sub=0.0;
-                    for(int v=0;v<256;v++) if((v>>4)==nib){
-                        int nv=(v&0xF0)|((v^ar)&0xF);
+                    for(int lo=0;lo<16;lo++){
+                        int v=base+lo, nv=base+((lo^ar)&0xF);
                         gain_sub+=hlog[total[nv]-phF[nv]+phF[v]]-hlog[total[nv]];
                         gain_sub+=hlog[total[v]-phF[v]+phF[nv]]-hlog[total[v]];}
                     if(gain_sub>best_sub){best_sub=gain_sub;best_sub_amp=(unsigned)(nib<<4)|ar;}}
@@ -856,18 +890,13 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
             /* COND_HI_XOR */ {
                 double best_sub=-1e30; unsigned best_sub_amp=0x11;
                 for(int nib=0;nib<16;nib++){
-                    int cf[256]={0}; for(int v=0;v<256;v++) if((v&0xF)==nib) cf[v]=phF[v];
-                    int remap[16]={0},remapc[16]={0};
-                    for(int v=0;v<256;v++) if((v&0xF)==nib){remap[v>>4]+=cf[v];remapc[v>>4]+=total[v]-cf[v];}
-                    double Sr=-1e30; int ar=1;
-                    {int wa[16],wb[16];
-                    for(int i=0;i<16;i++){wa[i]=remapc[i];wb[i]=remap[i];}
-                    long long best_pr=INT64_MIN;
-                    for(int kk=1;kk<16;kk++){long long pp=(long long)wa[kk]*wb[kk];
-                        if(pp>best_pr){best_pr=pp;ar=kk;}}}
+                    int remap[16],remapc[16];
+                    for(int hi=0;hi<16;hi++){remap[hi]=phF[hi*16+nib];remapc[hi]=total[hi*16+nib]-phF[hi*16+nib];}
+                    long long best_pr=INT64_MIN; int ar=1;
+                    for(int kk=1;kk<16;kk++){long long pp=(long long)remapc[kk]*remap[kk];if(pp>best_pr){best_pr=pp;ar=kk;}}
                     double gain_sub=0.0;
-                    for(int v=0;v<256;v++) if((v&0xF)==nib){
-                        int nv=((v^(ar<<4))&0xF0)|(v&0xF);
+                    for(int hi=0;hi<16;hi++){
+                        int v=hi*16+nib, nv=((hi^ar)<<4)|nib;
                         gain_sub+=hlog[total[nv]-phF[nv]+phF[v]]-hlog[total[nv]];
                         gain_sub+=hlog[total[v]-phF[v]+phF[nv]]-hlog[total[v]];}
                     if(gain_sub>best_sub){best_sub=gain_sub;best_sub_amp=(unsigned)((ar<<4)|nib);}}
@@ -875,29 +904,28 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
                 if(nch>bestNet){bestNet=nch;best=(Instr){COND_HI_XOR,stride,phase,best_sub_amp};}}
             /* COND_LO_ADD / COND_HI_ADD */ {
                 for(int nib=0;nib<16;nib++){
-                    int cf[256]={0}; for(int v=0;v<256;v++) if((v>>4)==nib) cf[v]=phF[v];
-                    int remap[16]={0},remapc[16]={0};
-                    for(int v=0;v<256;v++) if((v>>4)==nib){remap[v&0xF]+=cf[v];remapc[v&0xF]+=total[v]-cf[v];}
+                    int base=nib<<4;
+                    int remap[16],remapc[16];
+                    for(int lo=0;lo<16;lo++){remap[lo]=phF[base+lo];remapc[lo]=total[base+lo]-phF[base+lo];}
                     int corr16[16]={0}; for(int la=0;la<16;la++) for(int l=0;l<16;l++) corr16[la]+=remapc[l]*remap[(l-la)&0xF];
                     int ar=0; for(int la=1;la<16;la++) if(corr16[la]>corr16[ar]) ar=la;
                     if(!ar) continue;
                     double gain_sub=0.0;
-                    for(int v=0;v<256;v++) if((v>>4)==nib){
-                        int nv=(v&0xF0)|((v+ar)&0xF);
+                    for(int lo=0;lo<16;lo++){
+                        int v=base+lo, nv=base+((lo+ar)&0xF);
                         gain_sub+=hlog[total[nv]-phF[nv]+phF[v]]-hlog[total[nv]];
                         gain_sub+=hlog[total[v]-phF[v]+phF[nv]]-hlog[total[v]];}
                     double ncla=gain_sub-INSTR_OHD(8);
                     if(ncla>bestNet){bestNet=ncla;best=(Instr){COND_LO_ADD,stride,phase,(unsigned)(nib<<4)|ar};}}}
             {for(int nib=0;nib<16;nib++){
-                    int cf[256]={0}; for(int v=0;v<256;v++) if((v&0xF)==nib) cf[v]=phF[v];
-                    int remap[16]={0},remapc[16]={0};
-                    for(int v=0;v<256;v++) if((v&0xF)==nib){remap[v>>4]+=cf[v];remapc[v>>4]+=total[v]-cf[v];}
+                    int remap[16],remapc[16];
+                    for(int hi=0;hi<16;hi++){remap[hi]=phF[hi*16+nib];remapc[hi]=total[hi*16+nib]-phF[hi*16+nib];}
                     int corr16[16]={0}; for(int ha=0;ha<16;ha++) for(int h=0;h<16;h++) corr16[ha]+=remapc[h]*remap[(h-ha)&0xF];
                     int ar=0; for(int ha=1;ha<16;ha++) if(corr16[ha]>corr16[ar]) ar=ha;
                     if(!ar) continue;
                     double gain_sub=0.0;
-                    for(int v=0;v<256;v++) if((v&0xF)==nib){
-                        int nv=((((v>>4)+ar)&0xF)<<4)|(v&0xF);
+                    for(int hi=0;hi<16;hi++){
+                        int v=hi*16+nib, nv=((hi+ar)&0xF)*16+nib;
                         gain_sub+=hlog[total[nv]-phF[nv]+phF[v]]-hlog[total[nv]];
                         gain_sub+=hlog[total[v]-phF[v]+phF[nv]]-hlog[total[v]];}
                     double ncha=gain_sub-INSTR_OHD(8);
@@ -915,6 +943,7 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
                 double Sbr=0.0; for(int v=0;v<256;v++) Sbr+=hlog[br_tot[v]];
                 double nbr=(Sbr-Sbase)-INSTR_OHD(3);
                 if(nbr>bestNet){bestNet=nbr;best=(Instr){BIT_ROTATE,stride,phase,(unsigned)k};}}}
+#if !SKIP_NEVER_FIRE
             /* VALUE_XOR */
             /* Group 0: bytes with bit k=0; Group 1: bytes with bit k=1.
                Both amps must have bit k=0 so groups never cross — the transform
@@ -934,6 +963,7 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
                 double Svx=(S0+S1)-Sbase-INSTR_OHD(17);
                 if(Svx>bestNet){bestNet=Svx;best=(Instr){VALUE_XOR,stride,phase,
                     (unsigned)(k|(alo<<3)|(ahi<<11))};}} }
+#endif
             /* DUAL XOR/ADD/MUL (shared histograms) */ { int lo_phF[256]={0},hi_phF[256]={0};
                 int kk=0; for(int i=phase;i<n;i+=stride,kk++){if(kk&1)hi_phF[data[i]]++;else lo_phF[data[i]]++;}
                 int lo_dv[256],hi_dv[256]; for(int v=0;v<256;v++){lo_dv[v]=total[v]-lo_phF[v];hi_dv[v]=total[v]-hi_phF[v];}
@@ -973,20 +1003,55 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
                 for(int r=0;r<4;r++) a4[r]=(unsigned)add_best_amp(dv4[r],ph4[r],6,&S4[r]);
                 nq4=(S4[0]-Sbase)+(S4[1]-Sbase)+(S4[2]-Sbase)+(S4[3]-Sbase)-INSTR_OHD(4*8);
                 if(nq4>bestNet){bestNet=nq4;best=(Instr){QUAD_ADD,stride,phase,a4[0]|(a4[1]<<8)|(a4[2]<<16)|(a4[3]<<24)};}
+#if !SKIP_NEVER_FIRE
                 int idx4[4];
                 for(int r=0;r<4;r++){double Sm; idx4[r]=(mul_best_amp(dv4[r],ph4[r],&Sm)-3)/2;S4[r]=Sm;}
                 nq4=(S4[0]-Sbase)+(S4[1]-Sbase)+(S4[2]-Sbase)+(S4[3]-Sbase)-INSTR_OHD(4*7);
-                if(nq4>bestNet){bestNet=nq4;best=(Instr){QUAD_MUL,stride,phase,(unsigned)(idx4[0]|(idx4[1]<<7)|(idx4[2]<<14)|(idx4[3]<<21))};}}
-            }
+                if(nq4>bestNet){bestNet=nq4;best=(Instr){QUAD_MUL,stride,phase,(unsigned)(idx4[0]|(idx4[1]<<7)|(idx4[2]<<14)|(idx4[3]<<21))};}
+#endif
+            }  /* end if(!g_skip_quad) */
         }
     }
     *netOut = bestNet;
     return best;
 }
 
+/* thin wrapper — full exhaustive search over all strides */
+static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
+    return findBest_impl(data, n, netOut, max_stride, NULL);
+}
+
+#if ACORR_COMPARE
+/* autocorrelation pre-filter: score each stride by XOR-match count, keep top ACORR_TOP_K.
+ * Strides where data[i] == data[i-s] more often tend to have stronger stride structure,
+ * so they earn higher gain from XOR/ADD/COND transforms at that stride. */
+static Instr findBest_filtered(const u8 *data, int n, double *netOut, int max_stride) {
+    int score[65] = {0};
+    for (int s = 1; s <= max_stride; s++)
+        for (int i = s; i < n; i++) score[s] += (data[i] == data[i-s]);
+    /* partial-select top ACORR_TOP_K strides into mask[] */
+    int mask[65] = {0};
+    for (int k = 0; k < ACORR_TOP_K && k < max_stride; k++) {
+        int best_s = 0;
+        for (int s = 1; s <= max_stride; s++)
+            if (!mask[s] && (best_s == 0 || score[s] > score[best_s])) best_s = s;
+        if (best_s > 0) mask[best_s] = 1;
+    }
+    return findBest_impl(data, n, netOut, max_stride, mask);
+}
+#endif
+
 /* ── global instruction list ────────────────────────────────────────────── */
 static Instr g_ilist[4096];
 static int   g_ni;
+
+#if ACORR_COMPARE
+/* per-chunk comparison counters (reset in main before each chunk's greedy loop) */
+static int    g_cmp_steps;       /* greedy steps where exhaustive found net > 0 */
+static int    g_cmp_agree;       /* steps where filtered chose identical instruction */
+static double g_cmp_exh_gain;    /* sum of exhaustive net gains (bits) */
+static double g_cmp_flt_gain;    /* sum of filtered net gains (bits)   */
+#endif
 
 /* ── decompress (invert instruction list in reverse order) ──────────────── */
 static int do_decompress(u8 *data, int n, const Instr *instrs, int ni) {
@@ -1046,6 +1111,9 @@ static int do_decompress(u8 *data, int n, const Instr *instrs, int ni) {
             int m0=i0*2+3,m1=i1*2+3,m2=i2*2+3,m3=i3*2+3;
             int v0=(mul_inv[m0]-3)/2,v1=(mul_inv[m1]-3)/2,v2=(mul_inv[m2]-3)/2,v3=(mul_inv[m3]-3)/2;
             applyInstr(data,n,(Instr){QUAD_MUL,t.stride,t.phase,(unsigned)(v0|(v1<<7)|(v2<<14)|(v3<<21))}); break; }
+        /* Inverse CTX4: backward pass.  Going right-to-left, data[i-1] is still
+         * in its ENCODED (post-transform) state when we process position i, which
+         * is exactly the context value the encoder used — so the XOR/ADD cancels. */
         case CTX4_XOR: { u8 a[4]={(u8)(t.amp&0xFF),(u8)((t.amp>>8)&0xFF),(u8)((t.amp>>16)&0xFF),(u8)(t.amp>>24)};
             for(int i=n-1;i>=0;i--){u8 prev=(i>0)?data[i-1]:0; data[i]^=a[(prev>>6)&3];} break; }
         case CTX4_ADD: { u8 a[4]={(u8)(t.amp&0xFF),(u8)((t.amp>>8)&0xFF),(u8)((t.amp>>16)&0xFF),(u8)(t.amp>>24)};
@@ -1185,11 +1253,11 @@ static void analyse_chunk(const u8 *data, int n, int cidx) {
             for(int i=p;i<n;i+=s) phF[data[i]]++;
             /* COND_LO_XOR: condition on high nibble, XOR low nibble */
             for(int nib=0;nib<16;nib++){
-                double best=-1e30;
+                int base=nib<<4; double best=-1e30;
                 for(int ar=1;ar<16;ar++){
                     double g=0;
-                    for(int v=0;v<256;v++) if((v>>4)==nib){
-                        int nv=(v&0xF0)|((v^ar)&0xF);
+                    for(int lo=0;lo<16;lo++){
+                        int v=base+lo, nv=base+((lo^ar)&0xF);
                         g+=hlog[total[nv]-phF[nv]+phF[v]]-hlog[total[nv]]
                           +hlog[total[v]-phF[v]+phF[nv]]-hlog[total[v]];
                     }
@@ -1199,11 +1267,11 @@ static void analyse_chunk(const u8 *data, int n, int cidx) {
             }
             /* COND_LO_ADD: condition on high nibble, ADD to low nibble */
             for(int nib=0;nib<16;nib++){
-                double best=-1e30;
+                int base=nib<<4; double best=-1e30;
                 for(int ar=1;ar<16;ar++){
                     double g=0;
-                    for(int v=0;v<256;v++) if((v>>4)==nib){
-                        int nv=(v&0xF0)|((v+ar)&0xF);
+                    for(int lo=0;lo<16;lo++){
+                        int v=base+lo, nv=base+((lo+ar)&0xF);
                         g+=hlog[total[nv]-phF[nv]+phF[v]]-hlog[total[nv]]
                           +hlog[total[v]-phF[v]+phF[nv]]-hlog[total[v]];
                     }
@@ -1216,8 +1284,8 @@ static void analyse_chunk(const u8 *data, int n, int cidx) {
                 double best=-1e30;
                 for(int ar=1;ar<16;ar++){
                     double g=0;
-                    for(int v=0;v<256;v++) if((v&0xF)==nib){
-                        int nv=((v^(ar<<4))&0xF0)|(v&0xF);
+                    for(int hi=0;hi<16;hi++){
+                        int v=(hi<<4)|nib, nv=((hi^ar)<<4)|nib;
                         g+=hlog[total[nv]-phF[nv]+phF[v]]-hlog[total[nv]]
                           +hlog[total[v]-phF[v]+phF[nv]]-hlog[total[v]];
                     }
@@ -1230,8 +1298,8 @@ static void analyse_chunk(const u8 *data, int n, int cidx) {
                 double best=-1e30;
                 for(int ar=1;ar<16;ar++){
                     double g=0;
-                    for(int v=0;v<256;v++) if((v&0xF)==nib){
-                        int nv=(((v>>4)+ar)&0xF)<<4|(v&0xF);
+                    for(int hi=0;hi<16;hi++){
+                        int v=(hi<<4)|nib, nv=((hi+ar)&0xF)<<4|nib;
                         g+=hlog[total[nv]-phF[nv]+phF[v]]-hlog[total[nv]]
                           +hlog[total[v]-phF[v]+phF[nv]]-hlog[total[v]];
                     }
@@ -1415,19 +1483,28 @@ static void analyse_chunk(const u8 *data, int n, int cidx) {
     printf("\n");
 }
 
-/* ── greedy compress (simplified: no try_scramble for speed) ─────────────── */
+/* Greedy entropy-reduction loop.  Each iteration picks the single instruction
+ * with the highest estimated net gain, applies it, then measures the actual
+ * entropy change.  The e1 >= e0 guard rejects instructions whose gain estimate
+ * was a false positive (can happen near convergence due to hlog discretisation);
+ * the rejected instruction is reversed so the data stays valid. */
 static double compress_greedy(u8 *data, int n, int verbose, int *counts) {
     double total_net = 0.0;
     g_ni = 0;
+    double e0 = entropy(data, n);  /* carried forward each iteration to avoid recomputing */
     for (;;) {
         if (g_ni >= 4094) break;
         double net;
         Instr t = findBest(data, n, &net, 64);
         if (net <= 0.0) break;
-        double e0 = entropy(data, n);
+#if ACORR_COMPARE
+        { double fnet; Instr tf = findBest_filtered(data, n, &fnet, 64);
+          g_cmp_steps++;
+          if (tf.type==t.type && tf.stride==t.stride && tf.phase==t.phase) g_cmp_agree++;
+          g_cmp_exh_gain += net; g_cmp_flt_gain += fnet; }
+#endif
         applyInstr(data, n, t);
         double e1 = entropy(data, n);
-        /* reject if entropy didn't actually decrease (model error protection) */
         if (e1 >= e0) { do_decompress(data, n, &t, 1); break; }
         g_ilist[g_ni++] = t;
         total_net += (e0 - e1) * n;  /* use actual bit reduction */
@@ -1436,6 +1513,7 @@ static double compress_greedy(u8 *data, int n, int verbose, int *counts) {
             printf("    %-14s s%-2d p%-2d a%-8u  %.6f -> %.6f  net=%.1f\n",
                    INSTR_NAMES[t.type], t.stride, t.phase, t.amp,
                    e0, e1, (e0 - e1) * n);
+        e0 = e1;  /* reuse for next iteration */
     }
     return total_net;
 }
@@ -1568,15 +1646,16 @@ int main(void) {
 
     printf("%-7s  %-9s  %-7s  %-9s  %-9s  %-10s  %-5s  %-10s  %-4s  %-3s  %s\n",
            "chunk", "H_ans", "csz", "H_red", "delta-H", "net(bits)", "ni",
-           "ana_net", "rnd", "ok?", "top instr");
-    printf("%-7s  %-9s  %-7s  %-9s  %-9s  %-10s  %-5s  %-10s  %-4s  %-3s  %s\n",
+           "ana_net", "rnd", "ok?", "time  top instr");
+    printf("%-7s  %-9s  %-7s  %-9s  %-9s  %-10s  %-5s  %-10s  %-4s  %-3s  %-7s  %s\n",
            "-------", "---------", "-------", "---------", "---------",
-           "----------", "-----", "----------", "----", "---", "---------");
+           "----------", "-----", "----------", "----", "---", "-------", "---------");
 
     for (int c = 0; c < n_chunks; c++) {
         int off = c * BLOCK_SIZE;
         int csz = (off + BLOCK_SIZE <= ans_len) ? BLOCK_SIZE : (ans_len - off);
         u8 *chunk = ans_stream + off;
+        clock_t chunk_t0 = clock();
 
         double H_chunk = entropy(chunk, csz);
 
@@ -1591,17 +1670,17 @@ int main(void) {
         if (ANALYSE) analyse_chunk(chunk, csz, c);
         if (verbose_this) printf("[chunk 0 detail]\n");
 
-        /* ── interleaved greedy + analytic sub-loop until convergence ──────── */
-        /* Each analytic application gets its own slot (g_ni=0, K>0).
-         * The undo loop already handles mixed/pure slots correctly.         */
+        /* ── greedy+analytic interleaved reduction ───────────────────────── */
         double net_c     = 0.0;
         double ana_net_c = 0.0;
         int    total_ni_c = 0;
-        int    s = 0;   /* current slot index into rounds[c] */
-        nrounds_arr[c]    = 0;
+        int    s = 0;
+        nrounds_arr[c] = 0;
+#if ACORR_COMPARE
+        g_cmp_steps = 0; g_cmp_agree = 0; g_cmp_exh_gain = 0.0; g_cmp_flt_gain = 0.0;
+#endif
 
         for (int iter = 0; iter < 16 && s < ANA_MAX_INTERLEAVE; iter++) {
-            /* greedy pass → greedy-only slot */
             int cnt_r[NUM_INSTR_TYPES] = {0};
             double gn = compress_greedy(chunk, csz, (iter == 0 ? verbose_this : 0), cnt_r);
             if (iter == 0 && verbose_this) printf("\n");
@@ -1615,7 +1694,6 @@ int main(void) {
             net_c += gn;
             nrounds_arr[c] = ++s;
 
-            /* analytic sub-loop: keep firing on new periods until no gain */
             double an = 0.0;
             while (s < ANA_MAX_INTERLEAVE && ANA_MODE > 0) {
                 u8 px[ANA_MAX_K]; int Kx;
@@ -1639,14 +1717,13 @@ int main(void) {
                 an += best;
             }
             ana_net_c += an;
-
             if (gn <= 0.0 && an <= 0.0) break;
         }
 
         ni_list[c]    = total_ni_c;
         double H_red_c = entropy(chunk, csz);
 
-        /* round-trip verify: undo in reverse round order */
+        /* round-trip verify */
         u8 *tmp = malloc(csz);
         memcpy(tmp, chunk, csz);
         {
@@ -1670,22 +1747,61 @@ int main(void) {
             if (counts[i] > counts[top_type]) top_type = i;
         for (int i = 0; i < NUM_INSTR_TYPES; i++) total_counts[i] += counts[i];
 
-        printf("%-7d  %-9.6f  %-7d  %-9.6f  %-+9.6f  %-+10.1f  %-5d  %-+10.1f  %-4d  %-3s  %s\n",
+        double chunk_sec = (double)(clock() - chunk_t0) / CLOCKS_PER_SEC;
+#if ACORR_COMPARE
+        if (g_cmp_steps > 0) {
+            double missed = g_cmp_exh_gain - g_cmp_flt_gain;
+            printf("  [acorr K=%-2d  steps=%d  agree=%d/%d(%.0f%%)  "
+                   "exh=%+.1f  flt=%+.1f  missed=%+.1f bits]\n",
+                   ACORR_TOP_K, g_cmp_steps, g_cmp_agree, g_cmp_steps,
+                   100.0 * g_cmp_agree / g_cmp_steps,
+                   g_cmp_exh_gain, g_cmp_flt_gain, missed);
+        }
+#endif
+        printf("%-7d  %-9.6f  %-7d  %-9.6f  %-+9.6f  %-+10.1f  %-5d  %-+10.1f  %-4d  %-3s  %-7.3fs  %s\n",
                c, H_chunk, csz, H_red_c, H_red_c - H_chunk, net_c, ni_list[c],
-               ana_net_c, nrounds_arr[c],
-               ok ? "ok" : "FAIL",
+               ana_net_c, nrounds_arr[c], ok ? "ok" : "FAIL", chunk_sec,
                ni_list[c] > 0 ? INSTR_NAMES[top_type] : "-");
 
-        total_net += net_c; total_H_ans += H_chunk; total_H_red += H_red_c;
-        total_ana_net += ana_net_c;
+        total_net += net_c; total_ana_net += ana_net_c;
+        total_H_ans += H_chunk; total_H_red += H_red_c;
+#if ACORR_COMPARE
+        total_cmp_steps += g_cmp_steps; total_cmp_agree += g_cmp_agree;
+        total_cmp_exh   += g_cmp_exh_gain; total_cmp_flt += g_cmp_flt_gain;
+#endif
     }
+
+#if ACORR_COMPARE
+    if (total_cmp_steps > 0) {
+        double tot_missed = total_cmp_exh - total_cmp_flt;
+        double miss_pct   = total_cmp_exh > 0.0 ? 100.0 * tot_missed / total_cmp_exh : 0.0;
+        printf("\n[acorr K=%d summary over %d chunks]\n", ACORR_TOP_K, n_chunks);
+        printf("  steps : %d  agree : %d / %d (%.1f%%)\n",
+               total_cmp_steps, total_cmp_agree, total_cmp_steps,
+               100.0 * total_cmp_agree / total_cmp_steps);
+        printf("  exh gain : %+.1f bits  flt gain : %+.1f bits\n",
+               total_cmp_exh, total_cmp_flt);
+        printf("  missed   : %+.1f bits  (%.2f%% of exhaustive gain)\n",
+               tot_missed, miss_pct);
+    }
+#endif
 
     /* ── SECOND LAYER: per-chunk ANS2 on entropy-reduced stream ─────────── */
     printf("\n--- second layer test ---\n");
     {
         /* Per-chunk adaptive ANS2 with raw fallback.
-         * Format: [n_chunks × uint16 stored_len (bit15=1 → raw)] [payloads...]
-         * Using the same BLOCK_SIZE chunk boundaries as layer-1.
+         *
+         * Why per-chunk rather than one stream: the layer-1 entropy reduction
+         * applies different transforms to each chunk, so each chunk's byte
+         * distribution is locally concentrated (H≈7.71) but the GLOBAL
+         * distribution across all chunks is still near-flat.  A single ANS2
+         * pass on the concatenated stream sees only that global near-flat
+         * distribution and barely compresses.  Per-chunk ANS2 lets each chunk's
+         * locally lower entropy be exploited independently.
+         *
+         * Wire format: [n_chunks × uint16 stored_len (bit15=1 → raw)] [payloads...]
+         * Stored raw when ANS2 output ≥ chunk size (rare, but adaptive ANS can
+         * expand highly-structured small blocks on first pass).
          */
         int header_bytes = n_chunks * 2;
         int ans2_cap = header_bytes + ans_len + n_chunks * 8;
@@ -1832,7 +1948,7 @@ int main(void) {
            (total_H_red-total_H_ans)/n_chunks,
            total_net, total_net/n_chunks,
            total_ana_net, total_ana_net/n_chunks,
-           total_net + total_ana_net, (total_net + total_ana_net)/n_chunks);
+           total_net+total_ana_net, (total_net+total_ana_net)/n_chunks);
 
     printf("\ninstruction usage:\n");
     for (int i = 0; i < NUM_INSTR_TYPES; i++)
