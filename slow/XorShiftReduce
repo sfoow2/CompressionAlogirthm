@@ -1,0 +1,97 @@
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <time.h>
+
+typedef uint8_t  u8;
+typedef uint32_t u32;
+
+#define FILE_PATH   "C:/Users/lukac/Documents/compressor/chunk2.bin"
+#define OUT_PATH    "C:/Users/lukac/Documents/compressor/out.bin"
+#define SEARCH_MAX  (1 << 16)
+
+static double hlog[4097];
+
+void init_hlog(int n) {
+    hlog[0] = 0.0;
+    for (int k = 1; k <= n; k++) hlog[k] = k * log2((double)k);
+}
+
+double entropy(int *freq, int n) {
+    double s = 0.0;
+    for (int i = 0; i < 256; i++) if (freq[i]) s += hlog[freq[i]];
+    return log2((double)n) - s / n;
+}
+
+u32 xorshift(u32 *s) { *s^=*s<<13; *s^=*s>>17; *s^=*s<<5; return *s; }
+
+void do_xor_stream(u8 *data, int n, int seed) {
+    u32 s = (u32)seed ^ 0xDEADBEEFu; if (!s) s = 1;
+    int i = 0;
+    for (; i <= n - 4; i += 4) {
+        u32 r = xorshift(&s);
+        data[i+0] ^= (u8)(r      );
+        data[i+1] ^= (u8)(r >>  8);
+        data[i+2] ^= (u8)(r >> 16);
+        data[i+3] ^= (u8)(r >> 24);
+    }
+    for (; i < n; i++) { u32 r = xorshift(&s); data[i] ^= (u8)r; }
+}
+
+int main() {
+    FILE *f = fopen(FILE_PATH, "rb");
+    if (!f) { fprintf(stderr, "cannot open %s\n", FILE_PATH); return 1; }
+    fseek(f, 0, SEEK_END); int n = (int)ftell(f); rewind(f);
+    u8 *orig = malloc(n);
+    fread(orig, 1, n, f); fclose(f);
+
+    init_hlog(n);
+
+    int freq0[256] = {0};
+    for (int i = 0; i < n; i++) freq0[orig[i]]++;
+    double H0 = entropy(freq0, n);
+    printf("original entropy : %.6f bpb  (%.1f bits total)\n\n", H0, H0 * n);
+
+    clock_t t0 = clock();
+    int    freq[256];
+    double best_H    = H0;
+    int    best_seed = 0;
+
+    for (int s = 1; s < SEARCH_MAX; s++) {
+        memset(freq, 0, 256 * sizeof(int));
+        u32 st = (u32)s ^ 0xDEADBEEFu; if (!st) st = 1;
+        int i = 0;
+        for (; i <= n - 4; i += 4) {
+            u32 r = xorshift(&st);
+            freq[orig[i+0] ^ (u8)(r      )]++;
+            freq[orig[i+1] ^ (u8)(r >>  8)]++;
+            freq[orig[i+2] ^ (u8)(r >> 16)]++;
+            freq[orig[i+3] ^ (u8)(r >> 24)]++;
+        }
+        for (; i < n; i++) { u32 r = xorshift(&st); freq[orig[i] ^ (u8)r]++; }
+        double H = entropy(freq, n);
+        if (H < best_H) { best_H = H; best_seed = s; }
+    }
+
+    double raw = (H0 - best_H) * n;
+    double key = log2(best_seed + 1) + 1.0;
+    printf("best seed  : %d\n", best_seed);
+    printf("entropy    : %.6f bpb\n", best_H);
+    printf("raw gain   : %.1f bits\n", raw);
+    printf("key cost   : %.1f bits\n", key);
+    printf("net gain   : %.1f bits\n", raw - key);
+    printf("time       : %.3f s\n", (double)(clock() - t0) / CLOCKS_PER_SEC);
+
+    /* write output */
+    u8 *out = malloc(n);
+    memcpy(out, orig, n);
+    do_xor_stream(out, n, best_seed);
+    FILE *fo = fopen(OUT_PATH, "wb");
+    fwrite(out, 1, n, fo); fclose(fo);
+    printf("written to %s\n", OUT_PATH);
+
+    free(orig); free(out);
+    return 0;
+}
