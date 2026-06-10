@@ -10,7 +10,8 @@ typedef uint32_t u32;
 
 #define FILE_PATH   "C:/Users/lukac/Documents/compressor/chunk2.bin"
 #define OUT_PATH    "C:/Users/lukac/Documents/compressor/out.bin"
-#define SEARCH_MAX  (1 << 16)
+#define MAX_K       16
+#define MAX_ROUNDS  64
 
 static double hlog[4097];
 
@@ -19,79 +20,134 @@ void init_hlog(int n) {
     for (int k = 1; k <= n; k++) hlog[k] = k * log2((double)k);
 }
 
-double entropy(int *freq, int n) {
+double entropy_freq(int *freq, int n) {
     double s = 0.0;
     for (int i = 0; i < 256; i++) if (freq[i]) s += hlog[freq[i]];
     return log2((double)n) - s / n;
 }
 
-u32 xorshift(u32 *s) { *s^=*s<<13; *s^=*s>>17; *s^=*s<<5; return *s; }
+void apply_pattern(u8 *data, int n, u8 *pat, int K) {
+    for (int i = 0; i < n; i++) data[i] ^= pat[i % K];
+}
 
-void do_xor_stream(u8 *data, int n, int seed) {
-    u32 s = (u32)seed ^ 0xDEADBEEFu; if (!s) s = 1;
-    int i = 0;
-    for (; i <= n - 4; i += 4) {
-        u32 r = xorshift(&s);
-        data[i+0] ^= (u8)(r      );
-        data[i+1] ^= (u8)(r >>  8);
-        data[i+2] ^= (u8)(r >> 16);
-        data[i+3] ^= (u8)(r >> 24);
+/* find best period-K pattern for current data.
+   returns net gain (raw - key_bits), fills best_pat and best_K. */
+double find_best_analytic(u8 *data, int n, u8 *best_pat, int *best_K) {
+    int freq0[256] = {0};
+    for (int i = 0; i < n; i++) freq0[data[i]]++;
+    double H0 = entropy_freq(freq0, n);
+
+    double overall_net = 0.0;
+    double overall_H   = H0;
+    *best_K = 0;
+
+    for (int K = 2; K <= MAX_K; K++) {
+        int sub[MAX_K][256];
+        memset(sub, 0, sizeof(sub));
+        for (int i = 0; i < n; i++) sub[i % K][data[i]]++;
+
+        u8     pat[MAX_K] = {0};
+        double best_H = H0;
+        int    combined[256];
+
+        if (K <= 3) {
+            for (int x1 = 0; x1 < 256; x1++) {
+                int x2_hi = (K == 3) ? 256 : 1;
+                for (int x2 = 0; x2 < x2_hi; x2++) {
+                    memset(combined, 0, 256 * sizeof(int));
+                    for (int p = 0; p < K; p++) {
+                        int xp = (p == 0) ? 0 : (p == 1) ? x1 : x2;
+                        for (int v = 0; v < 256; v++) combined[v ^ xp] += sub[p][v];
+                    }
+                    double H = entropy_freq(combined, n);
+                    if (H < best_H) {
+                        best_H = H;
+                        pat[0] = 0; pat[1] = (u8)x1;
+                        if (K == 3) pat[2] = (u8)x2;
+                    }
+                }
+            }
+        } else {
+            for (int pass = 0; pass < 4; pass++) {
+                for (int p = 1; p < K; p++) {
+                    double lbest_H = H0 * 2; u8 lbest_x = pat[p];
+                    for (int xp = 0; xp < 256; xp++) {
+                        memset(combined, 0, 256 * sizeof(int));
+                        for (int q = 0; q < K; q++) {
+                            int xq = (q == p) ? xp : (int)pat[q];
+                            for (int v = 0; v < 256; v++) combined[v ^ xq] += sub[q][v];
+                        }
+                        double H = entropy_freq(combined, n);
+                        if (H < lbest_H) { lbest_H = H; lbest_x = (u8)xp; }
+                    }
+                    pat[p] = lbest_x; best_H = lbest_H;
+                }
+            }
+        }
+
+        double raw = (H0 - best_H) * n;
+        double key = 8.0 * K + 4.0;
+        double net = raw - key;
+
+        if (net > overall_net) {
+            overall_net = net;
+            overall_H   = best_H;
+            *best_K     = K;
+            memcpy(best_pat, pat, K);
+        }
     }
-    for (; i < n; i++) { u32 r = xorshift(&s); data[i] ^= (u8)r; }
+
+    return overall_net;
 }
 
 int main() {
     FILE *f = fopen(FILE_PATH, "rb");
     if (!f) { fprintf(stderr, "cannot open %s\n", FILE_PATH); return 1; }
     fseek(f, 0, SEEK_END); int n = (int)ftell(f); rewind(f);
-    u8 *orig = malloc(n);
-    fread(orig, 1, n, f); fclose(f);
-
+    u8 *data = malloc(n);
+    fread(data, 1, n, f); fclose(f);
     init_hlog(n);
 
     int freq0[256] = {0};
-    for (int i = 0; i < n; i++) freq0[orig[i]]++;
-    double H0 = entropy(freq0, n);
-    printf("original entropy : %.6f bpb  (%.1f bits total)\n\n", H0, H0 * n);
+    for (int i = 0; i < n; i++) freq0[data[i]]++;
+    double H0 = entropy_freq(freq0, n);
+    printf("original entropy : %.6f bpb  (%.1f bits total)\n\n", H0, H0*n);
 
-    clock_t t0 = clock();
-    int    freq[256];
-    double best_H    = H0;
-    int    best_seed = 0;
+    clock_t t0   = clock();
+    double total_net = 0.0;
+    int    total_key = 0;
 
-    for (int s = 1; s < SEARCH_MAX; s++) {
-        memset(freq, 0, 256 * sizeof(int));
-        u32 st = (u32)s ^ 0xDEADBEEFu; if (!st) st = 1;
-        int i = 0;
-        for (; i <= n - 4; i += 4) {
-            u32 r = xorshift(&st);
-            freq[orig[i+0] ^ (u8)(r      )]++;
-            freq[orig[i+1] ^ (u8)(r >>  8)]++;
-            freq[orig[i+2] ^ (u8)(r >> 16)]++;
-            freq[orig[i+3] ^ (u8)(r >> 24)]++;
+    for (int round = 0; round < MAX_ROUNDS; round++) {
+        u8  best_pat[MAX_K];
+        int best_K;
+        double net = find_best_analytic(data, n, best_pat, &best_K);
+
+        if (net <= 0.0) {
+            printf("round %d: no improvement (net=%.1f) — stopping\n", round+1, net);
+            break;
         }
-        for (; i < n; i++) { u32 r = xorshift(&st); freq[orig[i] ^ (u8)r]++; }
-        double H = entropy(freq, n);
-        if (H < best_H) { best_H = H; best_seed = s; }
+
+        apply_pattern(data, n, best_pat, best_K);
+
+        int freq[256] = {0};
+        for (int i = 0; i < n; i++) freq[data[i]]++;
+        double H = entropy_freq(freq, n);
+
+        int key_bits = 8 * best_K + 4;
+        total_net += net;
+        total_key += key_bits;
+
+        printf("round %-2d  K=%-2d  H=%.6f  net=%+.1f  total=%+.1f bits\n",
+               round+1, best_K, H, net, total_net);
     }
 
-    double raw = (H0 - best_H) * n;
-    double key = log2(best_seed + 1) + 1.0;
-    printf("best seed  : %d\n", best_seed);
-    printf("entropy    : %.6f bpb\n", best_H);
-    printf("raw gain   : %.1f bits\n", raw);
-    printf("key cost   : %.1f bits\n", key);
-    printf("net gain   : %.1f bits\n", raw - key);
-    printf("time       : %.3f s\n", (double)(clock() - t0) / CLOCKS_PER_SEC);
+    printf("\ntotal net gain : %.1f bits\n", total_net);
+    printf("total key cost : %d bits\n", total_key);
+    printf("time           : %.3f s\n", (double)(clock()-t0)/CLOCKS_PER_SEC);
 
-    /* write output */
-    u8 *out = malloc(n);
-    memcpy(out, orig, n);
-    do_xor_stream(out, n, best_seed);
     FILE *fo = fopen(OUT_PATH, "wb");
-    fwrite(out, 1, n, fo); fclose(fo);
-    printf("written to %s\n", OUT_PATH);
+    fwrite(data, 1, n, fo); fclose(fo);
 
-    free(orig); free(out);
+    free(data);
     return 0;
 }
