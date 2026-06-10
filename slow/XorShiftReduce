@@ -13,7 +13,6 @@ typedef uint32_t u32;
 #define MAX_K       64
 #define MAX_ROUNDS  64
 
-/* float table — 16KB vs 32KB for double, fits cleanly in L1 */
 static float hlogf[4097];
 
 void init_hlog(int n) {
@@ -27,11 +26,23 @@ double entropy_freq(int *freq, int n) {
     return log2((double)n) - s / n;
 }
 
-void apply_pattern(u8 *data, int n, u8 *pat, int K) {
-    for (int i = 0; i < n; i++) data[i] ^= pat[i % K];
+/* op=0: XOR   op=1: ADD mod 256 */
+void apply_pattern(u8 *data, int n, u8 *pat, int K, int op) {
+    if (op == 0) for (int i = 0; i < n; i++) data[i] ^=       pat[i % K];
+    else         for (int i = 0; i < n; i++) data[i] = (u8)((data[i] + pat[i % K]) & 0xFF);
 }
 
-double find_best_analytic(u8 *data, int n, u8 *best_pat, int *best_K) {
+void undo_pattern(u8 *data, int n, u8 *pat, int K, int op) {
+    if (op == 0) for (int i = 0; i < n; i++) data[i] ^=       pat[i % K];  /* XOR self-inverse */
+    else         for (int i = 0; i < n; i++) data[i] = (u8)((data[i] - pat[i % K] + 256) & 0xFF);
+}
+
+/* op=0: w = v ^ xp    op=1: w = (v + xp) & 255 */
+static inline int slot(int v, int xp, int op) {
+    return op == 0 ? (v ^ xp) : ((v + xp) & 255);
+}
+
+double find_best_analytic(u8 *data, int n, u8 *best_pat, int *best_K, int op) {
     int freq0[256] = {0};
     for (int i = 0; i < n; i++) freq0[data[i]]++;
     double H0 = entropy_freq(freq0, n);
@@ -58,17 +69,17 @@ double find_best_analytic(u8 *data, int n, u8 *best_pat, int *best_K) {
         int full[256] = {0};
         for (int p = 0; p < K; p++)
             for (int j = 0; j < nz_cnt[p]; j++)
-                full[nz_val[p][j] ^ pat[p]] += sub[p][nz_val[p][j]];
+                full[slot(nz_val[p][j], pat[p], op)] += sub[p][nz_val[p][j]];
 
         double full_hsum = 0.0;
         for (int v = 0; v < 256; v++) if (full[v]) full_hsum += hlogf[full[v]];
         double best_H = logn - full_hsum / n;
 
-        int    base[256];
-        int    bperm[256];        /* base[v^xp] precomputed for current j */
-        float  delta_j[4097];     /* delta_j[b] = hlogf[b+sp]-hlogf[b], tiny range */
-        float  delta_perm[256];   /* delta_j mapped through bperm */
-        float  hsum_arr[256];     /* per-xp accumulator */
+        int   base[256];
+        int   bperm[256];
+        float delta_j[4097];
+        float delta_perm[256];
+        float hsum_arr[256];
 
         for (int pass = 0; pass < 8; pass++) {
             int changed = 0;
@@ -76,41 +87,32 @@ double find_best_analytic(u8 *data, int n, u8 *best_pat, int *best_K) {
                 int nc    = nz_cnt[p];
                 u8  old_x = pat[p];
 
-                /* base[] = full[] minus phase p — O(256) memcpy + O(nc) subtract */
                 memcpy(base, full, 256 * sizeof(int));
                 for (int j = 0; j < nc; j++)
-                    base[nz_val[p][j] ^ old_x] -= sub[p][nz_val[p][j]];
+                    base[slot(nz_val[p][j], old_x, op)] -= sub[p][nz_val[p][j]];
 
-                /* base_hsum in O(nc) */
                 double base_hsum = full_hsum;
                 for (int j = 0; j < nc; j++) {
-                    int v = nz_val[p][j], sp = sub[p][v], fw = full[v ^ old_x];
+                    int v = nz_val[p][j], sp = sub[p][v], fw = full[slot(v, old_x, op)];
                     base_hsum += hlogf[fw - sp] - hlogf[fw];
                 }
 
-                /* max base value — determines how many delta_j entries we need */
                 int max_bw = 0;
                 for (int w = 0; w < 256; w++) if (base[w] > max_bw) max_bw = base[w];
 
-                /* init per-xp accumulators */
                 float fbase = (float)base_hsum;
                 for (int xp = 0; xp < 256; xp++) hsum_arr[xp] = fbase;
 
                 for (int j = 0; j < nc; j++) {
                     int v  = nz_val[p][j];
                     int sp = sub[p][v];
-                    /* tiny delta table — only max_bw+1 entries (~32-64 for large K) */
                     for (int b = 0; b <= max_bw; b++)
                         delta_j[b] = hlogf[b + sp] - hlogf[b];
-                    /* gather base[v^xp] → bperm (1KB base[], L1 hot) */
-                    for (int xp = 0; xp < 256; xp++) bperm[xp] = base[v ^ xp];
-                    /* gather through tiny delta_j — fits in a few cache lines */
+                    for (int xp = 0; xp < 256; xp++) bperm[xp] = base[slot(v, xp, op)];
                     for (int xp = 0; xp < 256; xp++) delta_perm[xp] = delta_j[bperm[xp]];
-                    /* sequential add — fully vectorized by compiler */
                     for (int xp = 0; xp < 256; xp++) hsum_arr[xp] += delta_perm[xp];
                 }
 
-                /* find best xp */
                 double lbest_H = 1e18; u8 lbest_x = old_x;
                 for (int xp = 0; xp < 256; xp++) {
                     double H = logn - hsum_arr[xp] / n;
@@ -120,10 +122,10 @@ double find_best_analytic(u8 *data, int n, u8 *best_pat, int *best_K) {
                 if (lbest_x != old_x) {
                     for (int j = 0; j < nc; j++) {
                         int v = nz_val[p][j], sp = sub[p][v];
-                        int wo = v ^ old_x;
+                        int wo = slot(v, old_x, op);
                         full_hsum += hlogf[full[wo] - sp] - hlogf[full[wo]];
                         full[wo] -= sp;
-                        int wn = v ^ lbest_x;
+                        int wn = slot(v, lbest_x, op);
                         full_hsum += hlogf[full[wn] + sp] - hlogf[full[wn]];
                         full[wn] += sp;
                     }
@@ -140,7 +142,7 @@ double find_best_analytic(u8 *data, int n, u8 *best_pat, int *best_K) {
         if (net > overall_net) {
             overall_net = net;
             *best_K     = K;
-            memcpy(best_pat, pat, K);
+            memcpy(best_pat, pat, (size_t)K);
         }
     }
 
@@ -151,9 +153,24 @@ int main() {
     FILE *f = fopen(FILE_PATH, "rb");
     if (!f) { fprintf(stderr, "cannot open %s\n", FILE_PATH); return 1; }
     fseek(f, 0, SEEK_END); int n = (int)ftell(f); rewind(f);
+    u8 *orig = malloc(n);
     u8 *data = malloc(n);
-    fread(data, 1, n, f); fclose(f);
+    fread(orig, 1, n, f); fclose(f);
+    memcpy(data, orig, n);
     init_hlog(n);
+
+    /* reversibility check */
+    {
+        u8 test_pat[4] = {0x12, 0x34, 0x56, 0x78};
+        u8 tmp[8] = {0,1,2,3,4,5,6,7};
+        u8 saved[8]; memcpy(saved, tmp, 8);
+        apply_pattern(tmp, 8, test_pat, 4, 0); apply_pattern(tmp, 8, test_pat, 4, 0);
+        if (memcmp(tmp, saved, 8)) { fprintf(stderr, "XOR reversibility FAIL\n"); return 1; }
+        memcpy(tmp, saved, 8);
+        apply_pattern(tmp, 8, test_pat, 4, 1); undo_pattern(tmp, 8, test_pat, 4, 1);
+        if (memcmp(tmp, saved, 8)) { fprintf(stderr, "ADD reversibility FAIL\n"); return 1; }
+        printf("reversibility check: PASS (XOR and ADD)\n\n");
+    }
 
     int freq0[256] = {0};
     for (int i = 0; i < n; i++) freq0[data[i]]++;
@@ -166,26 +183,36 @@ int main() {
 
     for (int round = 0; round < MAX_ROUNDS; round++) {
         u8  best_pat[64];
-        int best_K;
-        double net = find_best_analytic(data, n, best_pat, &best_K);
+        int best_K, best_op = -1;
+        double best_net = 0.0;
 
-        if (net <= 0.0) {
-            printf("round %d: no improvement (net=%.1f) — stopping\n", round+1, net);
+        /* try XOR */
+        u8 pat_xor[64]; int K_xor;
+        double net_xor = find_best_analytic(data, n, pat_xor, &K_xor, 0);
+        if (net_xor > best_net) { best_net = net_xor; best_op = 0; best_K = K_xor; memcpy(best_pat, pat_xor, K_xor); }
+
+        /* try ADD */
+        u8 pat_add[64]; int K_add;
+        double net_add = find_best_analytic(data, n, pat_add, &K_add, 1);
+        if (net_add > best_net) { best_net = net_add; best_op = 1; best_K = K_add; memcpy(best_pat, pat_add, K_add); }
+
+        if (best_op < 0) {
+            printf("round %d: neither XOR nor ADD improved — stopping\n", round+1);
             break;
         }
 
-        apply_pattern(data, n, best_pat, best_K);
+        apply_pattern(data, n, best_pat, best_K, best_op);
 
         int freq[256] = {0};
         for (int i = 0; i < n; i++) freq[data[i]]++;
         double H = entropy_freq(freq, n);
 
-        int key_bits = 8 * best_K + 4;
-        total_net += net;
+        int key_bits = 8 * best_K + 4 + 1; /* +1 bit to store op type */
+        total_net += best_net;
         total_key += key_bits;
 
-        printf("round %-2d  K=%-2d  H=%.6f  net=%+.1f  total=%+.1f bits\n",
-               round+1, best_K, H, net, total_net);
+        printf("round %-2d  %s  K=%-2d  H=%.6f  net=%+.1f  total=%+.1f bits\n",
+               round+1, best_op==0?"XOR":"ADD", best_K, H, best_net, total_net);
     }
 
     printf("\ntotal net gain : %.1f bits\n", total_net);
@@ -195,6 +222,6 @@ int main() {
     FILE *fo = fopen(OUT_PATH, "wb");
     fwrite(data, 1, n, fo); fclose(fo);
 
-    free(data);
+    free(orig); free(data);
     return 0;
 }
