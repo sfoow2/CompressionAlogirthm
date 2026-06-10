@@ -13,16 +13,17 @@ typedef uint32_t u32;
 #define MAX_K       64
 #define MAX_ROUNDS  64
 
-static double hlog[4097];
+/* float table — 16KB vs 32KB for double, fits cleanly in L1 */
+static float hlogf[4097];
 
 void init_hlog(int n) {
-    hlog[0] = 0.0;
-    for (int k = 1; k <= n; k++) hlog[k] = k * log2((double)k);
+    hlogf[0] = 0.0f;
+    for (int k = 1; k <= n; k++) hlogf[k] = k * log2f((float)k);
 }
 
 double entropy_freq(int *freq, int n) {
     double s = 0.0;
-    for (int i = 0; i < 256; i++) if (freq[i]) s += hlog[freq[i]];
+    for (int i = 0; i < 256; i++) if (freq[i]) s += hlogf[freq[i]];
     return log2((double)n) - s / n;
 }
 
@@ -30,26 +31,21 @@ void apply_pattern(u8 *data, int n, u8 *pat, int K) {
     for (int i = 0; i < n; i++) data[i] ^= pat[i % K];
 }
 
-/* find best period-K pattern for current data.
-   returns net gain (raw - key_bits), fills best_pat and best_K. */
 double find_best_analytic(u8 *data, int n, u8 *best_pat, int *best_K) {
     int freq0[256] = {0};
     for (int i = 0; i < n; i++) freq0[data[i]]++;
     double H0 = entropy_freq(freq0, n);
 
     double overall_net = 0.0;
-    double overall_H   = H0;
     *best_K = 0;
+
+    const double logn = log2((double)n);
 
     for (int K = 2; K <= MAX_K; K++) {
         int sub[64][256];
         memset(sub, 0, sizeof(sub));
         for (int i = 0; i < n; i++) sub[i % K][data[i]]++;
 
-        u8     pat[64] = {0};
-        double best_H = H0;
-
-        /* sparse index */
         u8  nz_val[64][256]; int nz_cnt[64];
         for (int p = 0; p < K; p++) {
             nz_cnt[p] = 0;
@@ -57,59 +53,78 @@ double find_best_analytic(u8 *data, int n, u8 *best_pat, int *best_K) {
                 if (sub[p][v]) nz_val[p][nz_cnt[p]++] = (u8)v;
         }
 
-        /* full combined histogram + its hsum — maintained incrementally */
+        u8 pat[64] = {0};
+
         int full[256] = {0};
         for (int p = 0; p < K; p++)
             for (int j = 0; j < nz_cnt[p]; j++)
                 full[nz_val[p][j] ^ pat[p]] += sub[p][nz_val[p][j]];
 
         double full_hsum = 0.0;
-        for (int v = 0; v < 256; v++) if (full[v]) full_hsum += hlog[full[v]];
-        best_H = log2((double)n) - full_hsum / n;
+        for (int v = 0; v < 256; v++) if (full[v]) full_hsum += hlogf[full[v]];
+        double best_H = logn - full_hsum / n;
 
-        int base[256];
+        int    base[256];
+        int    bperm[256];        /* base[v^xp] precomputed for current j */
+        float  delta_j[4097];     /* delta_j[b] = hlogf[b+sp]-hlogf[b], tiny range */
+        float  delta_perm[256];   /* delta_j mapped through bperm */
+        float  hsum_arr[256];     /* per-xp accumulator */
+
         for (int pass = 0; pass < 8; pass++) {
             int changed = 0;
             for (int p = (pass == 0 ? 1 : 0); p < K; p++) {
                 int nc    = nz_cnt[p];
                 u8  old_x = pat[p];
 
-                /* build base[] = full[] minus phase p — O(256) copy + O(nc) subtract */
+                /* base[] = full[] minus phase p — O(256) memcpy + O(nc) subtract */
                 memcpy(base, full, 256 * sizeof(int));
                 for (int j = 0; j < nc; j++)
                     base[nz_val[p][j] ^ old_x] -= sub[p][nz_val[p][j]];
 
-                /* base_hsum in O(nc) from full_hsum */
+                /* base_hsum in O(nc) */
                 double base_hsum = full_hsum;
                 for (int j = 0; j < nc; j++) {
                     int v = nz_val[p][j], sp = sub[p][v], fw = full[v ^ old_x];
-                    base_hsum += hlog[fw - sp] - hlog[fw];
+                    base_hsum += hlogf[fw - sp] - hlogf[fw];
                 }
 
-                /* search — plain base[w] lookup, no extra arithmetic */
+                /* max base value — determines how many delta_j entries we need */
+                int max_bw = 0;
+                for (int w = 0; w < 256; w++) if (base[w] > max_bw) max_bw = base[w];
+
+                /* init per-xp accumulators */
+                float fbase = (float)base_hsum;
+                for (int xp = 0; xp < 256; xp++) hsum_arr[xp] = fbase;
+
+                for (int j = 0; j < nc; j++) {
+                    int v  = nz_val[p][j];
+                    int sp = sub[p][v];
+                    /* tiny delta table — only max_bw+1 entries (~32-64 for large K) */
+                    for (int b = 0; b <= max_bw; b++)
+                        delta_j[b] = hlogf[b + sp] - hlogf[b];
+                    /* gather base[v^xp] → bperm (1KB base[], L1 hot) */
+                    for (int xp = 0; xp < 256; xp++) bperm[xp] = base[v ^ xp];
+                    /* gather through tiny delta_j — fits in a few cache lines */
+                    for (int xp = 0; xp < 256; xp++) delta_perm[xp] = delta_j[bperm[xp]];
+                    /* sequential add — fully vectorized by compiler */
+                    for (int xp = 0; xp < 256; xp++) hsum_arr[xp] += delta_perm[xp];
+                }
+
+                /* find best xp */
                 double lbest_H = 1e18; u8 lbest_x = old_x;
                 for (int xp = 0; xp < 256; xp++) {
-                    double hsum = base_hsum;
-                    for (int j = 0; j < nc; j++) {
-                        int v  = nz_val[p][j];
-                        int sp = sub[p][v];
-                        int w  = v ^ xp;
-                        int bw = base[w];
-                        hsum  += hlog[bw + sp] - hlog[bw];
-                    }
-                    double H = log2((double)n) - hsum / n;
+                    double H = logn - hsum_arr[xp] / n;
                     if (H < lbest_H) { lbest_H = H; lbest_x = (u8)xp; }
                 }
 
                 if (lbest_x != old_x) {
-                    /* patch full[] and full_hsum incrementally — O(nc) */
                     for (int j = 0; j < nc; j++) {
                         int v = nz_val[p][j], sp = sub[p][v];
                         int wo = v ^ old_x;
-                        full_hsum += hlog[full[wo] - sp] - hlog[full[wo]];
+                        full_hsum += hlogf[full[wo] - sp] - hlogf[full[wo]];
                         full[wo] -= sp;
                         int wn = v ^ lbest_x;
-                        full_hsum += hlog[full[wn] + sp] - hlog[full[wn]];
+                        full_hsum += hlogf[full[wn] + sp] - hlogf[full[wn]];
                         full[wn] += sp;
                     }
                     pat[p] = lbest_x; best_H = lbest_H; changed = 1;
@@ -124,7 +139,6 @@ double find_best_analytic(u8 *data, int n, u8 *best_pat, int *best_K) {
 
         if (net > overall_net) {
             overall_net = net;
-            overall_H   = best_H;
             *best_K     = K;
             memcpy(best_pat, pat, K);
         }
@@ -146,7 +160,7 @@ int main() {
     double H0 = entropy_freq(freq0, n);
     printf("original entropy : %.6f bpb  (%.1f bits total)\n\n", H0, H0*n);
 
-    clock_t t0   = clock();
+    clock_t t0 = clock();
     double total_net = 0.0;
     int    total_key = 0;
 
