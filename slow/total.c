@@ -23,13 +23,14 @@ typedef uint32_t u32;
 
 /* ── configuration ───────────────────────────────────────────────────────── */
 #define INPUT_FILE  "C:\\Users\\lukac\\Documents\\compressor\\data"
-#define MAX_CHUNKS  16         /* how many 4096-byte chunks to process (SINGLE_BLOCK=0) */
+#define MAX_CHUNKS  20         /* how many 4096-byte chunks to process (SINGLE_BLOCK=0) */
 #define BLOCK_SIZE  4096
 #define SINGLE_BLOCK       0   /* 1 = treat entire ANS output as one block (no chunking) */
 #define VERBOSE            1   /* 1 = print per-instruction detail                       */
 #define ANALYSE            1   /* 1 = print pattern profile before entropy reduction      */
 #define ANALYSE_MAX_STRIDE 64  /* stride scan for findBest/verification (1..N)           */
 #define ANALYSE_TRI_MAX    32  /* stride scan for TRIPLE category (<=ANALYSE_MAX_STRIDE) */
+#define HLOG_MAX  (MAX_CHUNKS * BLOCK_SIZE * 2 + 2)  /* hlog/hlogf table size */
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  ANS CODER  (Subbotin carryless range coder + adaptive order-0 model)
@@ -121,11 +122,11 @@ static int o0_decompress(const u8 *in, int n, u8 *out, int outlen) {
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /* ── hlog table ──────────────────────────────────────────────────────────── */
-static double hlog[BLOCK_SIZE + 1];
+static double hlog[HLOG_MAX];
 static int    g_skip_quad = 0;
 static void init_hlog(void) {
     hlog[0] = 0.0;
-    for (int i = 1; i <= BLOCK_SIZE; i++) hlog[i] = i * log2(i);
+    for (int i = 1; i < HLOG_MAX; i++) hlog[i] = i * log2(i);
 }
 
 /* ── analytic period-K XOR/ADD transform ────────────────────────────────── */
@@ -135,11 +136,11 @@ static void init_hlog(void) {
 
 typedef struct { u8 pat[ANA_MAX_K]; int K; int op; int g_ni; } RoundInfo;
 
-static float hlogf[BLOCK_SIZE + 1];
+static float hlogf[HLOG_MAX];
 
 static void init_hlogf(void) {
     hlogf[0] = 0.0f;
-    for (int i = 1; i <= BLOCK_SIZE; i++) hlogf[i] = i * log2f((float)i);
+    for (int i = 1; i < HLOG_MAX; i++) hlogf[i] = i * log2f((float)i);
 }
 
 static inline int ana_slot(int v, int xp, int op) {
@@ -264,6 +265,105 @@ static double find_best_analytic(u8 *data, int n, u8 *best_pat, int *best_K, int
     return overall_net;
 }
 
+/* ── CTX256_XOR global transform ─────────────────────────────────────────── */
+/* Forward: data[i] ^= amp[original data[i-1]], left-to-right, prev=0 for i=0 */
+static void apply_ctx256_xor(u8 *data, int n, const u8 *amp) {
+    u8 prev = 0;
+    for (int i = 0; i < n; i++) {
+        u8 orig = data[i];
+        data[i] = orig ^ amp[prev];
+        prev = orig;
+    }
+}
+/* Undo: forward pass using recovered originals as context (NOT self-inverse) */
+static void undo_ctx256_xor(u8 *data, int n, const u8 *amp) {
+    u8 prev = 0;
+    for (int i = 0; i < n; i++) {
+        u8 orig = data[i] ^ amp[prev];
+        prev = orig;
+        data[i] = orig;
+    }
+}
+/* Coordinate descent: for each of 256 contexts find best XOR amp jointly.
+   Key cost = 256*8 = 2048 bits.  Intended for full ANS stream (n >> 4096). */
+static double find_best_ctx256_xor(const u8 *data, int n, u8 *amp_out) {
+    static int cond[256][256];
+    memset(cond, 0, sizeof cond);
+    cond[0][data[0]]++;
+    for (int i = 1; i < n; i++) cond[(u8)data[i-1]][data[i]]++;
+
+    int total[256] = {0};
+    for (int i = 0; i < n; i++) total[data[i]]++;
+
+    double hs0 = 0.0;
+    for (int v = 0; v < 256; v++) if (total[v]) hs0 += hlogf[total[v]];
+    double H0 = log2((double)n) - hs0 / n;
+
+    u8  amp[256]; memset(amp, 0, 256);
+    int full[256]; memcpy(full, total, 256 * sizeof(int));
+    double full_hsum = hs0;
+    const double logn = log2((double)n);
+
+    static float delta_j[HLOG_MAX];
+
+    for (int pass = 0; pass < 8; pass++) {
+        int changed = 0;
+        for (int c = 0; c < 256; c++) {
+            u8  old_a = amp[c];
+            int nz_v[256], nz_cnt = 0;
+            for (int v = 0; v < 256; v++) if (cond[c][v]) nz_v[nz_cnt++] = v;
+            if (nz_cnt == 0) continue;
+
+            int base[256]; memcpy(base, full, 256 * sizeof(int));
+            double base_hsum = full_hsum;
+            for (int j = 0; j < nz_cnt; j++) {
+                int v = nz_v[j], sp = cond[c][v], sl = v ^ old_a;
+                base_hsum += hlogf[base[sl] - sp] - hlogf[base[sl]];
+                base[sl] -= sp;
+            }
+
+            int max_bw = 0;
+            for (int w = 0; w < 256; w++) if (base[w] > max_bw) max_bw = base[w];
+
+            float hsum_arr[256];
+            float fbase = (float)base_hsum;
+            for (int xp = 0; xp < 256; xp++) hsum_arr[xp] = fbase;
+
+            for (int j = 0; j < nz_cnt; j++) {
+                int v = nz_v[j], sp = cond[c][v];
+                for (int b = 0; b <= max_bw; b++) delta_j[b] = hlogf[b + sp] - hlogf[b];
+                for (int xp = 0; xp < 256; xp++) hsum_arr[xp] += delta_j[base[v ^ xp]];
+            }
+
+            double lbest_H = 1e18; u8 lbest_xp = old_a;
+            for (int xp = 0; xp < 256; xp++) {
+                double H = logn - hsum_arr[xp] / n;
+                if (H < lbest_H) { lbest_H = H; lbest_xp = (u8)xp; }
+            }
+
+            if (lbest_xp != old_a) {
+                for (int j = 0; j < nz_cnt; j++) {
+                    int v = nz_v[j], sp = cond[c][v];
+                    int wo = v ^ old_a;
+                    full_hsum += hlogf[full[wo] - sp] - hlogf[full[wo]];
+                    full[wo] -= sp;
+                    int wn = v ^ lbest_xp;
+                    full_hsum += hlogf[full[wn] + sp] - hlogf[full[wn]];
+                    full[wn] += sp;
+                }
+                amp[c] = lbest_xp; changed = 1;
+            }
+        }
+        if (!changed) break;
+    }
+
+    double best_H = logn - full_hsum / n;
+    double raw_gain = (H0 - best_H) * n;
+    double net = raw_gain - 2048.0;  /* key = 256*8 bits dense */
+    if (net > 0.0) memcpy(amp_out, amp, 256);
+    return net;  /* caller checks > 0 before applying */
+}
+
 #define INSTR_BASE          12
 #define INSTR_BASE_NOPHASE   5
 #define INSTR_OHD(ab)         ((double)(INSTR_BASE         + (ab)))
@@ -318,7 +418,7 @@ static double entropy(const u8 *data, int n) {
     double s = 0.0;
     for (int i = 0; i < 256; i++) {
         if (f[i] > 0)
-            s += f[i] <= BLOCK_SIZE ? hlog[f[i]] : (double)f[i] * log2((double)f[i]);
+            s += f[i] < HLOG_MAX ? hlog[f[i]] : (double)f[i] * log2((double)f[i]);
     }
     return log2((double)n) - s / n;
 }
@@ -1431,6 +1531,24 @@ int main(void) {
     free(raw_check);
 
 #else
+    /* ── CTX256_XOR pre-pass on the full ANS stream ───────────────────── */
+    u8  ctx256_amp[256];
+    int has_ctx256 = 0;
+    {
+        double H_pre = entropy(ans_stream, ans_len);
+        double cn = find_best_ctx256_xor(ans_stream, ans_len, ctx256_amp);
+        printf("CTX256_XOR  n=%-7d  H=%.6f  net=%+.1f bits (raw=%+.1f key=2048)",
+               ans_len, H_pre, cn, cn + 2048.0);
+        if (cn > 0.0) {
+            apply_ctx256_xor(ans_stream, ans_len, ctx256_amp);
+            has_ctx256 = 1;
+            memcpy(ans_pristine, ans_stream, ans_len);
+            printf("  [applied]\n\n");
+        } else {
+            printf("  [skipped]\n\n");
+        }
+    }
+
     /* ── chunked mode: split ANS stream into BLOCK_SIZE chunks ──────── */
     int n_chunks = (ans_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
     if (n_chunks > MAX_CHUNKS) n_chunks = MAX_CHUNKS;
@@ -1569,6 +1687,7 @@ int main(void) {
         }
     }
     int ans_match = (memcmp(ans_stream, ans_pristine, ans_len) == 0);
+    if (has_ctx256) undo_ctx256_xor(ans_stream, ans_len, ctx256_amp);
     u8 *raw_check = malloc(raw_size);
     o0_decompress(ans_stream, ans_len, raw_check, raw_size);
     int raw_match = (memcmp(raw_check, raw_data, raw_size) == 0);
