@@ -1680,24 +1680,75 @@ int main(void) {
         total_ana_net += ana_net_c;
     }
 
-    /* ── SECOND LAYER: ANS2 on entropy-reduced stream, then entropy-reduce ─ */
-    printf("\n--- second layer test (diagnostic) ---\n");
+    /* ── SECOND LAYER: per-chunk ANS2 on entropy-reduced stream ─────────── */
+    printf("\n--- second layer test ---\n");
     {
-        /* ans_stream is still in entropy-reduced state here */
-        u8 *red_copy = malloc(ans_len);
-        memcpy(red_copy, ans_stream, ans_len);
-
-        int ans2_cap = ans_len + 4096;
+        /* Per-chunk adaptive ANS2 with raw fallback.
+         * Format: [n_chunks × uint16 stored_len (bit15=1 → raw)] [payloads...]
+         * Using the same BLOCK_SIZE chunk boundaries as layer-1.
+         */
+        int header_bytes = n_chunks * 2;
+        int ans2_cap = header_bytes + ans_len + n_chunks * 8;
         u8 *ans2_buf = malloc(ans2_cap);
-        int ans2_len = o0_compress(red_copy, ans_len, ans2_buf, ans2_cap);
-        free(red_copy);
+        u8 *hdr2     = ans2_buf;
+        u8 *pay2     = ans2_buf + header_bytes;
+        int pay2_pos = 0;
+        int chunks_c2 = 0, chunks_fb = 0;
+        u8 *ctmp = malloc(BLOCK_SIZE + 64);  /* reused per chunk */
 
-        printf("ANS2 adaptive : %d → %d bytes  H=%.6f  (%+.0f bits)\n\n",
-               ans_len, ans2_len, entropy(ans2_buf, ans2_len),
-               (double)(ans_len - ans2_len) * 8.0);
+        printf("%-7s  %-8s  %-8s  %-8s  %-8s\n",
+               "chunk", "raw_B", "ans2_B", "saved_B", "H_in");
 
-        u8  *ans2_payload = ans2_buf;
-        int  ans2_plen    = ans2_len;
+        for (int c = 0; c < n_chunks; c++) {
+            int off = c * BLOCK_SIZE;
+            int csz = (off + BLOCK_SIZE <= ans_len) ? BLOCK_SIZE : (ans_len - off);
+            u8 *chunk = ans_stream + off;
+            double H_in = entropy(chunk, csz);
+
+            int clen = o0_compress(chunk, csz, ctmp, csz + 64);
+
+            if (clen < csz) {
+                hdr2[c*2]   = (u8)(clen & 0xFF);
+                hdr2[c*2+1] = (u8)(clen >> 8);        /* bit15=0 → ANS2 */
+                memcpy(pay2 + pay2_pos, ctmp, clen);
+                pay2_pos += clen;
+                chunks_c2++;
+                printf("  %-5d  %-8d  %-8d  %-+8d  %.6f  ANS2\n",
+                       c, csz, clen, csz - clen, H_in);
+            } else {
+                hdr2[c*2]   = (u8)(csz & 0xFF);
+                hdr2[c*2+1] = (u8)((csz >> 8) | 0x80); /* bit15=1 → raw */
+                memcpy(pay2 + pay2_pos, chunk, csz);
+                pay2_pos += csz;
+                chunks_fb++;
+                printf("  %-5d  %-8d  %-8d  %-+8d  %.6f  raw\n",
+                       c, csz, csz, 0, H_in);
+            }
+        }
+        free(ctmp);
+
+        int ans2_len = header_bytes + pay2_pos;
+
+        /* key_bits_est = gross entropy reduction - net (after key was already subtracted)
+         * gross = avg_delta_bpb × ans_len  (bpb × bytes = bits, no extra ×8)
+         */
+        double avg_delta_bpb = (total_H_ans - total_H_red) / (double)n_chunks;
+        double total_gross_bits = avg_delta_bpb * (double)ans_len;
+        int key_bits_est  = (int)(total_gross_bits - (total_net + total_ana_net) + 0.5);
+        int key_bytes_est = (key_bits_est + 7) / 8;
+
+        printf("\nANS2 per-chunk : %d → %d bytes  (%+.0f bits)"
+               "  [%d ANS2, %d raw, %d-byte hdr]\n",
+               ans_len, ans2_len, (double)(ans_len - ans2_len) * 8.0,
+               chunks_c2, chunks_fb, header_bytes);
+        printf("key overhead   : ~%d bytes (~%d bits)\n",
+               key_bytes_est, key_bits_est);
+        printf("net total      : %+d bytes  (%s)\n\n",
+               ans_len - (ans2_len + key_bytes_est),
+               (ans_len > ans2_len + key_bytes_est) ? "COMPRESSES" : "does not compress");
+
+        u8  *ans2_payload = pay2;
+        int  ans2_plen    = pay2_pos;
 
         int n2 = (ans2_plen + BLOCK_SIZE - 1) / BLOCK_SIZE;
         double total_net2 = 0.0, total_ana2 = 0.0;
