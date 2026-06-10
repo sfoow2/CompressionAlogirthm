@@ -7,7 +7,7 @@
  *             → verify: invert key → ANS decompress → must equal raw[4096]
  *
  * Change INPUT_FILE and MAX_CHUNKS to suit.
- * Compile:  gcc -O2 -o ans_entropy_test ans_entropy_test.c -lm
+ * Compile:  gcc -O3 -o ans_entropy_test ans_entropy_test.c -lm
  */
 
 #include <stdio.h>
@@ -111,75 +111,6 @@ static int o0_decompress(const u8 *in, int n, u8 *out, int outlen) {
         dec_decode(&rc, cum, m0[s]);
         out[i] = (u8)s;
         m0_bump(s);
-    }
-    return outlen;
-}
-
-/* ── static-table ANS: transmit freq table once, code without adaptive model ─
- * Header: 256 × u16 LE normalized to sum=65536 = 512 bytes.
- * Normalizing to a power-of-2 total makes rc->range /= tot an exact right-shift,
- * eliminating the ~0.28 bits/symbol rounding overhead of raw-count coding.    */
-static void normalize_freqs(const u32 *raw, int n, u32 *norm) {
-    double scale = 65536.0 / n;
-    double frac[256];
-    int total = 0;
-    for (int v = 0; v < 256; v++) {
-        if (!raw[v]) { norm[v] = 0; frac[v] = 0.0; continue; }
-        double exact = raw[v] * scale;
-        int nf = (int)exact; if (nf < 1) nf = 1;
-        norm[v] = (u32)nf; frac[v] = exact - nf; total += nf;
-    }
-    /* assign remaining slots to symbols with largest fractional parts */
-    for (int adj = 65536 - total; adj > 0; adj--) {
-        int best = 0;
-        for (int v = 1; v < 256; v++) if (frac[v] > frac[best]) best = v;
-        norm[best]++; frac[best] -= 1.0;
-    }
-    for (int adj = total - 65536; adj > 0; adj--) {
-        int worst = -1;
-        for (int v = 0; v < 256; v++)
-            if (norm[v] > 1 && (worst < 0 || frac[v] < frac[worst])) worst = v;
-        if (worst < 0) break;
-        norm[worst]--; frac[worst] += 1.0;
-    }
-}
-static int o0_compress_static(const u8 *in, int n, u8 *out, int cap) {
-    if (cap < 512 + n + 16) return -1;
-    u32 raw[256] = {0};
-    for (int i = 0; i < n; i++) raw[in[i]]++;
-    u32 norm[256]; normalize_freqs(raw, n, norm);
-    /* write header: 256 × u16 LE normalized counts (sum = 65536) */
-    for (int v = 0; v < 256; v++) {
-        out[v*2]   = (u8)(norm[v] & 0xFF);
-        out[v*2+1] = (u8)((norm[v] >> 8) & 0xFF);
-    }
-    u32 cum[256]; u32 tot = 0;
-    for (int v = 0; v < 256; v++) { cum[v] = tot; tot += norm[v]; }
-    RC rc; enc_init(&rc, out + 512, cap - 512);
-    for (int i = 0; i < n; i++) {
-        u8 s = in[i];
-        enc_encode(&rc, cum[s], norm[s], 65536);
-    }
-    enc_flush(&rc);
-    return 512 + rc.pos;
-}
-static int o0_decompress_static(const u8 *in, int n, u8 *out, int outlen) {
-    if (n < 512) return -1;
-    u32 norm[256], cum[256]; u32 tot = 0;
-    for (int v = 0; v < 256; v++) {
-        norm[v] = (u32)in[v*2] | ((u32)in[v*2+1] << 8);
-        cum[v] = tot; tot += norm[v];
-    }
-    RC rc; dec_init(&rc, (u8*)in + 512, n - 512);
-    for (int i = 0; i < outlen; i++) {
-        u32 dv = dec_getfreq(&rc, tot);
-        int lo = 0, hi = 255;
-        while (lo < hi) {
-            int mid = (lo + hi + 1) >> 1;
-            if (cum[mid] <= dv) lo = mid; else hi = mid - 1;
-        }
-        dec_decode(&rc, cum[lo], norm[lo]);
-        out[i] = (u8)lo;
     }
     return outlen;
 }
@@ -466,10 +397,17 @@ static void fft256_core(double *re, double *im, int sign) {
         }
     }
 }
+/* FFT(total) cache: every caller passes dv = total - phF, and the FFT is
+   linear, so FFT(dv) = FFT(total) - FFT(phF). The correlation values are
+   exact integers recovered via round(); FP error (~1e-7) is far below 0.5,
+   so the integer corr[] output is unchanged. Saves 1 of 3 FFTs per call. */
+static double g_fft_tot_r[256], g_fft_tot_i[256];
 static void add_cyclic_corr(const int *dv, const int *phF, int *corr) {
+    (void)dv;
     double Ar[256], Ai[256], Br[256], Bi[256];
-    for (int v = 0; v < 256; v++) { Ar[v]=(double)dv[v]; Ai[v]=0.0; Br[v]=(double)phF[v]; Bi[v]=0.0; }
-    fft256_core(Ar, Ai, +1); fft256_core(Br, Bi, +1);
+    for (int v = 0; v < 256; v++) { Br[v]=(double)phF[v]; Bi[v]=0.0; }
+    fft256_core(Br, Bi, +1);
+    for (int k = 0; k < 256; k++) { Ar[k]=g_fft_tot_r[k]-Br[k]; Ai[k]=g_fft_tot_i[k]-Bi[k]; }
     for (int k = 0; k < 256; k++) {
         double pr = Ar[k]*Br[k] + Ai[k]*Bi[k], pi = Ai[k]*Br[k] - Ar[k]*Bi[k];
         Ar[k]=pr; Ai[k]=pi;
@@ -656,10 +594,22 @@ static int xor_best_amp_128(const int *A, const int *B, double *Sout) {
 static int vxor_ins(int idx, int k) { return ((idx>>k)<<(k+1))|(idx&((1<<k)-1)); }
 /* remove bit k from v (v must have bit k == 0), giving a 7-bit half-space index */
 static int rbk(int v, int k) { return ((v>>1)&~((1<<k)-1)) | (v&((1<<k)-1)); }
+/* WHT(total) cache: every caller passes A = total - B, and the WHT is linear
+   over the integers, so WHT(A) = WHT(total) - WHT(B) exactly (bit-identical).
+   Saves 1 of 2 forward WHTs per call.  set_freq_cache() must be called after
+   computing total[] (done at the top of findBest and analyse_chunk).        */
+static int g_wht_tot[256];
+static void set_freq_cache(const int *total) {
+    for (int i = 0; i < 256; i++) g_wht_tot[i] = total[i];
+    wht256(g_wht_tot);
+    for (int v = 0; v < 256; v++) { g_fft_tot_r[v] = (double)total[v]; g_fft_tot_i[v] = 0.0; }
+    fft256_core(g_fft_tot_r, g_fft_tot_i, +1);
+}
 static int xor_best_amp(const int *A, const int *B, double *Sout) {
     int ha[256],hb[256];
-    for(int i=0;i<256;i++){ha[i]=A[i];hb[i]=B[i];}
-    wht256(ha); wht256(hb);
+    for(int i=0;i<256;i++) hb[i]=B[i];
+    wht256(hb);
+    for(int i=0;i<256;i++) ha[i]=g_wht_tot[i]-hb[i];
     long long prod[256];
     for(int k=0;k<256;k++) prod[k]=(long long)ha[k]*hb[k];
     for(int len=1;len<256;len<<=1)
@@ -709,10 +659,18 @@ static int add_nibs_best_amp(const int *dv, const int *phF, double *Sout) {
         if(S>best_S){best_S=S;best_amp=amp;}}
     *Sout=best_S; return best_amp;
 }
+static double mul_eval_S(const int *dv, const int *phF, int m) {
+    double S=0.0;
+    for(int v=0;v<256;v++) S+=hlog[dv[v]+phF[(v*(int)mul_inv[m])&0xFF]];
+    return S;
+}
 static int mul_best_amp(const int *dv, const int *phF, double *Sout) {
+    /* memoize S(m): the refine windows overlap each other and the coarse
+       probes, so each distinct m is evaluated once (values unchanged) */
+    double Sc[256]; u8 seen[256]={0};
     int top3a[3]={3,35,67}; double top3s[3]={-1e30,-1e30,-1e30};
-    for(int m=3;m<256;m+=32){double S=0.0;
-        for(int v=0;v<256;v++) S+=hlog[dv[v]+phF[(v*(int)mul_inv[m])&0xFF]];
+    for(int m=3;m<256;m+=32){
+        double S=mul_eval_S(dv,phF,m); Sc[m]=S; seen[m]=1;
         if(S>top3s[0]){top3s[2]=top3s[1];top3a[2]=top3a[1];top3s[1]=top3s[0];top3a[1]=top3a[0];top3s[0]=S;top3a[0]=m;}
         else if(S>top3s[1]){top3s[2]=top3s[1];top3a[2]=top3a[1];top3s[1]=S;top3a[1]=m;}
         else if(S>top3s[2]){top3s[2]=S;top3a[2]=m;}}
@@ -720,7 +678,9 @@ static int mul_best_amp(const int *dv, const int *phF, double *Sout) {
     for(int ci=0;ci<3;ci++){int base=top3a[ci];
         for(int d=-32;d<=32;d+=2){int m=base+d;
             if(m<3||m>255||!(m&1))continue;
-            double S=0.0; for(int v=0;v<256;v++) S+=hlog[dv[v]+phF[(v*(int)mul_inv[m])&0xFF]];
+            double S;
+            if(seen[m]) S=Sc[m];
+            else {S=mul_eval_S(dv,phF,m); Sc[m]=S; seen[m]=1;}
             if(S>best_S){best_S=S;best_amp=m;}}}
     *Sout=best_S; return best_amp;
 }
@@ -780,6 +740,7 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
     for(int i=0;i<n;i++) total[data[i]]++;
     double hlt[256],Sbase=0.0;
     for(int v=0;v<256;v++){hlt[v]=hlog[total[v]];Sbase+=hlt[v];}
+    set_freq_cache(total);
 
     double bestNet=0.0;
     Instr  best={XOR_PHASE,2,0,1};
@@ -973,71 +934,48 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
                 double Svx=(S0+S1)-Sbase-INSTR_OHD(17);
                 if(Svx>bestNet){bestNet=Svx;best=(Instr){VALUE_XOR,stride,phase,
                     (unsigned)(k|(alo<<3)|(ahi<<11))};}} }
-            /* DUAL_XOR */ { int lo_phF[256]={0},hi_phF[256]={0};
+            /* DUAL XOR/ADD/MUL (shared histograms) */ { int lo_phF[256]={0},hi_phF[256]={0};
                 int kk=0; for(int i=phase;i<n;i+=stride,kk++){if(kk&1)hi_phF[data[i]]++;else lo_phF[data[i]]++;}
                 int lo_dv[256],hi_dv[256]; for(int v=0;v<256;v++){lo_dv[v]=total[v]-lo_phF[v];hi_dv[v]=total[v]-hi_phF[v];}
-                double Slo,Shi; int alo=xor_best_amp(lo_dv,lo_phF,&Slo),ahi=xor_best_amp(hi_dv,hi_phF,&Shi);
-                double ndx=(Slo-Sbase)+(Shi-Sbase)-INSTR_OHD(16);
-                if(ndx>bestNet){bestNet=ndx;best=(Instr){DUAL_XOR,stride,phase,(unsigned)(alo|(ahi<<8))};}}
-            /* DUAL_ADD */ { int lo_phF[256]={0},hi_phF[256]={0};
-                int kk=0; for(int i=phase;i<n;i+=stride,kk++){if(kk&1)hi_phF[data[i]]++;else lo_phF[data[i]]++;}
-                int lo_dv[256],hi_dv[256]; for(int v=0;v<256;v++){lo_dv[v]=total[v]-lo_phF[v];hi_dv[v]=total[v]-hi_phF[v];}
-                double Slo,Shi; int alo=add_best_amp(lo_dv,lo_phF,6,&Slo),ahi=add_best_amp(hi_dv,hi_phF,6,&Shi);
-                double nda=(Slo-Sbase)+(Shi-Sbase)-INSTR_OHD(16);
-                if(nda>bestNet){bestNet=nda;best=(Instr){DUAL_ADD,stride,phase,(unsigned)(alo|(ahi<<8))};}}
-            /* DUAL_MUL */ { int lo_phF[256]={0},hi_phF[256]={0};
-                int kk=0; for(int i=phase;i<n;i+=stride,kk++){if(kk&1)hi_phF[data[i]]++;else lo_phF[data[i]]++;}
-                int lo_dv[256],hi_dv[256]; for(int v=0;v<256;v++){lo_dv[v]=total[v]-lo_phF[v];hi_dv[v]=total[v]-hi_phF[v];}
-                double Slo,Shi; int idx_lo=(mul_best_amp(lo_dv,lo_phF,&Slo)-3)/2,idx_hi=(mul_best_amp(hi_dv,hi_phF,&Shi)-3)/2;
-                double ndm=(Slo-Sbase)+(Shi-Sbase)-INSTR_OHD(14);
-                if(ndm>bestNet){bestNet=ndm;best=(Instr){DUAL_MUL,stride,phase,(unsigned)(idx_lo|(idx_hi<<7))};}}
-            /* TRIPLE_XOR */ if(!g_skip_quad){
+                double Slo,Shi;
+                { int alo=xor_best_amp(lo_dv,lo_phF,&Slo),ahi=xor_best_amp(hi_dv,hi_phF,&Shi);
+                  double ndx=(Slo-Sbase)+(Shi-Sbase)-INSTR_OHD(16);
+                  if(ndx>bestNet){bestNet=ndx;best=(Instr){DUAL_XOR,stride,phase,(unsigned)(alo|(ahi<<8))};} }
+                { int alo=add_best_amp(lo_dv,lo_phF,6,&Slo),ahi=add_best_amp(hi_dv,hi_phF,6,&Shi);
+                  double nda=(Slo-Sbase)+(Shi-Sbase)-INSTR_OHD(16);
+                  if(nda>bestNet){bestNet=nda;best=(Instr){DUAL_ADD,stride,phase,(unsigned)(alo|(ahi<<8))};} }
+                { int idx_lo=(mul_best_amp(lo_dv,lo_phF,&Slo)-3)/2,idx_hi=(mul_best_amp(hi_dv,hi_phF,&Shi)-3)/2;
+                  double ndm=(Slo-Sbase)+(Shi-Sbase)-INSTR_OHD(14);
+                  if(ndm>bestNet){bestNet=ndm;best=(Instr){DUAL_MUL,stride,phase,(unsigned)(idx_lo|(idx_hi<<7))};} } }
+            /* TRIPLE XOR/ADD/MUL (shared histograms) */ if(!g_skip_quad){
                 int ph3[3][256]={{0},{0},{0}};
                 int kk=0; for(int i=phase;i<n;i+=stride,kk++) ph3[kk%3][data[i]]++;
                 int dv3[3][256]; for(int r=0;r<3;r++) for(int v=0;v<256;v++) dv3[r][v]=total[v]-ph3[r][v];
                 double S3[3]; int a3[3];
                 for(int r=0;r<3;r++) a3[r]=xor_best_amp(dv3[r],ph3[r],&S3[r]);
                 double nt3=(S3[0]-Sbase)+(S3[1]-Sbase)+(S3[2]-Sbase)-INSTR_OHD_NOPHASE(3*8);
-                if(nt3>bestNet){bestNet=nt3;best=(Instr){TRIPLE_XOR,stride,phase,(unsigned)(a3[0]|(a3[1]<<8)|(a3[2]<<16))};}}
-            if(!g_skip_quad){ /* TRIPLE_ADD */
-                int ph3[3][256]={{0},{0},{0}};
-                int kk=0; for(int i=phase;i<n;i+=stride,kk++) ph3[kk%3][data[i]]++;
-                int dv3[3][256]; for(int r=0;r<3;r++) for(int v=0;v<256;v++) dv3[r][v]=total[v]-ph3[r][v];
-                double S3[3]; int a3[3];
+                if(nt3>bestNet){bestNet=nt3;best=(Instr){TRIPLE_XOR,stride,phase,(unsigned)(a3[0]|(a3[1]<<8)|(a3[2]<<16))};}
                 for(int r=0;r<3;r++) a3[r]=add_best_amp(dv3[r],ph3[r],6,&S3[r]);
-                double nt3=(S3[0]-Sbase)+(S3[1]-Sbase)+(S3[2]-Sbase)-INSTR_OHD_NOPHASE(3*8);
-                if(nt3>bestNet){bestNet=nt3;best=(Instr){TRIPLE_ADD,stride,phase,(unsigned)(a3[0]|(a3[1]<<8)|(a3[2]<<16))};}}
-            if(!g_skip_quad){ /* TRIPLE_MUL */
-                int ph3[3][256]={{0},{0},{0}};
-                int kk=0; for(int i=phase;i<n;i+=stride,kk++) ph3[kk%3][data[i]]++;
-                int dv3[3][256]; for(int r=0;r<3;r++) for(int v=0;v<256;v++) dv3[r][v]=total[v]-ph3[r][v];
-                double S3[3]; int idx3[3];
+                nt3=(S3[0]-Sbase)+(S3[1]-Sbase)+(S3[2]-Sbase)-INSTR_OHD_NOPHASE(3*8);
+                if(nt3>bestNet){bestNet=nt3;best=(Instr){TRIPLE_ADD,stride,phase,(unsigned)(a3[0]|(a3[1]<<8)|(a3[2]<<16))};}
+                int idx3[3];
                 for(int r=0;r<3;r++){double Sm; idx3[r]=(mul_best_amp(dv3[r],ph3[r],&Sm)-3)/2;S3[r]=Sm;}
-                double nt3=(S3[0]-Sbase)+(S3[1]-Sbase)+(S3[2]-Sbase)-INSTR_OHD_NOPHASE(3*7);
+                nt3=(S3[0]-Sbase)+(S3[1]-Sbase)+(S3[2]-Sbase)-INSTR_OHD_NOPHASE(3*7);
                 if(nt3>bestNet){bestNet=nt3;best=(Instr){TRIPLE_MUL,stride,phase,(unsigned)(idx3[0]|(idx3[1]<<7)|(idx3[2]<<14))};}}
-            if(!g_skip_quad){ /* QUAD_XOR */
+            if(!g_skip_quad){ /* QUAD XOR/ADD/MUL (shared histograms) */
                 int ph4[4][256]={{0},{0},{0},{0}};
                 int kk=0; for(int i=phase;i<n;i+=stride,kk++) ph4[kk&3][data[i]]++;
                 int dv4[4][256]; for(int r=0;r<4;r++) for(int v=0;v<256;v++) dv4[r][v]=total[v]-ph4[r][v];
                 double S4[4]; unsigned a4[4];
                 for(int r=0;r<4;r++) a4[r]=(unsigned)xor_best_amp(dv4[r],ph4[r],&S4[r]);
                 double nq4=(S4[0]-Sbase)+(S4[1]-Sbase)+(S4[2]-Sbase)+(S4[3]-Sbase)-INSTR_OHD(4*8);
-                if(nq4>bestNet){bestNet=nq4;best=(Instr){QUAD_XOR,stride,phase,a4[0]|(a4[1]<<8)|(a4[2]<<16)|(a4[3]<<24)};}}
-            if(!g_skip_quad){ /* QUAD_ADD */
-                int ph4[4][256]={{0},{0},{0},{0}};
-                int kk=0; for(int i=phase;i<n;i+=stride,kk++) ph4[kk&3][data[i]]++;
-                int dv4[4][256]; for(int r=0;r<4;r++) for(int v=0;v<256;v++) dv4[r][v]=total[v]-ph4[r][v];
-                double S4[4]; unsigned a4[4];
+                if(nq4>bestNet){bestNet=nq4;best=(Instr){QUAD_XOR,stride,phase,a4[0]|(a4[1]<<8)|(a4[2]<<16)|(a4[3]<<24)};}
                 for(int r=0;r<4;r++) a4[r]=(unsigned)add_best_amp(dv4[r],ph4[r],6,&S4[r]);
-                double nq4=(S4[0]-Sbase)+(S4[1]-Sbase)+(S4[2]-Sbase)+(S4[3]-Sbase)-INSTR_OHD(4*8);
-                if(nq4>bestNet){bestNet=nq4;best=(Instr){QUAD_ADD,stride,phase,a4[0]|(a4[1]<<8)|(a4[2]<<16)|(a4[3]<<24)};}}
-            if(!g_skip_quad){ /* QUAD_MUL */
-                int ph4[4][256]={{0},{0},{0},{0}};
-                int kk=0; for(int i=phase;i<n;i+=stride,kk++) ph4[kk&3][data[i]]++;
-                int dv4[4][256]; for(int r=0;r<4;r++) for(int v=0;v<256;v++) dv4[r][v]=total[v]-ph4[r][v];
-                double S4[4]; int idx4[4];
+                nq4=(S4[0]-Sbase)+(S4[1]-Sbase)+(S4[2]-Sbase)+(S4[3]-Sbase)-INSTR_OHD(4*8);
+                if(nq4>bestNet){bestNet=nq4;best=(Instr){QUAD_ADD,stride,phase,a4[0]|(a4[1]<<8)|(a4[2]<<16)|(a4[3]<<24)};}
+                int idx4[4];
                 for(int r=0;r<4;r++){double Sm; idx4[r]=(mul_best_amp(dv4[r],ph4[r],&Sm)-3)/2;S4[r]=Sm;}
-                double nq4=(S4[0]-Sbase)+(S4[1]-Sbase)+(S4[2]-Sbase)+(S4[3]-Sbase)-INSTR_OHD(4*7);
+                nq4=(S4[0]-Sbase)+(S4[1]-Sbase)+(S4[2]-Sbase)+(S4[3]-Sbase)-INSTR_OHD(4*7);
                 if(nq4>bestNet){bestNet=nq4;best=(Instr){QUAD_MUL,stride,phase,(unsigned)(idx4[0]|(idx4[1]<<7)|(idx4[2]<<14)|(idx4[3]<<21))};}}
             }
         }
@@ -1137,6 +1075,7 @@ static void analyse_chunk(const u8 *data, int n, int cidx) {
     int total[256]={0};
     for(int i=0;i<n;i++) total[data[i]]++;
     double Sbase=0; for(int v=0;v<256;v++) Sbase+=hlog[total[v]];
+    set_freq_cache(total);
 
     /* ── overall best + verification ─────────────────────────────── */
     double estNet=0;
@@ -1749,35 +1688,16 @@ int main(void) {
         memcpy(red_copy, ans_stream, ans_len);
 
         int ans2_cap = ans_len + 4096;
-        u8 *ans2_buf_adapt = malloc(ans2_cap);
-        u8 *ans2_buf_stat  = malloc(ans2_cap);
-        int ans2_adapt = o0_compress(red_copy, ans_len, ans2_buf_adapt, ans2_cap);
-        int ans2_stat  = o0_compress_static(red_copy, ans_len, ans2_buf_stat,  ans2_cap);
-
-        /* verify static ANS round-trips */
-        u8 *rt_buf = malloc(ans_len);
-        o0_decompress_static(ans2_buf_stat, ans2_stat, rt_buf, ans_len);
-        int static_ok = (memcmp(rt_buf, red_copy, ans_len) == 0);
-        free(rt_buf);
+        u8 *ans2_buf = malloc(ans2_cap);
+        int ans2_len = o0_compress(red_copy, ans_len, ans2_buf, ans2_cap);
         free(red_copy);
 
-        /* entropy of the coded payload (skip 512-byte freq-table header for static) */
-        double H_adapt = entropy(ans2_buf_adapt, ans2_adapt);
-        double H_stat  = entropy(ans2_buf_stat + 512, ans2_stat - 512);
-        printf("ANS2 adaptive : %d → %d bytes  H=%.6f  (%+.0f bits)\n",
-               ans_len, ans2_adapt, H_adapt, (double)(ans_len - ans2_adapt) * 8.0);
-        printf("ANS2 static   : %d → %d bytes  H_payload=%.6f  rt=%s  (%+.0f bits)\n\n",
-               ans_len, ans2_stat, H_stat, static_ok ? "ok" : "FAIL",
-               (double)(ans_len - ans2_stat) * 8.0);
+        printf("ANS2 adaptive : %d → %d bytes  H=%.6f  (%+.0f bits)\n\n",
+               ans_len, ans2_len, entropy(ans2_buf, ans2_len),
+               (double)(ans_len - ans2_len) * 8.0);
 
-        /* use static output for layer-2 entropy reduction */
-        free(ans2_buf_adapt);
-        u8 *ans2_buf = ans2_buf_stat;
-        int ans2_len = ans2_stat;
-
-        /* operate on coded payload only (skip 512-byte freq-table header) */
-        u8  *ans2_payload = ans2_buf + 512;
-        int  ans2_plen    = ans2_len - 512;
+        u8  *ans2_payload = ans2_buf;
+        int  ans2_plen    = ans2_len;
 
         int n2 = (ans2_plen + BLOCK_SIZE - 1) / BLOCK_SIZE;
         double total_net2 = 0.0, total_ana2 = 0.0;
