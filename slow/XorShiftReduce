@@ -49,7 +49,7 @@ double find_best_analytic(u8 *data, int n, u8 *best_pat, int *best_K) {
         u8     pat[64] = {0};
         double best_H = H0;
 
-        /* build sparse index of non-zero entries per phase (most are 0 at large K) */
+        /* sparse index */
         u8  nz_val[64][256]; int nz_cnt[64];
         for (int p = 0; p < K; p++) {
             nz_cnt[p] = 0;
@@ -57,35 +57,65 @@ double find_best_analytic(u8 *data, int n, u8 *best_pat, int *best_K) {
                 if (sub[p][v]) nz_val[p][nz_cnt[p]++] = (u8)v;
         }
 
+        /* full combined histogram + its hsum — maintained incrementally */
+        int full[256] = {0};
+        for (int p = 0; p < K; p++)
+            for (int j = 0; j < nz_cnt[p]; j++)
+                full[nz_val[p][j] ^ pat[p]] += sub[p][nz_val[p][j]];
+
+        double full_hsum = 0.0;
+        for (int v = 0; v < 256; v++) if (full[v]) full_hsum += hlog[full[v]];
+        best_H = log2((double)n) - full_hsum / n;
+
         int base[256];
         for (int pass = 0; pass < 8; pass++) {
             int changed = 0;
             for (int p = (pass == 0 ? 1 : 0); p < K; p++) {
-                memset(base, 0, 256 * sizeof(int));
-                for (int q = 0; q < K; q++) {
-                    if (q == p) continue;
-                    int xq = pat[q];
-                    for (int v = 0; v < 256; v++) base[v ^ xq] += sub[q][v];
-                }
-                double base_hsum = 0.0;
-                for (int v = 0; v < 256; v++) if (base[v]) base_hsum += hlog[base[v]];
+                int nc    = nz_cnt[p];
+                u8  old_x = pat[p];
 
-                double lbest_H = H0 * 2; u8 lbest_x = pat[p];
-                int nc = nz_cnt[p];
+                /* build base[] = full[] minus phase p — O(256) copy + O(nc) subtract */
+                memcpy(base, full, 256 * sizeof(int));
+                for (int j = 0; j < nc; j++)
+                    base[nz_val[p][j] ^ old_x] -= sub[p][nz_val[p][j]];
+
+                /* base_hsum in O(nc) from full_hsum */
+                double base_hsum = full_hsum;
+                for (int j = 0; j < nc; j++) {
+                    int v = nz_val[p][j], sp = sub[p][v], fw = full[v ^ old_x];
+                    base_hsum += hlog[fw - sp] - hlog[fw];
+                }
+
+                /* search — plain base[w] lookup, no extra arithmetic */
+                double lbest_H = 1e18; u8 lbest_x = old_x;
                 for (int xp = 0; xp < 256; xp++) {
                     double hsum = base_hsum;
                     for (int j = 0; j < nc; j++) {
-                        int w  = nz_val[p][j] ^ xp;
-                        int sp = sub[p][nz_val[p][j]];
+                        int v  = nz_val[p][j];
+                        int sp = sub[p][v];
+                        int w  = v ^ xp;
                         int bw = base[w];
-                        hsum += hlog[bw + sp] - hlog[bw];
+                        hsum  += hlog[bw + sp] - hlog[bw];
                     }
                     double H = log2((double)n) - hsum / n;
                     if (H < lbest_H) { lbest_H = H; lbest_x = (u8)xp; }
                 }
-                if (lbest_x != pat[p]) { pat[p] = lbest_x; best_H = lbest_H; changed = 1; }
+
+                if (lbest_x != old_x) {
+                    /* patch full[] and full_hsum incrementally — O(nc) */
+                    for (int j = 0; j < nc; j++) {
+                        int v = nz_val[p][j], sp = sub[p][v];
+                        int wo = v ^ old_x;
+                        full_hsum += hlog[full[wo] - sp] - hlog[full[wo]];
+                        full[wo] -= sp;
+                        int wn = v ^ lbest_x;
+                        full_hsum += hlog[full[wn] + sp] - hlog[full[wn]];
+                        full[wn] += sp;
+                    }
+                    pat[p] = lbest_x; best_H = lbest_H; changed = 1;
+                }
             }
-            if (!changed) break;   /* converged early */
+            if (!changed) break;
         }
 
         double raw = (H0 - best_H) * n;
