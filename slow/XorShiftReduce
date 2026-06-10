@@ -10,7 +10,7 @@ typedef uint32_t u32;
 
 #define FILE_PATH   "C:/Users/lukac/Documents/compressor/chunk2.bin"
 #define OUT_PATH    "C:/Users/lukac/Documents/compressor/out.bin"
-#define MAX_K       16
+#define MAX_K       64
 #define MAX_ROUNDS  64
 
 static double hlog[4097];
@@ -42,47 +42,50 @@ double find_best_analytic(u8 *data, int n, u8 *best_pat, int *best_K) {
     *best_K = 0;
 
     for (int K = 2; K <= MAX_K; K++) {
-        int sub[MAX_K][256];
+        int sub[64][256];
         memset(sub, 0, sizeof(sub));
         for (int i = 0; i < n; i++) sub[i % K][data[i]]++;
 
-        u8     pat[MAX_K] = {0};
+        u8     pat[64] = {0};
         double best_H = H0;
-        int    combined[256];
 
-        if (K <= 3) {
-            for (int x1 = 0; x1 < 256; x1++) {
-                int x2_hi = (K == 3) ? 256 : 1;
-                for (int x2 = 0; x2 < x2_hi; x2++) {
-                    memset(combined, 0, 256 * sizeof(int));
-                    for (int p = 0; p < K; p++) {
-                        int xp = (p == 0) ? 0 : (p == 1) ? x1 : x2;
-                        for (int v = 0; v < 256; v++) combined[v ^ xp] += sub[p][v];
-                    }
-                    double H = entropy_freq(combined, n);
-                    if (H < best_H) {
-                        best_H = H;
-                        pat[0] = 0; pat[1] = (u8)x1;
-                        if (K == 3) pat[2] = (u8)x2;
-                    }
+        /* build sparse index of non-zero entries per phase (most are 0 at large K) */
+        u8  nz_val[64][256]; int nz_cnt[64];
+        for (int p = 0; p < K; p++) {
+            nz_cnt[p] = 0;
+            for (int v = 0; v < 256; v++)
+                if (sub[p][v]) nz_val[p][nz_cnt[p]++] = (u8)v;
+        }
+
+        int base[256];
+        for (int pass = 0; pass < 8; pass++) {
+            int changed = 0;
+            for (int p = (pass == 0 ? 1 : 0); p < K; p++) {
+                memset(base, 0, 256 * sizeof(int));
+                for (int q = 0; q < K; q++) {
+                    if (q == p) continue;
+                    int xq = pat[q];
+                    for (int v = 0; v < 256; v++) base[v ^ xq] += sub[q][v];
                 }
-            }
-        } else {
-            for (int pass = 0; pass < 4; pass++) {
-                for (int p = 1; p < K; p++) {
-                    double lbest_H = H0 * 2; u8 lbest_x = pat[p];
-                    for (int xp = 0; xp < 256; xp++) {
-                        memset(combined, 0, 256 * sizeof(int));
-                        for (int q = 0; q < K; q++) {
-                            int xq = (q == p) ? xp : (int)pat[q];
-                            for (int v = 0; v < 256; v++) combined[v ^ xq] += sub[q][v];
-                        }
-                        double H = entropy_freq(combined, n);
-                        if (H < lbest_H) { lbest_H = H; lbest_x = (u8)xp; }
+                double base_hsum = 0.0;
+                for (int v = 0; v < 256; v++) if (base[v]) base_hsum += hlog[base[v]];
+
+                double lbest_H = H0 * 2; u8 lbest_x = pat[p];
+                int nc = nz_cnt[p];
+                for (int xp = 0; xp < 256; xp++) {
+                    double hsum = base_hsum;
+                    for (int j = 0; j < nc; j++) {
+                        int w  = nz_val[p][j] ^ xp;
+                        int sp = sub[p][nz_val[p][j]];
+                        int bw = base[w];
+                        hsum += hlog[bw + sp] - hlog[bw];
                     }
-                    pat[p] = lbest_x; best_H = lbest_H;
+                    double H = log2((double)n) - hsum / n;
+                    if (H < lbest_H) { lbest_H = H; lbest_x = (u8)xp; }
                 }
+                if (lbest_x != pat[p]) { pat[p] = lbest_x; best_H = lbest_H; changed = 1; }
             }
+            if (!changed) break;   /* converged early */
         }
 
         double raw = (H0 - best_H) * n;
@@ -118,7 +121,7 @@ int main() {
     int    total_key = 0;
 
     for (int round = 0; round < MAX_ROUNDS; round++) {
-        u8  best_pat[MAX_K];
+        u8  best_pat[64];
         int best_K;
         double net = find_best_analytic(data, n, best_pat, &best_K);
 
