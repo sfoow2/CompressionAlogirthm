@@ -1672,6 +1672,62 @@ int main(void) {
         total_ana_net += ana_net_c;
     }
 
+    /* ── SECOND LAYER: ANS2 on entropy-reduced stream, then entropy-reduce ─ */
+    printf("\n--- second layer test (diagnostic) ---\n");
+    {
+        /* ans_stream is still in entropy-reduced state here */
+        u8 *red_copy = malloc(ans_len);
+        memcpy(red_copy, ans_stream, ans_len);
+
+        int ans2_cap = ans_len + ans_len / 4 + 4096;
+        u8 *ans2_buf = malloc(ans2_cap);
+        int ans2_len = o0_compress(red_copy, ans_len, ans2_buf, ans2_cap);
+        free(red_copy);
+
+        double H_ans2 = entropy(ans2_buf, ans2_len);
+        printf("ANS2: %d → %d bytes  H=%.6f  (saved %+.0f bits vs layer1)\n\n",
+               ans_len, ans2_len, H_ans2,
+               (double)(ans_len - ans2_len) * 8.0);
+
+        int n2 = (ans2_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        double total_net2 = 0.0, total_ana2 = 0.0;
+
+        printf("%-7s  %-9s  %-9s  %-10s  %-10s\n",
+               "chunk2", "H_in", "H_out", "greedy", "analytic");
+
+        for (int c2 = 0; c2 < n2; c2++) {
+            int off2 = c2 * BLOCK_SIZE;
+            int csz2 = (off2 + BLOCK_SIZE <= ans2_len) ? BLOCK_SIZE : (ans2_len - off2);
+            u8 *ch2  = ans2_buf + off2;
+
+            double H_in2 = entropy(ch2, csz2);
+            int cnt2[NUM_INSTR_TYPES] = {0};
+            double gn2 = compress_greedy(ch2, csz2, 0, cnt2);
+
+            double an2 = 0.0;
+            if (ANA_MODE > 0) {
+                u8 px[ANA_MAX_K]; int Kx;
+                double nx = find_best_analytic(ch2, csz2, px, &Kx, 0);
+                u8 pa[ANA_MAX_K]; int Ka;
+                double na2x = find_best_analytic(ch2, csz2, pa, &Ka, 1);
+                if (nx >= na2x && nx > 0.0) { an2 = nx; apply_analytic(ch2, csz2, px, Kx, 0); }
+                else if (na2x > nx && na2x > 0.0) { an2 = na2x; apply_analytic(ch2, csz2, pa, Ka, 1); }
+            }
+
+            double H_out2 = entropy(ch2, csz2);
+            printf("  %-5d  %-9.6f  %-9.6f  %-+10.1f  %-+10.1f\n",
+                   c2, H_in2, H_out2, gn2, an2);
+            total_net2 += gn2;
+            total_ana2 += an2;
+        }
+
+        printf("\n2nd layer greedy  : %+.1f bits  (%+.1f/chunk)\n", total_net2, total_net2/n2);
+        printf("2nd layer analytic: %+.1f bits  (%+.1f/chunk)\n", total_ana2, total_ana2/n2);
+        printf("2nd layer combined: %+.1f bits  (%+.1f/chunk)\n",
+               total_net2+total_ana2, (total_net2+total_ana2)/n2);
+        free(ans2_buf);
+    }
+
     for (int c = 0; c < n_chunks; c++) {
         int off = c * BLOCK_SIZE;
         int csz = (off + BLOCK_SIZE <= ans_len) ? BLOCK_SIZE : (ans_len - off);
