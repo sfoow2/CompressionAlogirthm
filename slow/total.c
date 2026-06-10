@@ -15,8 +15,6 @@
 #include <stdint.h>
 #include <string.h>
 #include <math.h>
-#include <windows.h>
-#include <bcrypt.h>
 
 typedef uint8_t  u8;
 typedef uint32_t u32;
@@ -117,6 +115,75 @@ static int o0_decompress(const u8 *in, int n, u8 *out, int outlen) {
     return outlen;
 }
 
+/* ── static-table ANS: transmit freq table once, code without adaptive model ─
+ * Header: 256 × u16 LE normalized to sum=65536 = 512 bytes.
+ * Normalizing to a power-of-2 total makes rc->range /= tot an exact right-shift,
+ * eliminating the ~0.28 bits/symbol rounding overhead of raw-count coding.    */
+static void normalize_freqs(const u32 *raw, int n, u32 *norm) {
+    double scale = 65536.0 / n;
+    double frac[256];
+    int total = 0;
+    for (int v = 0; v < 256; v++) {
+        if (!raw[v]) { norm[v] = 0; frac[v] = 0.0; continue; }
+        double exact = raw[v] * scale;
+        int nf = (int)exact; if (nf < 1) nf = 1;
+        norm[v] = (u32)nf; frac[v] = exact - nf; total += nf;
+    }
+    /* assign remaining slots to symbols with largest fractional parts */
+    for (int adj = 65536 - total; adj > 0; adj--) {
+        int best = 0;
+        for (int v = 1; v < 256; v++) if (frac[v] > frac[best]) best = v;
+        norm[best]++; frac[best] -= 1.0;
+    }
+    for (int adj = total - 65536; adj > 0; adj--) {
+        int worst = -1;
+        for (int v = 0; v < 256; v++)
+            if (norm[v] > 1 && (worst < 0 || frac[v] < frac[worst])) worst = v;
+        if (worst < 0) break;
+        norm[worst]--; frac[worst] += 1.0;
+    }
+}
+static int o0_compress_static(const u8 *in, int n, u8 *out, int cap) {
+    if (cap < 512 + n + 16) return -1;
+    u32 raw[256] = {0};
+    for (int i = 0; i < n; i++) raw[in[i]]++;
+    u32 norm[256]; normalize_freqs(raw, n, norm);
+    /* write header: 256 × u16 LE normalized counts (sum = 65536) */
+    for (int v = 0; v < 256; v++) {
+        out[v*2]   = (u8)(norm[v] & 0xFF);
+        out[v*2+1] = (u8)((norm[v] >> 8) & 0xFF);
+    }
+    u32 cum[256]; u32 tot = 0;
+    for (int v = 0; v < 256; v++) { cum[v] = tot; tot += norm[v]; }
+    RC rc; enc_init(&rc, out + 512, cap - 512);
+    for (int i = 0; i < n; i++) {
+        u8 s = in[i];
+        enc_encode(&rc, cum[s], norm[s], 65536);
+    }
+    enc_flush(&rc);
+    return 512 + rc.pos;
+}
+static int o0_decompress_static(const u8 *in, int n, u8 *out, int outlen) {
+    if (n < 512) return -1;
+    u32 norm[256], cum[256]; u32 tot = 0;
+    for (int v = 0; v < 256; v++) {
+        norm[v] = (u32)in[v*2] | ((u32)in[v*2+1] << 8);
+        cum[v] = tot; tot += norm[v];
+    }
+    RC rc; dec_init(&rc, (u8*)in + 512, n - 512);
+    for (int i = 0; i < outlen; i++) {
+        u32 dv = dec_getfreq(&rc, tot);
+        int lo = 0, hi = 255;
+        while (lo < hi) {
+            int mid = (lo + hi + 1) >> 1;
+            if (cum[mid] <= dv) lo = mid; else hi = mid - 1;
+        }
+        dec_decode(&rc, cum[lo], norm[lo]);
+        out[i] = (u8)lo;
+    }
+    return outlen;
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  *  ENTROPY REDUCER  (greedy search, simple.c logic verbatim)
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -132,7 +199,7 @@ static void init_hlog(void) {
 /* ── analytic period-K XOR/ADD transform ────────────────────────────────── */
 #define ANA_MAX_K          64
 #define ANA_MODE           1   /* 0=off  1=always (runs every round) */
-#define ANA_MAX_INTERLEAVE 4   /* max (greedy→analytic) rounds per chunk */
+#define ANA_MAX_INTERLEAVE 128 /* max round slots per chunk (greedy+analytic each get own slot) */
 
 typedef struct { u8 pat[ANA_MAX_K]; int K; int op; int g_ni; } RoundInfo;
 
@@ -421,9 +488,6 @@ static double entropy(const u8 *data, int n) {
             s += f[i] < HLOG_MAX ? hlog[f[i]] : (double)f[i] * log2((double)f[i]);
     }
     return log2((double)n) - s / n;
-}
-static void fill_random(u8 *buf, int n) {
-    BCryptGenRandom(NULL, buf, (ULONG)n, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
 }
 
 /* ── multiply-inverse table mod 256 ─────────────────────────────────────── */
@@ -1461,12 +1525,8 @@ int main(void) {
         if (raw_size <= 0) { fprintf(stderr, "read error or empty file\n"); return 1; }
         fclose(f);
     } else {
-        raw_size = MAX_CHUNKS * BLOCK_SIZE;
-        raw_data = malloc(raw_size);
-        if (!raw_data) { fprintf(stderr, "OOM\n"); return 1; }
-        fill_random(raw_data, raw_size);
-        printf("'%s' not found — using %d bytes of random data\n\n",
-               INPUT_FILE, raw_size);
+        fprintf(stderr, "error: input file '%s' not found\n", INPUT_FILE);
+        return 1;
     }
 
     printf("Input : %d bytes  H_raw=%.6f bpb\n\n",
@@ -1592,45 +1652,54 @@ int main(void) {
         if (ANALYSE) analyse_chunk(chunk, csz, c);
         if (verbose_this) printf("[chunk 0 detail]\n");
 
-        /* ── interleaved greedy + analytic until convergence ─────────────── */
+        /* ── interleaved greedy + analytic sub-loop until convergence ──────── */
+        /* Each analytic application gets its own slot (g_ni=0, K>0).
+         * The undo loop already handles mixed/pure slots correctly.         */
         double net_c     = 0.0;
         double ana_net_c = 0.0;
         int    total_ni_c = 0;
+        int    s = 0;   /* current slot index into rounds[c] */
         nrounds_arr[c]    = 0;
 
-        for (int r = 0; r < ANA_MAX_INTERLEAVE; r++) {
-            /* greedy pass */
+        for (int iter = 0; iter < 16 && s < ANA_MAX_INTERLEAVE; iter++) {
+            /* greedy pass → greedy-only slot */
             int cnt_r[NUM_INSTR_TYPES] = {0};
-            double gn = compress_greedy(chunk, csz, (r == 0 ? verbose_this : 0), cnt_r);
-            if (r == 0 && verbose_this) printf("\n");
+            double gn = compress_greedy(chunk, csz, (iter == 0 ? verbose_this : 0), cnt_r);
+            if (iter == 0 && verbose_this) printf("\n");
             int rni = g_ni;
             if (total_ni_c + rni > 4096) rni = 4096 - total_ni_c;
             memcpy(ilists[c] + total_ni_c, g_ilist, (size_t)rni * sizeof(Instr));
-            rounds[c][r].g_ni = rni;
+            rounds[c][s].g_ni = rni;
+            rounds[c][s].K    = 0;
             total_ni_c += rni;
             for (int i2 = 0; i2 < NUM_INSTR_TYPES; i2++) counts[i2] += cnt_r[i2];
             net_c += gn;
+            nrounds_arr[c] = ++s;
 
-            /* analytic pass */
+            /* analytic sub-loop: keep firing on new periods until no gain */
             double an = 0.0;
-            rounds[c][r].K = 0;
-            if (ANA_MODE > 0) {
+            while (s < ANA_MAX_INTERLEAVE && ANA_MODE > 0) {
                 u8 px[ANA_MAX_K]; int Kx;
                 double nx = find_best_analytic(chunk, csz, px, &Kx, 0);
                 u8 pa[ANA_MAX_K]; int Ka;
                 double na2 = find_best_analytic(chunk, csz, pa, &Ka, 1);
+                double best = 0.0;
                 if (nx >= na2 && nx > 0.0) {
-                    an = nx; rounds[c][r].K = Kx; rounds[c][r].op = 0;
-                    memcpy(rounds[c][r].pat, px, (size_t)Kx);
+                    best = nx;
+                    rounds[c][s].K = Kx; rounds[c][s].op = 0; rounds[c][s].g_ni = 0;
+                    memcpy(rounds[c][s].pat, px, (size_t)Kx);
                     apply_analytic(chunk, csz, px, Kx, 0);
+                    nrounds_arr[c] = ++s;
                 } else if (na2 > nx && na2 > 0.0) {
-                    an = na2; rounds[c][r].K = Ka; rounds[c][r].op = 1;
-                    memcpy(rounds[c][r].pat, pa, (size_t)Ka);
+                    best = na2;
+                    rounds[c][s].K = Ka; rounds[c][s].op = 1; rounds[c][s].g_ni = 0;
+                    memcpy(rounds[c][s].pat, pa, (size_t)Ka);
                     apply_analytic(chunk, csz, pa, Ka, 1);
-                }
+                    nrounds_arr[c] = ++s;
+                } else break;
+                an += best;
             }
             ana_net_c += an;
-            nrounds_arr[c] = r + 1;
 
             if (gn <= 0.0 && an <= 0.0) break;
         }
@@ -1679,17 +1748,38 @@ int main(void) {
         u8 *red_copy = malloc(ans_len);
         memcpy(red_copy, ans_stream, ans_len);
 
-        int ans2_cap = ans_len + ans_len / 4 + 4096;
-        u8 *ans2_buf = malloc(ans2_cap);
-        int ans2_len = o0_compress(red_copy, ans_len, ans2_buf, ans2_cap);
+        int ans2_cap = ans_len + 4096;
+        u8 *ans2_buf_adapt = malloc(ans2_cap);
+        u8 *ans2_buf_stat  = malloc(ans2_cap);
+        int ans2_adapt = o0_compress(red_copy, ans_len, ans2_buf_adapt, ans2_cap);
+        int ans2_stat  = o0_compress_static(red_copy, ans_len, ans2_buf_stat,  ans2_cap);
+
+        /* verify static ANS round-trips */
+        u8 *rt_buf = malloc(ans_len);
+        o0_decompress_static(ans2_buf_stat, ans2_stat, rt_buf, ans_len);
+        int static_ok = (memcmp(rt_buf, red_copy, ans_len) == 0);
+        free(rt_buf);
         free(red_copy);
 
-        double H_ans2 = entropy(ans2_buf, ans2_len);
-        printf("ANS2: %d → %d bytes  H=%.6f  (saved %+.0f bits vs layer1)\n\n",
-               ans_len, ans2_len, H_ans2,
-               (double)(ans_len - ans2_len) * 8.0);
+        /* entropy of the coded payload (skip 512-byte freq-table header for static) */
+        double H_adapt = entropy(ans2_buf_adapt, ans2_adapt);
+        double H_stat  = entropy(ans2_buf_stat + 512, ans2_stat - 512);
+        printf("ANS2 adaptive : %d → %d bytes  H=%.6f  (%+.0f bits)\n",
+               ans_len, ans2_adapt, H_adapt, (double)(ans_len - ans2_adapt) * 8.0);
+        printf("ANS2 static   : %d → %d bytes  H_payload=%.6f  rt=%s  (%+.0f bits)\n\n",
+               ans_len, ans2_stat, H_stat, static_ok ? "ok" : "FAIL",
+               (double)(ans_len - ans2_stat) * 8.0);
 
-        int n2 = (ans2_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        /* use static output for layer-2 entropy reduction */
+        free(ans2_buf_adapt);
+        u8 *ans2_buf = ans2_buf_stat;
+        int ans2_len = ans2_stat;
+
+        /* operate on coded payload only (skip 512-byte freq-table header) */
+        u8  *ans2_payload = ans2_buf + 512;
+        int  ans2_plen    = ans2_len - 512;
+
+        int n2 = (ans2_plen + BLOCK_SIZE - 1) / BLOCK_SIZE;
         double total_net2 = 0.0, total_ana2 = 0.0;
 
         printf("%-7s  %-9s  %-9s  %-10s  %-10s\n",
@@ -1697,21 +1787,31 @@ int main(void) {
 
         for (int c2 = 0; c2 < n2; c2++) {
             int off2 = c2 * BLOCK_SIZE;
-            int csz2 = (off2 + BLOCK_SIZE <= ans2_len) ? BLOCK_SIZE : (ans2_len - off2);
-            u8 *ch2  = ans2_buf + off2;
+            int csz2 = (off2 + BLOCK_SIZE <= ans2_plen) ? BLOCK_SIZE : (ans2_plen - off2);
+            u8 *ch2  = ans2_payload + off2;
 
             double H_in2 = entropy(ch2, csz2);
             int cnt2[NUM_INSTR_TYPES] = {0};
-            double gn2 = compress_greedy(ch2, csz2, 0, cnt2);
+            double gn2 = 0.0, an2 = 0.0;
 
-            double an2 = 0.0;
-            if (ANA_MODE > 0) {
-                u8 px[ANA_MAX_K]; int Kx;
-                double nx = find_best_analytic(ch2, csz2, px, &Kx, 0);
-                u8 pa[ANA_MAX_K]; int Ka;
-                double na2x = find_best_analytic(ch2, csz2, pa, &Ka, 1);
-                if (nx >= na2x && nx > 0.0) { an2 = nx; apply_analytic(ch2, csz2, px, Kx, 0); }
-                else if (na2x > nx && na2x > 0.0) { an2 = na2x; apply_analytic(ch2, csz2, pa, Ka, 1); }
+            /* same greedy+analytic sub-loop as layer-1 (diagnostic, no undo needed) */
+            for (int it2 = 0; it2 < 16; it2++) {
+                int c2t[NUM_INSTR_TYPES] = {0};
+                double g = compress_greedy(ch2, csz2, 0, c2t);
+                for (int i2 = 0; i2 < NUM_INSTR_TYPES; i2++) cnt2[i2] += c2t[i2];
+                gn2 += g;
+                double round_an2 = 0.0;
+                while (ANA_MODE > 0) {
+                    u8 px[ANA_MAX_K]; int Kx;
+                    double nx = find_best_analytic(ch2, csz2, px, &Kx, 0);
+                    u8 pa[ANA_MAX_K]; int Ka;
+                    double na2x = find_best_analytic(ch2, csz2, pa, &Ka, 1);
+                    if (nx >= na2x && nx > 0.0) { round_an2 += nx; apply_analytic(ch2, csz2, px, Kx, 0); }
+                    else if (na2x > nx && na2x > 0.0) { round_an2 += na2x; apply_analytic(ch2, csz2, pa, Ka, 1); }
+                    else break;
+                }
+                an2 += round_an2;
+                if (g <= 0.0 && round_an2 <= 0.0) break;
             }
 
             double H_out2 = entropy(ch2, csz2);
