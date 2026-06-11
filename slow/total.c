@@ -18,18 +18,19 @@
 #include <time.h>
 
 typedef uint8_t  u8;
+typedef uint16_t u16;
 typedef uint32_t u32;
 
 /* ── configuration ───────────────────────────────────────────────────────── */
 #define INPUT_FILE  "C:\\Users\\lukac\\Documents\\compressor\\data"
-#define MAX_CHUNKS  20         /* how many 4096-byte chunks to process (SINGLE_BLOCK=0) */
+#define OUTPUT_FILE "C:\\Users\\lukac\\Documents\\compressor\\data.ansc"
 #define BLOCK_SIZE  4096
 #define SINGLE_BLOCK       0   /* 1 = treat entire ANS output as one block (no chunking) */
 #define VERBOSE            0   /* 1 = print per-instruction detail                       */
 #define ANALYSE            0   /* 1 = print pattern profile before entropy reduction      */
 #define ANALYSE_MAX_STRIDE 64  /* stride scan for findBest/verification (1..N)           */
 #define ANALYSE_TRI_MAX    32  /* stride scan for TRIPLE category (<=ANALYSE_MAX_STRIDE) */
-#define HLOG_MAX  (MAX_CHUNKS * BLOCK_SIZE * 2 + 2)  /* hlog/hlogf table size */
+#define HLOG_MAX  (BLOCK_SIZE * 2 + 2)  /* hlog/hlogf table: max index = max freq in one chunk */
 #define SKIP_NEVER_FIRE 1  /* 1 = skip instruction types that never fire on near-entropy ANS output   */
 #define ACORR_COMPARE  0   /* 1 = run filtered findBest alongside exhaustive to measure quality delta */
 #define ACORR_TOP_K   12   /* # strides kept by autocorrelation pre-filter in filtered mode           */
@@ -130,7 +131,6 @@ static void init_hlog(void) {
     hlog[0] = 0.0;
     for (int i = 1; i < HLOG_MAX; i++) hlog[i] = i * log2(i);
 }
-
 /* ── analytic period-K XOR/ADD transform ────────────────────────────────── */
 #define ANA_MAX_K          64
 #define ANA_MODE           1   /* 0=off  1=always (runs every round) */
@@ -147,6 +147,12 @@ static float hlogf[HLOG_MAX];
 static void init_hlogf(void) {
     hlogf[0] = 0.0f;
     for (int i = 1; i < HLOG_MAX; i++) hlogf[i] = i * log2f((float)i);
+}
+static inline float  hlogf_safe(int x) {
+    return x < HLOG_MAX ? hlogf[x] : (float)((double)x * log2((double)x));
+}
+static inline double hlog_safe(int x) {
+    return x < HLOG_MAX ? hlog[x] : (double)x * log2((double)x);
 }
 
 static inline int ana_slot(int v, int xp, int op) {
@@ -307,15 +313,13 @@ static double find_best_ctx256_xor(const u8 *data, int n, u8 *amp_out) {
     for (int i = 0; i < n; i++) total[data[i]]++;
 
     double hs0 = 0.0;
-    for (int v = 0; v < 256; v++) if (total[v]) hs0 += hlogf[total[v]];
+    for (int v = 0; v < 256; v++) if (total[v]) hs0 += hlog_safe(total[v]);
     double H0 = log2((double)n) - hs0 / n;
 
     u8  amp[256]; memset(amp, 0, 256);
     int full[256]; memcpy(full, total, 256 * sizeof(int));
     double full_hsum = hs0;
     const double logn = log2((double)n);
-
-    static float delta_j[HLOG_MAX];
 
     for (int pass = 0; pass < 8; pass++) {
         int changed = 0;
@@ -329,21 +333,17 @@ static double find_best_ctx256_xor(const u8 *data, int n, u8 *amp_out) {
             double base_hsum = full_hsum;
             for (int j = 0; j < nz_cnt; j++) {
                 int v = nz_v[j], sp = cond[c][v], sl = v ^ old_a;
-                base_hsum += hlogf[base[sl] - sp] - hlogf[base[sl]];
+                base_hsum += hlog_safe(base[sl] - sp) - hlog_safe(base[sl]);
                 base[sl] -= sp;
             }
 
-            int max_bw = 0;
-            for (int w = 0; w < 256; w++) if (base[w] > max_bw) max_bw = base[w];
-
-            float hsum_arr[256];
-            float fbase = (float)base_hsum;
-            for (int xp = 0; xp < 256; xp++) hsum_arr[xp] = fbase;
+            double hsum_arr[256];
+            for (int xp = 0; xp < 256; xp++) hsum_arr[xp] = base_hsum;
 
             for (int j = 0; j < nz_cnt; j++) {
                 int v = nz_v[j], sp = cond[c][v];
-                for (int b = 0; b <= max_bw; b++) delta_j[b] = hlogf[b + sp] - hlogf[b];
-                for (int xp = 0; xp < 256; xp++) hsum_arr[xp] += delta_j[base[v ^ xp]];
+                for (int xp = 0; xp < 256; xp++)
+                    hsum_arr[xp] += hlog_safe(base[v ^ xp] + sp) - hlog_safe(base[v ^ xp]);
             }
 
             double lbest_H = 1e18; u8 lbest_xp = old_a;
@@ -356,10 +356,10 @@ static double find_best_ctx256_xor(const u8 *data, int n, u8 *amp_out) {
                 for (int j = 0; j < nz_cnt; j++) {
                     int v = nz_v[j], sp = cond[c][v];
                     int wo = v ^ old_a;
-                    full_hsum += hlogf[full[wo] - sp] - hlogf[full[wo]];
+                    full_hsum += hlog_safe(full[wo] - sp) - hlog_safe(full[wo]);
                     full[wo] -= sp;
                     int wn = v ^ lbest_xp;
-                    full_hsum += hlogf[full[wn] + sp] - hlogf[full[wn]];
+                    full_hsum += hlog_safe(full[wn] + sp) - hlog_safe(full[wn]);
                     full[wn] += sp;
                 }
                 amp[c] = lbest_xp; changed = 1;
@@ -1534,11 +1534,11 @@ int main(void) {
 
     FILE *f = fopen(INPUT_FILE, "rb");
     if (f) {
-        /* cap input so we don't try to read a giant file */
-        int cap = MAX_CHUNKS * BLOCK_SIZE;
-        raw_data = malloc(cap);
+        fseek(f, 0, SEEK_END);
+        long fsz = ftell(f); fseek(f, 0, SEEK_SET);
+        raw_data = malloc((size_t)fsz);
         if (!raw_data) { fprintf(stderr, "OOM\n"); return 1; }
-        raw_size = (int)fread(raw_data, 1, cap, f);
+        raw_size = (int)fread(raw_data, 1, (size_t)fsz, f);
         if (raw_size <= 0) { fprintf(stderr, "read error or empty file\n"); return 1; }
         fclose(f);
     } else {
@@ -1559,12 +1559,10 @@ int main(void) {
     printf("ANS   : %d → %d bytes  H_ans=%.6f bpb\n\n",
            raw_size, ans_len, entropy(ans_stream, ans_len));
 
-    /* pristine copy for verification */
+#if SINGLE_BLOCK
     u8 *ans_pristine = malloc(ans_len);
     if (!ans_pristine) { fprintf(stderr, "OOM\n"); return 1; }
     memcpy(ans_pristine, ans_stream, ans_len);
-
-#if SINGLE_BLOCK
     /* ── Option A: entropy-reduce the full ANS output as one block ───── */
     double H_ans_full = entropy(ans_stream, ans_len);
     printf("H_ans=%.6f bpb  size=%d bytes\n\n", H_ans_full, ans_len);
@@ -1619,7 +1617,6 @@ int main(void) {
         if (cn > 0.0) {
             apply_ctx256_xor(ans_stream, ans_len, ctx256_amp);
             has_ctx256 = 1;
-            memcpy(ans_pristine, ans_stream, ans_len);
             printf("  [applied]\n\n");
         } else {
             printf("  [skipped]\n\n");
@@ -1628,21 +1625,26 @@ int main(void) {
 
     /* ── chunked mode: split ANS stream into BLOCK_SIZE chunks ──────── */
     int n_chunks = (ans_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    if (n_chunks > MAX_CHUNKS) n_chunks = MAX_CHUNKS;
-
-    Instr (*ilists)[4096] = malloc(n_chunks * sizeof(*ilists));
-    int   *ni_list          = calloc(n_chunks, sizeof(int));
-    if (!ilists || !ni_list) { fprintf(stderr, "OOM\n"); return 1; }
 
     int    total_counts[NUM_INSTR_TYPES] = {0};
     double total_net = 0.0, total_H_ans = 0.0, total_H_red = 0.0;
     double total_ana_net = 0.0;
     int    chunks_ok = 0, chunks_fail = 0;
 
-    RoundInfo (*rounds)[ANA_MAX_INTERLEAVE] =
-        calloc(n_chunks, ANA_MAX_INTERLEAVE * sizeof(RoundInfo));
-    int *nrounds_arr = calloc(n_chunks, sizeof(int));
-    if (!rounds || !nrounds_arr) { fprintf(stderr, "OOM\n"); return 1; }
+    /* per-chunk working buffers: allocated once, reused every iteration */
+    Instr     *ilist_c  = malloc(4096 * sizeof(Instr));
+    RoundInfo *rounds_c = malloc(ANA_MAX_INTERLEAVE * sizeof(RoundInfo));
+    if (!ilist_c || !rounds_c) { fprintf(stderr, "OOM\n"); return 1; }
+
+    /* open output file and write placeholder header */
+    FILE *fout = fopen(OUTPUT_FILE, "wb");
+    if (!fout) { fprintf(stderr, "Cannot open %s\n", OUTPUT_FILE); return 1; }
+    {
+        u8 plc[16] = {0}; fwrite(plc, 16, 1, fout);  /* filled in at the end */
+        /* ctx256 block: 1-byte flag + 256-byte amp table (always present) */
+        u8 ctx_flag = (u8)has_ctx256; fwrite(&ctx_flag, 1, 1, fout);
+        fwrite(ctx256_amp, 1, 256, fout);
+    }
 
     printf("%-7s  %-9s  %-7s  %-9s  %-9s  %-10s  %-5s  %-10s  %-4s  %-3s  %s\n",
            "chunk", "H_ans", "csz", "H_red", "delta-H", "net(bits)", "ni",
@@ -1657,28 +1659,20 @@ int main(void) {
         u8 *chunk = ans_stream + off;
         clock_t chunk_t0 = clock();
 
+        /* save original chunk bytes for per-chunk round-trip verify */
+        u8 chunk_orig[BLOCK_SIZE];
+        memcpy(chunk_orig, chunk, csz);
+
         double H_chunk = entropy(chunk, csz);
-
-        /* dump chunk 2 raw bytes to file for inspection */
-        if (c == 2) {
-            FILE *df = fopen("C:\\Users\\lukac\\Documents\\compressor\\chunk2.bin", "wb");
-            if (df) { fwrite(chunk, 1, csz, df); fclose(df); printf("[chunk 2 dumped to chunk2.bin]\n"); }
-        }
-
         int counts[NUM_INSTR_TYPES] = {0};
         int verbose_this = (c == 0 && VERBOSE);
         if (ANALYSE) analyse_chunk(chunk, csz, c);
         if (verbose_this) printf("[chunk 0 detail]\n");
 
         /* ── greedy+analytic interleaved reduction ───────────────────────── */
-        double net_c     = 0.0;
-        double ana_net_c = 0.0;
-        int    total_ni_c = 0;
-        int    s = 0;
-        nrounds_arr[c] = 0;
-#if ACORR_COMPARE
-        g_cmp_steps = 0; g_cmp_agree = 0; g_cmp_exh_gain = 0.0; g_cmp_flt_gain = 0.0;
-#endif
+        double net_c = 0.0, ana_net_c = 0.0;
+        int total_ni_c = 0, s = 0, nrounds_c = 0;
+        memset(rounds_c, 0, ANA_MAX_INTERLEAVE * sizeof(RoundInfo));
 
         for (int iter = 0; iter < 16 && s < ANA_MAX_INTERLEAVE; iter++) {
             int cnt_r[NUM_INSTR_TYPES] = {0};
@@ -1686,13 +1680,13 @@ int main(void) {
             if (iter == 0 && verbose_this) printf("\n");
             int rni = g_ni;
             if (total_ni_c + rni > 4096) rni = 4096 - total_ni_c;
-            memcpy(ilists[c] + total_ni_c, g_ilist, (size_t)rni * sizeof(Instr));
-            rounds[c][s].g_ni = rni;
-            rounds[c][s].K    = 0;
+            memcpy(ilist_c + total_ni_c, g_ilist, (size_t)rni * sizeof(Instr));
+            rounds_c[s].g_ni = rni;
+            rounds_c[s].K    = 0;
             total_ni_c += rni;
             for (int i2 = 0; i2 < NUM_INSTR_TYPES; i2++) counts[i2] += cnt_r[i2];
             net_c += gn;
-            nrounds_arr[c] = ++s;
+            nrounds_c = ++s;
 
             double an = 0.0;
             while (s < ANA_MAX_INTERLEAVE && ANA_MODE > 0) {
@@ -1700,45 +1694,39 @@ int main(void) {
                 double nx = find_best_analytic(chunk, csz, px, &Kx, 0);
                 u8 pa[ANA_MAX_K]; int Ka;
                 double na2 = find_best_analytic(chunk, csz, pa, &Ka, 1);
-                double best = 0.0;
                 if (nx >= na2 && nx > 0.0) {
-                    best = nx;
-                    rounds[c][s].K = Kx; rounds[c][s].op = 0; rounds[c][s].g_ni = 0;
-                    memcpy(rounds[c][s].pat, px, (size_t)Kx);
+                    rounds_c[s].K = Kx; rounds_c[s].op = 0; rounds_c[s].g_ni = 0;
+                    memcpy(rounds_c[s].pat, px, (size_t)Kx);
                     apply_analytic(chunk, csz, px, Kx, 0);
-                    nrounds_arr[c] = ++s;
+                    an += nx; nrounds_c = ++s;
                 } else if (na2 > nx && na2 > 0.0) {
-                    best = na2;
-                    rounds[c][s].K = Ka; rounds[c][s].op = 1; rounds[c][s].g_ni = 0;
-                    memcpy(rounds[c][s].pat, pa, (size_t)Ka);
+                    rounds_c[s].K = Ka; rounds_c[s].op = 1; rounds_c[s].g_ni = 0;
+                    memcpy(rounds_c[s].pat, pa, (size_t)Ka);
                     apply_analytic(chunk, csz, pa, Ka, 1);
-                    nrounds_arr[c] = ++s;
+                    an += na2; nrounds_c = ++s;
                 } else break;
-                an += best;
             }
             ana_net_c += an;
             if (gn <= 0.0 && an <= 0.0) break;
         }
 
-        ni_list[c]    = total_ni_c;
         double H_red_c = entropy(chunk, csz);
 
-        /* round-trip verify */
-        u8 *tmp = malloc(csz);
+        /* per-chunk round-trip verify */
+        u8 tmp[BLOCK_SIZE];
         memcpy(tmp, chunk, csz);
         {
             int gni_pos = total_ni_c;
-            for (int r = nrounds_arr[c]-1; r >= 0; r--) {
-                if (rounds[c][r].K > 0)
-                    undo_analytic(tmp, csz, rounds[c][r].pat,
-                                  rounds[c][r].K, rounds[c][r].op);
-                gni_pos -= rounds[c][r].g_ni;
-                if (rounds[c][r].g_ni > 0)
-                    do_decompress(tmp, csz, ilists[c] + gni_pos, rounds[c][r].g_ni);
+            for (int r = nrounds_c-1; r >= 0; r--) {
+                if (rounds_c[r].K > 0)
+                    undo_analytic(tmp, csz, rounds_c[r].pat,
+                                  rounds_c[r].K, rounds_c[r].op);
+                gni_pos -= rounds_c[r].g_ni;
+                if (rounds_c[r].g_ni > 0)
+                    do_decompress(tmp, csz, ilist_c + gni_pos, rounds_c[r].g_ni);
             }
         }
-        int ok = (memcmp(tmp, ans_pristine + off, csz) == 0);
-        free(tmp);
+        int ok = (memcmp(tmp, chunk_orig, csz) == 0);
 
         if (ok) chunks_ok++; else { chunks_fail++; printf("  *** FAIL chunk %d ***\n", c); }
 
@@ -1748,217 +1736,75 @@ int main(void) {
         for (int i = 0; i < NUM_INSTR_TYPES; i++) total_counts[i] += counts[i];
 
         double chunk_sec = (double)(clock() - chunk_t0) / CLOCKS_PER_SEC;
-#if ACORR_COMPARE
-        if (g_cmp_steps > 0) {
-            double missed = g_cmp_exh_gain - g_cmp_flt_gain;
-            printf("  [acorr K=%-2d  steps=%d  agree=%d/%d(%.0f%%)  "
-                   "exh=%+.1f  flt=%+.1f  missed=%+.1f bits]\n",
-                   ACORR_TOP_K, g_cmp_steps, g_cmp_agree, g_cmp_steps,
-                   100.0 * g_cmp_agree / g_cmp_steps,
-                   g_cmp_exh_gain, g_cmp_flt_gain, missed);
-        }
-#endif
         printf("%-7d  %-9.6f  %-7d  %-9.6f  %-+9.6f  %-+10.1f  %-5d  %-+10.1f  %-4d  %-3s  %-7.3fs  %s\n",
-               c, H_chunk, csz, H_red_c, H_red_c - H_chunk, net_c, ni_list[c],
-               ana_net_c, nrounds_arr[c], ok ? "ok" : "FAIL", chunk_sec,
-               ni_list[c] > 0 ? INSTR_NAMES[top_type] : "-");
+               c, H_chunk, csz, H_red_c, H_red_c - H_chunk, net_c, total_ni_c,
+               ana_net_c, nrounds_c, ok ? "ok" : "FAIL", chunk_sec,
+               total_ni_c > 0 ? INSTR_NAMES[top_type] : "-");
 
         total_net += net_c; total_ana_net += ana_net_c;
         total_H_ans += H_chunk; total_H_red += H_red_c;
-#if ACORR_COMPARE
-        total_cmp_steps += g_cmp_steps; total_cmp_agree += g_cmp_agree;
-        total_cmp_exh   += g_cmp_exh_gain; total_cmp_flt += g_cmp_flt_gain;
-#endif
-    }
 
-#if ACORR_COMPARE
-    if (total_cmp_steps > 0) {
-        double tot_missed = total_cmp_exh - total_cmp_flt;
-        double miss_pct   = total_cmp_exh > 0.0 ? 100.0 * tot_missed / total_cmp_exh : 0.0;
-        printf("\n[acorr K=%d summary over %d chunks]\n", ACORR_TOP_K, n_chunks);
-        printf("  steps : %d  agree : %d / %d (%.1f%%)\n",
-               total_cmp_steps, total_cmp_agree, total_cmp_steps,
-               100.0 * total_cmp_agree / total_cmp_steps);
-        printf("  exh gain : %+.1f bits  flt gain : %+.1f bits\n",
-               total_cmp_exh, total_cmp_flt);
-        printf("  missed   : %+.1f bits  (%.2f%% of exhaustive gain)\n",
-               tot_missed, miss_pct);
-    }
-#endif
-
-    /* ── SECOND LAYER: per-chunk ANS2 on entropy-reduced stream ─────────── */
-    printf("\n--- second layer test ---\n");
-    {
-        /* Per-chunk adaptive ANS2 with raw fallback.
-         *
-         * Why per-chunk rather than one stream: the layer-1 entropy reduction
-         * applies different transforms to each chunk, so each chunk's byte
-         * distribution is locally concentrated (H≈7.71) but the GLOBAL
-         * distribution across all chunks is still near-flat.  A single ANS2
-         * pass on the concatenated stream sees only that global near-flat
-         * distribution and barely compresses.  Per-chunk ANS2 lets each chunk's
-         * locally lower entropy be exploited independently.
-         *
-         * Wire format: [n_chunks × uint16 stored_len (bit15=1 → raw)] [payloads...]
-         * Stored raw when ANS2 output ≥ chunk size (rare, but adaptive ANS can
-         * expand highly-structured small blocks on first pass).
-         */
-        int header_bytes = n_chunks * 2;
-        int ans2_cap = header_bytes + ans_len + n_chunks * 8;
-        u8 *ans2_buf = malloc(ans2_cap);
-        u8 *hdr2     = ans2_buf;
-        u8 *pay2     = ans2_buf + header_bytes;
-        int pay2_pos = 0;
-        int chunks_c2 = 0, chunks_fb = 0;
-        u8 *ctmp = malloc(BLOCK_SIZE + 64);  /* reused per chunk */
-
-        printf("%-7s  %-8s  %-8s  %-8s  %-8s\n",
-               "chunk", "raw_B", "ans2_B", "saved_B", "H_in");
-
-        for (int c = 0; c < n_chunks; c++) {
-            int off = c * BLOCK_SIZE;
-            int csz = (off + BLOCK_SIZE <= ans_len) ? BLOCK_SIZE : (ans_len - off);
-            u8 *chunk = ans_stream + off;
-            double H_in = entropy(chunk, csz);
-
-            int clen = o0_compress(chunk, csz, ctmp, csz + 64);
-
-            if (clen < csz) {
-                hdr2[c*2]   = (u8)(clen & 0xFF);
-                hdr2[c*2+1] = (u8)(clen >> 8);        /* bit15=0 → ANS2 */
-                memcpy(pay2 + pay2_pos, ctmp, clen);
-                pay2_pos += clen;
-                chunks_c2++;
-                printf("  %-5d  %-8d  %-8d  %-+8d  %.6f  ANS2\n",
-                       c, csz, clen, csz - clen, H_in);
-            } else {
-                hdr2[c*2]   = (u8)(csz & 0xFF);
-                hdr2[c*2+1] = (u8)((csz >> 8) | 0x80); /* bit15=1 → raw */
-                memcpy(pay2 + pay2_pos, chunk, csz);
-                pay2_pos += csz;
-                chunks_fb++;
-                printf("  %-5d  %-8d  %-8d  %-+8d  %.6f  raw\n",
-                       c, csz, csz, 0, H_in);
-            }
-        }
-        free(ctmp);
-
-        int ans2_len = header_bytes + pay2_pos;
-
-        /* key_bits_est = gross entropy reduction - net (after key was already subtracted)
-         * gross = avg_delta_bpb × ans_len  (bpb × bytes = bits, no extra ×8)
-         */
-        double avg_delta_bpb = (total_H_ans - total_H_red) / (double)n_chunks;
-        double total_gross_bits = avg_delta_bpb * (double)ans_len;
-        int key_bits_est  = (int)(total_gross_bits - (total_net + total_ana_net) + 0.5);
-        int key_bytes_est = (key_bits_est + 7) / 8;
-
-        printf("\nANS2 per-chunk : %d → %d bytes  (%+.0f bits)"
-               "  [%d ANS2, %d raw, %d-byte hdr]\n",
-               ans_len, ans2_len, (double)(ans_len - ans2_len) * 8.0,
-               chunks_c2, chunks_fb, header_bytes);
-        printf("key overhead   : ~%d bytes (~%d bits)\n",
-               key_bytes_est, key_bits_est);
-        printf("net total      : %+d bytes  (%s)\n\n",
-               ans_len - (ans2_len + key_bytes_est),
-               (ans_len > ans2_len + key_bytes_est) ? "COMPRESSES" : "does not compress");
-
-        u8  *ans2_payload = pay2;
-        int  ans2_plen    = pay2_pos;
-
-        int n2 = (ans2_plen + BLOCK_SIZE - 1) / BLOCK_SIZE;
-        double total_net2 = 0.0, total_ana2 = 0.0;
-
-        printf("%-7s  %-9s  %-9s  %-10s  %-10s\n",
-               "chunk2", "H_in", "H_out", "greedy", "analytic");
-
-        for (int c2 = 0; c2 < n2; c2++) {
-            int off2 = c2 * BLOCK_SIZE;
-            int csz2 = (off2 + BLOCK_SIZE <= ans2_plen) ? BLOCK_SIZE : (ans2_plen - off2);
-            u8 *ch2  = ans2_payload + off2;
-
-            double H_in2 = entropy(ch2, csz2);
-            int cnt2[NUM_INSTR_TYPES] = {0};
-            double gn2 = 0.0, an2 = 0.0;
-
-            /* same greedy+analytic sub-loop as layer-1 (diagnostic, no undo needed) */
-            for (int it2 = 0; it2 < 16; it2++) {
-                int c2t[NUM_INSTR_TYPES] = {0};
-                double g = compress_greedy(ch2, csz2, 0, c2t);
-                for (int i2 = 0; i2 < NUM_INSTR_TYPES; i2++) cnt2[i2] += c2t[i2];
-                gn2 += g;
-                double round_an2 = 0.0;
-                while (ANA_MODE > 0) {
-                    u8 px[ANA_MAX_K]; int Kx;
-                    double nx = find_best_analytic(ch2, csz2, px, &Kx, 0);
-                    u8 pa[ANA_MAX_K]; int Ka;
-                    double na2x = find_best_analytic(ch2, csz2, pa, &Ka, 1);
-                    if (nx >= na2x && nx > 0.0) { round_an2 += nx; apply_analytic(ch2, csz2, px, Kx, 0); }
-                    else if (na2x > nx && na2x > 0.0) { round_an2 += na2x; apply_analytic(ch2, csz2, pa, Ka, 1); }
-                    else break;
+        /* write this chunk's key + transformed data to output file */
+        {
+            u16 nr = (u16)nrounds_c; fwrite(&nr, 2, 1, fout);
+            int ilist_base = 0;
+            for (int r = 0; r < nrounds_c; r++) {
+                RoundInfo *ri = &rounds_c[r];
+                if (ri->K == 0) {
+                    u8 kind = 0; fwrite(&kind, 1, 1, fout);
+                    u16 gni = (u16)ri->g_ni; fwrite(&gni, 2, 1, fout);
+                    for (int i = 0; i < ri->g_ni; i++) {
+                        Instr *ins = &ilist_c[ilist_base + i];
+                        u8 t = (u8)ins->type, st = (u8)ins->stride, ph = (u8)ins->phase;
+                        u32 amp = ins->amp;
+                        fwrite(&t, 1, 1, fout); fwrite(&st, 1, 1, fout);
+                        fwrite(&ph, 1, 1, fout); fwrite(&amp, 4, 1, fout);
+                    }
+                    ilist_base += ri->g_ni;
+                } else {
+                    u8 kind = (u8)(ri->op == 0 ? 1 : 2); fwrite(&kind, 1, 1, fout);
+                    u8 K = (u8)ri->K; fwrite(&K, 1, 1, fout);
+                    fwrite(ri->pat, 1, ri->K, fout);
                 }
-                an2 += round_an2;
-                if (g <= 0.0 && round_an2 <= 0.0) break;
             }
-
-            double H_out2 = entropy(ch2, csz2);
-            printf("  %-5d  %-9.6f  %-9.6f  %-+10.1f  %-+10.1f\n",
-                   c2, H_in2, H_out2, gn2, an2);
-            total_net2 += gn2;
-            total_ana2 += an2;
-        }
-
-        printf("\n2nd layer greedy  : %+.1f bits  (%+.1f/chunk)\n", total_net2, total_net2/n2);
-        printf("2nd layer analytic: %+.1f bits  (%+.1f/chunk)\n", total_ana2, total_ana2/n2);
-        printf("2nd layer combined: %+.1f bits  (%+.1f/chunk)\n",
-               total_net2+total_ana2, (total_net2+total_ana2)/n2);
-        free(ans2_buf);
-    }
-
-    for (int c = 0; c < n_chunks; c++) {
-        int off = c * BLOCK_SIZE;
-        int csz = (off + BLOCK_SIZE <= ans_len) ? BLOCK_SIZE : (ans_len - off);
-        u8 *data = ans_stream + off;
-        int gni_pos = ni_list[c];
-        for (int r = nrounds_arr[c]-1; r >= 0; r--) {
-            if (rounds[c][r].K > 0)
-                undo_analytic(data, csz, rounds[c][r].pat,
-                              rounds[c][r].K, rounds[c][r].op);
-            gni_pos -= rounds[c][r].g_ni;
-            if (rounds[c][r].g_ni > 0)
-                do_decompress(data, csz, ilists[c] + gni_pos, rounds[c][r].g_ni);
+            fwrite(chunk, 1, csz, fout);
         }
     }
-    int ans_match = (memcmp(ans_stream, ans_pristine, ans_len) == 0);
-    if (has_ctx256) undo_ctx256_xor(ans_stream, ans_len, ctx256_amp);
-    u8 *raw_check = malloc(raw_size);
-    o0_decompress(ans_stream, ans_len, raw_check, raw_size);
-    int raw_match = (memcmp(raw_check, raw_data, raw_size) == 0);
-    free(raw_check);
 
-    printf("\nchunks processed : %d  (%d ok, %d FAIL)\n", n_chunks, chunks_ok, chunks_fail);
-    printf("ANS restore      : %s\nfull round-trip  : %s\n\n",
-           ans_match ? "ok" : "FAIL", raw_match ? "ok" : "FAIL");
-    printf("avg H_ans     : %.6f bpb\navg H_red     : %.6f bpb\n"
-           "avg delta     : %+.6f bpb\n"
-           "greedy net    : %+.1f bits  (%+.1f bits/chunk)\n"
-           "analytic net  : %+.1f bits  (%+.1f bits/chunk)\n"
-           "combined net  : %+.1f bits  (%+.1f bits/chunk)\n",
-           total_H_ans/n_chunks, total_H_red/n_chunks,
-           (total_H_red-total_H_ans)/n_chunks,
-           total_net, total_net/n_chunks,
-           total_ana_net, total_ana_net/n_chunks,
-           total_net+total_ana_net, (total_net+total_ana_net)/n_chunks);
+    /* seek back and write real header */
+    {
+        long total_out = ftell(fout);
+        fseek(fout, 0, SEEK_SET);
+        u8 magic[4] = {'A','N','S','C'};
+        fwrite(magic, 1, 4, fout);
+        u32 hdr[3] = { (u32)raw_size, (u32)ans_len, (u32)n_chunks };
+        fwrite(hdr, 4, 3, fout);
+        fclose(fout);
 
-    printf("\ninstruction usage:\n");
-    for (int i = 0; i < NUM_INSTR_TYPES; i++)
-        if (total_counts[i] > 0)
-            printf("  %-16s %d\n", INSTR_NAMES[i], total_counts[i]);
+        printf("\nchunks processed : %d  (%d ok, %d FAIL)\n", n_chunks, chunks_ok, chunks_fail);
+        printf("avg H_ans     : %.6f bpb\navg H_red     : %.6f bpb\n"
+               "avg delta     : %+.6f bpb\n"
+               "greedy net    : %+.1f bits  (%+.1f bits/chunk)\n"
+               "analytic net  : %+.1f bits  (%+.1f bits/chunk)\n"
+               "combined net  : %+.1f bits  (%+.1f bits/chunk)\n",
+               total_H_ans/n_chunks, total_H_red/n_chunks,
+               (total_H_red-total_H_ans)/n_chunks,
+               total_net, total_net/n_chunks,
+               total_ana_net, total_ana_net/n_chunks,
+               total_net+total_ana_net, (total_net+total_ana_net)/n_chunks);
+        printf("\ninstruction usage:\n");
+        for (int i = 0; i < NUM_INSTR_TYPES; i++)
+            if (total_counts[i] > 0)
+                printf("  %-16s %d\n", INSTR_NAMES[i], total_counts[i]);
+        printf("\nwrote %s  (%ld bytes, ANS was %d)\n", OUTPUT_FILE, total_out, ans_len);
+    }
 
-    free(ilists); free(ni_list);
-    free(rounds); free(nrounds_arr);
+    free(ilist_c); free(rounds_c);
 #endif
 
-    free(raw_data); free(ans_stream); free(ans_pristine);
+#if SINGLE_BLOCK
+    free(ans_pristine);
+#endif
+    free(raw_data); free(ans_stream);
     return 0;
 }
