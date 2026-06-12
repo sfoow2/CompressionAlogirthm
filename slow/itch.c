@@ -5,6 +5,7 @@
 #include <math.h>
 #include <string.h>
 #include <time.h>
+#include "cvs.c"
 
 typedef uint8_t u8;
 
@@ -502,54 +503,6 @@ double RunModules(u8 *data, int size) {
         free(shifts4a);
     }
 
-    // --- Module 4b: fresh half-byte PRNG search on post-module-3 data ---
-    // Module 3's chunk shifts changed all bytes; re-searching the best (pattern, seed)
-    // per chunk on the current data finds new half-byte optima that weren't reachable
-    // before.  Mirrors module 2 exactly but runs on a differently-structured buffer.
-    double e4b;
-    {
-        clock_t t0 = clock();
-        int nm4b[4] = {0};
-        int *seeds4b = malloc(num_chunks * sizeof(int));
-        int *pats4b  = malloc(num_chunks * sizeof(int));
-        for (int c = 0; c < num_chunks; c++) {
-            int off = c * CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
-            int best_sc = 0, best_seed = 0, best_pat = 0;
-            for (int pat = 0; pat < 4; pat++) {
-                for (int seed = 0; seed < 65536; seed++) {
-                    int sc = score_seed_pattern(cur+off, len, seed, pat);
-                    if (sc > best_sc) { best_sc = sc; best_seed = seed; best_pat = pat; }
-                }
-            }
-            seeds4b[c] = best_seed;
-            pats4b[c]  = best_pat;
-        }
-        for (int c = 0; c < num_chunks; c++) {
-            int off = c * CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
-            int pat = pats4b[c];
-            nm4b[pat]++;
-            xorshift_seed(seeds4b[c]);
-            for (int i = 0; i < len; i++)
-                tmp[off+i] = pattern_applies(i, pat)
-                    ? (u8)(cur[off+i] + randNum_add())
-                    : cur[off+i];
-        }
-        e4b = entropy(tmp, size);
-        if (e4b < e4a) {
-            memcpy(cur, tmp, size);
-            memcpy(pats, pats4b, num_chunks * sizeof(int));
-            printf("module 4b: entropy=%lf  profit=%+.2f  total=%+.2f  time=%.1fs"
-                   "  [half-prng-2  odd:%d even:%d 0110:%d 1001:%d]\n",
-                   e4b, (e4a-e4b)*size, (e0-e4b)*size,
-                   (double)(clock()-t0)/CLOCKS_PER_SEC,
-                   nm4b[0], nm4b[1], nm4b[2], nm4b[3]);
-        } else {
-            e4b = e4a;
-            printf("module 4b: skipped  [half-prng-2]\n");
-        }
-        free(seeds4b); free(pats4b);
-    }
-
     // --- Module 4c: H/C two-constant cross-chunk alignment ---
     // Module 3 shifted the whole chunk (H and C move together). Here we give H and C
     // their own independent constant shifts, each chosen by cross-correlating that
@@ -610,14 +563,14 @@ double RunModules(u8 *data, int size) {
         }
 
         e4c = entropy(tmp, size);
-        if (e4c < e4b) {
+        if (e4c < e4a) {
             memcpy(cur, tmp, size);
             printf("module 4c: entropy=%lf  profit=%+.2f  total=%+.2f  time=%.1fs"
                    "  [hc-align]\n",
-                   e4c, (e4b-e4c)*size, (e0-e4c)*size,
+                   e4c, (e4a-e4c)*size, (e0-e4c)*size,
                    (double)(clock()-t0)/CLOCKS_PER_SEC);
         } else {
-            e4c = e4b;
+            e4c = e4a;
             printf("module 4c: skipped  [hc-align]\n");
         }
 
@@ -632,13 +585,17 @@ int main() {
     init_entropy_table();
     int size = 4096;
     u8 *data = malloc(size);
-    srand(14);
-    for (int i = 0; i < size; i++)
-        data[i] = rand() % 256;
+    CSV_XY *csv = csv_xy_open("output.csv", "seeds", "profit","null");
+    for (int seeds = 0; seeds < 50; seeds++){
+        srand(seeds);
+        for (int i = 0; i < size; i++)
+            data[i] = rand() % 256;
 
-    print_stats("before", data, size);
-    printf("got %lf\n", RunModules(data, size));
+        print_stats("before", data, size);
+        csv_xy_add(csv, seeds, RunModules(data, size),0);
+    }
 
+    csv_xy_close(csv);
     free(data);
 
     return 0;
