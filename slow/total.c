@@ -14,6 +14,9 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 #include <math.h>
 #include <time.h>
 
@@ -474,6 +477,11 @@ static const char *INSTR_NAMES[NUM_INSTR_TYPES] = {
 };
 typedef struct { InstrType type; int stride, phase; unsigned int amp; } Instr;
 
+/* compound literal replacement — works with MSVC which doesn't support C99 compound literals */
+static inline Instr instr_make(InstrType t, int s, int p, unsigned a) {
+    Instr i; i.type=t; i.stride=s; i.phase=p; i.amp=a; return i;
+}
+
 /* ── forward declarations for scramble helpers ───────────────────────────── */
 static void interleave_stride(const u8 *src, u8 *dst, int n, int s);
 static void bit_plane_sep(const u8 *src, u8 *dst, int n);
@@ -817,7 +825,7 @@ static Instr findBest_impl(const u8 *data, int n, double *netOut, int max_stride
         for(int ii=0;ii+lag<n;ii++){lxfreq[data[ii]]--;lxfreq[data[ii]^data[ii+lag]]++;}
         double Slx=0.0; for(int v=0;v<256;v++) Slx+=hlog[lxfreq[v]];
         double nlx=(Slx-Sbase)-INSTR_OHD_NOPHASE(8);
-        if(nlx>bestNet){bestNet=nlx;best=(Instr){LAG_XOR,0,0,(unsigned)lag};}}
+        if(nlx>bestNet){bestNet=nlx;best=instr_make(LAG_XOR,0,0,(unsigned)lag);}}
 
     /* LAG_ADD */
     for(int lag=1;lag<n&&lag<=255;lag++){
@@ -825,7 +833,7 @@ static Instr findBest_impl(const u8 *data, int n, double *netOut, int max_stride
         for(int ii=0;ii+lag<n;ii++){lafreq[data[ii]]--;lafreq[(data[ii]+data[ii+lag])&0xFF]++;}
         double Sla=0.0; for(int v=0;v<256;v++) Sla+=hlog[lafreq[v]];
         double nla=(Sla-Sbase)-INSTR_OHD_NOPHASE(8);
-        if(nla>bestNet){bestNet=nla;best=(Instr){LAG_ADD,0,0,(unsigned)lag};}}
+        if(nla>bestNet){bestNet=nla;best=instr_make(LAG_ADD,0,0,(unsigned)lag);}}
 #endif
 
     /* CTX4_XOR / CTX4_ADD: 4 contexts keyed on top 2 bits of previous byte */
@@ -840,13 +848,13 @@ static Instr findBest_impl(const u8 *data, int n, double *netOut, int max_stride
         for(int c=0;c<4;c++){double Sc; int ac=xor_best_amp(dv4[c],phF4[c],&Sc);
             S4x+=Sc; amp4x|=(unsigned)(ac&0xFF)<<(c*8);}
         double n4x=S4x-4.0*Sbase-INSTR_OHD(32);
-        if(n4x>bestNet){bestNet=n4x; best=(Instr){CTX4_XOR,1,0,amp4x};}
+        if(n4x>bestNet){bestNet=n4x; best=instr_make(CTX4_XOR,1,0,amp4x);}
 #endif
         double S4a=0.0; unsigned amp4a=0;
         for(int c=0;c<4;c++){double Sc; int ac=add_best_amp(dv4[c],phF4[c],6,&Sc);
             S4a+=Sc; amp4a|=(unsigned)(ac&0xFF)<<(c*8);}
         double n4a=S4a-4.0*Sbase-INSTR_OHD(32);
-        if(n4a>bestNet){bestNet=n4a; best=(Instr){CTX4_ADD,1,0,amp4a};}
+        if(n4a>bestNet){bestNet=n4a; best=instr_make(CTX4_ADD,1,0,amp4a);}
     }
 
     for(int stride=1;stride<=max_stride;stride++){
@@ -860,7 +868,7 @@ static Instr findBest_impl(const u8 *data, int n, double *netOut, int max_stride
             for(int i=stride;i<n;i++) pdfreq[data[i]^data[i-s1]^data[i-stride]]++;
             double Spd=0.0; for(int v=0;v<256;v++) Spd+=hlog[pdfreq[v]];
             double npd=(Spd-Sbase)-INSTR_OHD(6);
-            if(npd>bestNet){bestNet=npd;best=(Instr){POLY_DELTA_XOR,s1,stride,0};}}}
+            if(npd>bestNet){bestNet=npd;best=instr_make(POLY_DELTA_XOR,s1,stride,0);}}}
 #endif
 
         for(int phase=0;phase<stride;phase++){
@@ -887,7 +895,7 @@ static Instr findBest_impl(const u8 *data, int n, double *netOut, int max_stride
                         gain_sub+=hlog[total[v]-phF[v]+phF[nv]]-hlog[total[v]];}
                     if(gain_sub>best_sub){best_sub=gain_sub;best_sub_amp=(unsigned)(nib<<4)|ar;}}
                 double ncl=best_sub-INSTR_OHD(8);
-                if(ncl>bestNet){bestNet=ncl;best=(Instr){COND_LO_XOR,stride,phase,best_sub_amp};}}
+                if(ncl>bestNet){bestNet=ncl;best=instr_make(COND_LO_XOR,stride,phase,best_sub_amp);}}
             /* COND_HI_XOR */ {
                 double best_sub=-1e30; unsigned best_sub_amp=0x11;
                 for(int nib=0;nib<16;nib++){
@@ -902,7 +910,7 @@ static Instr findBest_impl(const u8 *data, int n, double *netOut, int max_stride
                         gain_sub+=hlog[total[v]-phF[v]+phF[nv]]-hlog[total[v]];}
                     if(gain_sub>best_sub){best_sub=gain_sub;best_sub_amp=(unsigned)((ar<<4)|nib);}}
                 double nch=best_sub-INSTR_OHD(8);
-                if(nch>bestNet){bestNet=nch;best=(Instr){COND_HI_XOR,stride,phase,best_sub_amp};}}
+                if(nch>bestNet){bestNet=nch;best=instr_make(COND_HI_XOR,stride,phase,best_sub_amp);}}
             /* COND_LO_ADD / COND_HI_ADD */ {
                 for(int nib=0;nib<16;nib++){
                     int base=nib<<4;
@@ -917,7 +925,7 @@ static Instr findBest_impl(const u8 *data, int n, double *netOut, int max_stride
                         gain_sub+=hlog[total[nv]-phF[nv]+phF[v]]-hlog[total[nv]];
                         gain_sub+=hlog[total[v]-phF[v]+phF[nv]]-hlog[total[v]];}
                     double ncla=gain_sub-INSTR_OHD(8);
-                    if(ncla>bestNet){bestNet=ncla;best=(Instr){COND_LO_ADD,stride,phase,(unsigned)(nib<<4)|ar};}}}
+                    if(ncla>bestNet){bestNet=ncla;best=instr_make(COND_LO_ADD,stride,phase,(unsigned)(nib<<4)|ar);}}}
             {for(int nib=0;nib<16;nib++){
                     int remap[16],remapc[16];
                     for(int hi=0;hi<16;hi++){remap[hi]=phF[hi*16+nib];remapc[hi]=total[hi*16+nib]-phF[hi*16+nib];}
@@ -930,7 +938,7 @@ static Instr findBest_impl(const u8 *data, int n, double *netOut, int max_stride
                         gain_sub+=hlog[total[nv]-phF[nv]+phF[v]]-hlog[total[nv]];
                         gain_sub+=hlog[total[v]-phF[v]+phF[nv]]-hlog[total[v]];}
                     double ncha=gain_sub-INSTR_OHD(8);
-                    if(ncha>bestNet){bestNet=ncha;best=(Instr){COND_HI_ADD,stride,phase,(unsigned)((ar<<4)|nib)};}}}
+                    if(ncha>bestNet){bestNet=ncha;best=instr_make(COND_HI_ADD,stride,phase,(unsigned)((ar<<4)|nib));}}}
             /* TRIPLE XOR/ADD/MUL */ if(!g_skip_quad){
                 int ph3[3][256]={{0},{0},{0}};
                 int kk=0; for(int i=phase;i<n;i+=stride,kk++) ph3[kk%3][data[i]]++;
@@ -938,14 +946,14 @@ static Instr findBest_impl(const u8 *data, int n, double *netOut, int max_stride
                 double S3[3]; int a3[3];
                 for(int r=0;r<3;r++) a3[r]=xor_best_amp(dv3[r],ph3[r],&S3[r]);
                 double nt3=(S3[0]-Sbase)+(S3[1]-Sbase)+(S3[2]-Sbase)-INSTR_OHD_NOPHASE(3*8);
-                if(nt3>bestNet){bestNet=nt3;best=(Instr){TRIPLE_XOR,stride,phase,(unsigned)(a3[0]|(a3[1]<<8)|(a3[2]<<16))};}
+                if(nt3>bestNet){bestNet=nt3;best=instr_make(TRIPLE_XOR,stride,phase,(unsigned)(a3[0]|(a3[1]<<8)|(a3[2]<<16)));}
                 for(int r=0;r<3;r++) a3[r]=add_best_amp(dv3[r],ph3[r],6,&S3[r]);
                 nt3=(S3[0]-Sbase)+(S3[1]-Sbase)+(S3[2]-Sbase)-INSTR_OHD_NOPHASE(3*8);
-                if(nt3>bestNet){bestNet=nt3;best=(Instr){TRIPLE_ADD,stride,phase,(unsigned)(a3[0]|(a3[1]<<8)|(a3[2]<<16))};}
+                if(nt3>bestNet){bestNet=nt3;best=instr_make(TRIPLE_ADD,stride,phase,(unsigned)(a3[0]|(a3[1]<<8)|(a3[2]<<16)));}
                 int idx3[3];
                 for(int r=0;r<3;r++){double Sm; idx3[r]=(mul_best_amp(dv3[r],ph3[r],&Sm)-3)/2;S3[r]=Sm;}
                 nt3=(S3[0]-Sbase)+(S3[1]-Sbase)+(S3[2]-Sbase)-INSTR_OHD_NOPHASE(3*7);
-                if(nt3>bestNet){bestNet=nt3;best=(Instr){TRIPLE_MUL,stride,phase,(unsigned)(idx3[0]|(idx3[1]<<7)|(idx3[2]<<14))};}}
+                if(nt3>bestNet){bestNet=nt3;best=instr_make(TRIPLE_MUL,stride,phase,(unsigned)(idx3[0]|(idx3[1]<<7)|(idx3[2]<<14)));}}
             if(!g_skip_quad){ /* QUAD XOR/ADD */
                 int ph4[4][256]={{0},{0},{0},{0}};
                 int kk=0; for(int i=phase;i<n;i+=stride,kk++) ph4[kk&3][data[i]]++;
@@ -953,26 +961,26 @@ static Instr findBest_impl(const u8 *data, int n, double *netOut, int max_stride
                 double S4[4]; unsigned a4[4];
                 for(int r=0;r<4;r++) a4[r]=(unsigned)xor_best_amp(dv4[r],ph4[r],&S4[r]);
                 double nq4=(S4[0]-Sbase)+(S4[1]-Sbase)+(S4[2]-Sbase)+(S4[3]-Sbase)-INSTR_OHD(4*8);
-                if(nq4>bestNet){bestNet=nq4;best=(Instr){QUAD_XOR,stride,phase,a4[0]|(a4[1]<<8)|(a4[2]<<16)|(a4[3]<<24)};}
+                if(nq4>bestNet){bestNet=nq4;best=instr_make(QUAD_XOR,stride,phase,a4[0]|(a4[1]<<8)|(a4[2]<<16)|(a4[3]<<24));}
                 for(int r=0;r<4;r++) a4[r]=(unsigned)add_best_amp(dv4[r],ph4[r],6,&S4[r]);
                 nq4=(S4[0]-Sbase)+(S4[1]-Sbase)+(S4[2]-Sbase)+(S4[3]-Sbase)-INSTR_OHD(4*8);
-                if(nq4>bestNet){bestNet=nq4;best=(Instr){QUAD_ADD,stride,phase,a4[0]|(a4[1]<<8)|(a4[2]<<16)|(a4[3]<<24)};}
+                if(nq4>bestNet){bestNet=nq4;best=instr_make(QUAD_ADD,stride,phase,a4[0]|(a4[1]<<8)|(a4[2]<<16)|(a4[3]<<24));}
 #if !SKIP_NEVER_FIRE
                 int idx4[4];
                 for(int r=0;r<4;r++){double Sm; idx4[r]=(mul_best_amp(dv4[r],ph4[r],&Sm)-3)/2;S4[r]=Sm;}
                 nq4=(S4[0]-Sbase)+(S4[1]-Sbase)+(S4[2]-Sbase)+(S4[3]-Sbase)-INSTR_OHD(4*7);
-                if(nq4>bestNet){bestNet=nq4;best=(Instr){QUAD_MUL,stride,phase,(unsigned)(idx4[0]|(idx4[1]<<7)|(idx4[2]<<14)|(idx4[3]<<21))};}
+                if(nq4>bestNet){bestNet=nq4;best=instr_make(QUAD_MUL,stride,phase,(unsigned)(idx4[0]|(idx4[1]<<7)|(idx4[2]<<14)|(idx4[3]<<21)));}
 #endif
             }  /* end if(!g_skip_quad) */
 
             /* ── remaining types ── */
             /* XOR_PHASE */ { double Sx; int ax=xor_best_amp(dv,phF,&Sx);
                 double nx=(Sx-Sbase)-INSTR_OHD(8);
-                if(nx>bestNet){bestNet=nx;best=(Instr){XOR_PHASE,stride,phase,ax};}}
+                if(nx>bestNet){bestNet=nx;best=instr_make(XOR_PHASE,stride,phase,ax);}}
 #if !SKIP_NEVER_FIRE
             /* ADD_PHASE */ { double Sa; int aa=add_best_amp(dv,phF,6,&Sa);
                 double na=(Sa-Sbase)-INSTR_OHD(8);
-                if(na>bestNet){bestNet=na;best=(Instr){ADD_PHASE,stride,phase,aa};}}
+                if(na>bestNet){bestNet=na;best=instr_make(ADD_PHASE,stride,phase,aa);}}
             /* PACK_XOR */ {
                 int pxfreq[256]; for(int v=0;v<256;v++) pxfreq[v]=total[v];
                 int k=0; for(int ii=phase;ii<n;ii+=stride,k++){
@@ -980,7 +988,7 @@ static Instr findBest_impl(const u8 *data, int n, double *netOut, int max_stride
                     pxfreq[data[ii]]--; pxfreq[data[ii]^data[j]]++;}
                 double Spx=0.0; for(int v=0;v<256;v++) Spx+=hlog[pxfreq[v]];
                 double npx=(Spx-Sbase)-INSTR_OHD(0);
-                if(npx>bestNet){bestNet=npx;best=(Instr){PACK_XOR,stride,phase,0};}}
+                if(npx>bestNet){bestNet=npx;best=instr_make(PACK_XOR,stride,phase,0);}}
             /* COND_PREV_XOR */ {
                 int phF0[256]={0},phF1[256]={0},pv=0,cpx_first=1;
                 for(int ii=phase;ii<n;ii+=stride){
@@ -991,25 +999,25 @@ static Instr findBest_impl(const u8 *data, int n, double *netOut, int max_stride
                 for(int v=0;v<256;v++){dv0[v]=total[v]-phF0[v];dv1[v]=total[v]-phF1[v];}
                 double Sx0,Sx1; int ax0=xor_best_amp(dv0,phF0,&Sx0),ax1=xor_best_amp(dv1,phF1,&Sx1);
                 double ncpx=(Sx0-Sbase)+(Sx1-Sbase)-INSTR_OHD(16);
-                if(ncpx>bestNet){bestNet=ncpx;best=(Instr){COND_PREV_XOR,stride,phase,
-                    (unsigned)(ax0|(ax1<<8))};}}
+                if(ncpx>bestNet){bestNet=ncpx;best=instr_make(COND_PREV_XOR,stride,phase,
+                    (unsigned)(ax0|(ax1<<8)));}}
 #endif
             /* ADD_NIBS */ { double San; int an=add_nibs_best_amp(dv,phF,&San);
                 double nan=(San-Sbase)-INSTR_OHD(8);
-                if(nan>bestNet){bestNet=nan;best=(Instr){ADD_NIBS,stride,phase,(unsigned)an};}}
+                if(nan>bestNet){bestNet=nan;best=instr_make(ADD_NIBS,stride,phase,(unsigned)an);}}
             /* NIB_SWAP */ { int nsfreq[256]={0};
                 for(int i=phase;i<n;i+=stride) nsfreq[((data[i]<<4)&0xF0)|(data[i]>>4)]++;
                 int ns_tot[256]; for(int v=0;v<256;v++) ns_tot[v]=total[v]-phF[v]+nsfreq[v];
                 double Sns=0.0; for(int v=0;v<256;v++) Sns+=hlog[ns_tot[v]];
                 double nns=(Sns-Sbase)-INSTR_OHD(0);
-                if(nns>bestNet){bestNet=nns;best=(Instr){NIB_SWAP,stride,phase,0};}}
+                if(nns>bestNet){bestNet=nns;best=instr_make(NIB_SWAP,stride,phase,0);}}
             /* BIT_ROTATE */ { for(int k=1;k<8;k++){
                 int brfreq[256]={0};
                 for(int i=phase;i<n;i+=stride) brfreq[((data[i]<<k)|(data[i]>>(8-k)))&0xFF]++;
                 int br_tot[256]; for(int v=0;v<256;v++) br_tot[v]=total[v]-phF[v]+brfreq[v&0xFF];
                 double Sbr=0.0; for(int v=0;v<256;v++) Sbr+=hlog[br_tot[v]];
                 double nbr=(Sbr-Sbase)-INSTR_OHD(3);
-                if(nbr>bestNet){bestNet=nbr;best=(Instr){BIT_ROTATE,stride,phase,(unsigned)k};}}}
+                if(nbr>bestNet){bestNet=nbr;best=instr_make(BIT_ROTATE,stride,phase,(unsigned)k);}}}
 #if !SKIP_NEVER_FIRE
             /* VALUE_XOR */
             /* Group 0: bytes with bit k=0; Group 1: bytes with bit k=1.
@@ -1028,8 +1036,8 @@ static Instr findBest_impl(const u8 *data, int n, double *netOut, int max_stride
                 /* restore to 8-bit amps with bit k=0 */
                 int alo=vxor_ins(ha0,k), ahi=vxor_ins(ha1,k);
                 double Svx=(S0+S1)-Sbase-INSTR_OHD(17);
-                if(Svx>bestNet){bestNet=Svx;best=(Instr){VALUE_XOR,stride,phase,
-                    (unsigned)(k|(alo<<3)|(ahi<<11))};}} }
+                if(Svx>bestNet){bestNet=Svx;best=instr_make(VALUE_XOR,stride,phase,
+                    (unsigned)(k|(alo<<3)|(ahi<<11)));}} }
 #endif
             /* DUAL XOR/ADD/MUL */ { int lo_phF[256]={0},hi_phF[256]={0};
                 int kk=0; for(int i=phase;i<n;i+=stride,kk++){if(kk&1)hi_phF[data[i]]++;else lo_phF[data[i]]++;}
@@ -1037,13 +1045,13 @@ static Instr findBest_impl(const u8 *data, int n, double *netOut, int max_stride
                 double Slo,Shi;
                 { int alo=xor_best_amp(lo_dv,lo_phF,&Slo),ahi=xor_best_amp(hi_dv,hi_phF,&Shi);
                   double ndx=(Slo-Sbase)+(Shi-Sbase)-INSTR_OHD(16);
-                  if(ndx>bestNet){bestNet=ndx;best=(Instr){DUAL_XOR,stride,phase,(unsigned)(alo|(ahi<<8))};} }
+                  if(ndx>bestNet){bestNet=ndx;best=instr_make(DUAL_XOR,stride,phase,(unsigned)(alo|(ahi<<8)));} }
                 { int alo=add_best_amp(lo_dv,lo_phF,6,&Slo),ahi=add_best_amp(hi_dv,hi_phF,6,&Shi);
                   double nda=(Slo-Sbase)+(Shi-Sbase)-INSTR_OHD(16);
-                  if(nda>bestNet){bestNet=nda;best=(Instr){DUAL_ADD,stride,phase,(unsigned)(alo|(ahi<<8))};} }
+                  if(nda>bestNet){bestNet=nda;best=instr_make(DUAL_ADD,stride,phase,(unsigned)(alo|(ahi<<8)));} }
                 { int idx_lo=(mul_best_amp(lo_dv,lo_phF,&Slo)-3)/2,idx_hi=(mul_best_amp(hi_dv,hi_phF,&Shi)-3)/2;
                   double ndm=(Slo-Sbase)+(Shi-Sbase)-INSTR_OHD(14);
-                  if(ndm>bestNet){bestNet=ndm;best=(Instr){DUAL_MUL,stride,phase,(unsigned)(idx_lo|(idx_hi<<7))};} } }
+                  if(ndm>bestNet){bestNet=ndm;best=instr_make(DUAL_MUL,stride,phase,(unsigned)(idx_lo|(idx_hi<<7)));} } }
         }
     }
     *netOut = bestNet;
@@ -1104,47 +1112,47 @@ static int do_decompress(u8 *data, int n, const Instr *instrs, int ni) {
         case POLY_DELTA_XOR: { int s1=t.stride,s2=t.phase;
             for(int i=s2;i<n;i++) data[i]^=data[i-s1]^data[i-s2]; break; }
         case XOR_PHASE: applyInstr(data,n,t); break;
-        case ADD_PHASE: applyInstr(data,n,(Instr){ADD_PHASE,t.stride,t.phase,(256-t.amp)&0xFF}); break;
+        case ADD_PHASE: applyInstr(data,n,instr_make(ADD_PHASE,t.stride,t.phase,(256-t.amp)&0xFF)); break;
         case PACK_XOR:  applyInstr(data,n,t); break;
         case LAG_XOR: { int lag=(int)t.amp;
             for(int i=n-lag-1;i>=0;i--) data[i]^=data[i+lag]; break; }
         case LAG_ADD: { int lag=(int)t.amp;
             for(int i=n-lag-1;i>=0;i--) data[i]=(u8)((data[i]-data[i+lag])&0xFF); break; }
         case ADD_NIBS: { int lo=t.amp&0xF,hi=(t.amp>>4)&0xF;
-            applyInstr(data,n,(Instr){ADD_NIBS,t.stride,t.phase,(unsigned)(((-hi)&0xF)<<4)|((-lo)&0xF)}); break; }
+            applyInstr(data,n,instr_make(ADD_NIBS,t.stride,t.phase,(unsigned)(((-hi)&0xF)<<4)|((-lo)&0xF))); break; }
         case NIB_SWAP: applyInstr(data,n,t); break;
         case BIT_ROTATE: { int k=t.amp&7;
-            applyInstr(data,n,(Instr){BIT_ROTATE,t.stride,t.phase,(8-k)&7}); break; }
+            applyInstr(data,n,instr_make(BIT_ROTATE,t.stride,t.phase,(8-k)&7)); break; }
         case VALUE_XOR: applyInstr(data,n,t); break;
         case COND_LO_XOR: applyInstr(data,n,t); break;
         case COND_HI_XOR: applyInstr(data,n,t); break;
         case COND_LO_ADD: { int nc=(t.amp>>4)&0xF,av=t.amp&0xF;
-            applyInstr(data,n,(Instr){COND_LO_ADD,t.stride,t.phase,(unsigned)((nc<<4)|((-av)&0xF))}); break; }
+            applyInstr(data,n,instr_make(COND_LO_ADD,t.stride,t.phase,(unsigned)((nc<<4)|((-av)&0xF)))); break; }
         case COND_HI_ADD: { int nc=t.amp&0xF,av=(t.amp>>4)&0xF;
-            applyInstr(data,n,(Instr){COND_HI_ADD,t.stride,t.phase,(unsigned)(nc|((-av&0xF)<<4))}); break; }
+            applyInstr(data,n,instr_make(COND_HI_ADD,t.stride,t.phase,(unsigned)(nc|((-av&0xF)<<4)))); break; }
         case DUAL_XOR: applyInstr(data,n,t); break;
         case DUAL_ADD: { int lo=t.amp&0xFF,hi=(t.amp>>8)&0xFF;
-            applyInstr(data,n,(Instr){DUAL_ADD,t.stride,t.phase,((256-lo)&0xFF)|(((256-hi)&0xFF)<<8)}); break; }
+            applyInstr(data,n,instr_make(DUAL_ADD,t.stride,t.phase,((256-lo)&0xFF)|(((256-hi)&0xFF)<<8))); break; }
         case DUAL_MUL: { int il=t.amp&0x7F,ih=(t.amp>>7)&0x7F;
             int ml=il*2+3,mh=ih*2+3;
             int invl=(mul_inv[ml]-3)/2,invh=(mul_inv[mh]-3)/2;
-            applyInstr(data,n,(Instr){DUAL_MUL,t.stride,t.phase,(unsigned)(invl|(invh<<7))}); break; }
+            applyInstr(data,n,instr_make(DUAL_MUL,t.stride,t.phase,(unsigned)(invl|(invh<<7)))); break; }
         case TRIPLE_XOR: applyInstr(data,n,t); break;
         case TRIPLE_ADD: { int a0=t.amp&0xFF,a1=(t.amp>>8)&0xFF,a2=(t.amp>>16)&0xFF;
-            applyInstr(data,n,(Instr){TRIPLE_ADD,t.stride,t.phase,
-                ((256-a0)&0xFF)|(((256-a1)&0xFF)<<8)|(((256-a2)&0xFF)<<16)}); break; }
+            applyInstr(data,n,instr_make(TRIPLE_ADD,t.stride,t.phase,
+                ((256-a0)&0xFF)|(((256-a1)&0xFF)<<8)|(((256-a2)&0xFF)<<16))); break; }
         case TRIPLE_MUL: { int i0=t.amp&0x7F,i1=(t.amp>>7)&0x7F,i2=(t.amp>>14)&0x7F;
             int m0=i0*2+3,m1=i1*2+3,m2=i2*2+3;
             int v0=(mul_inv[m0]-3)/2,v1=(mul_inv[m1]-3)/2,v2=(mul_inv[m2]-3)/2;
-            applyInstr(data,n,(Instr){TRIPLE_MUL,t.stride,t.phase,(unsigned)(v0|(v1<<7)|(v2<<14))}); break; }
+            applyInstr(data,n,instr_make(TRIPLE_MUL,t.stride,t.phase,(unsigned)(v0|(v1<<7)|(v2<<14)))); break; }
         case QUAD_XOR: applyInstr(data,n,t); break;
         case QUAD_ADD: { unsigned a0=t.amp&0xFF,a1=(t.amp>>8)&0xFF,a2=(t.amp>>16)&0xFF,a3=t.amp>>24;
-            applyInstr(data,n,(Instr){QUAD_ADD,t.stride,t.phase,
-                ((256-a0)&0xFF)|(((256-a1)&0xFF)<<8)|(((256-a2)&0xFF)<<16)|(((256-a3)&0xFF)<<24)}); break; }
+            applyInstr(data,n,instr_make(QUAD_ADD,t.stride,t.phase,
+                ((256-a0)&0xFF)|(((256-a1)&0xFF)<<8)|(((256-a2)&0xFF)<<16)|(((256-a3)&0xFF)<<24))); break; }
         case QUAD_MUL: { int i0=t.amp&0x7F,i1=(t.amp>>7)&0x7F,i2=(t.amp>>14)&0x7F,i3=(t.amp>>21)&0x7F;
             int m0=i0*2+3,m1=i1*2+3,m2=i2*2+3,m3=i3*2+3;
             int v0=(mul_inv[m0]-3)/2,v1=(mul_inv[m1]-3)/2,v2=(mul_inv[m2]-3)/2,v3=(mul_inv[m3]-3)/2;
-            applyInstr(data,n,(Instr){QUAD_MUL,t.stride,t.phase,(unsigned)(v0|(v1<<7)|(v2<<14)|(v3<<21))}); break; }
+            applyInstr(data,n,instr_make(QUAD_MUL,t.stride,t.phase,(unsigned)(v0|(v1<<7)|(v2<<14)|(v3<<21)))); break; }
         /* Inverse CTX4: backward pass.  Going right-to-left, data[i-1] is still
          * in its ENCODED (post-transform) state when we process position i, which
          * is exactly the context value the encoder used — so the XOR/ADD cancels. */
@@ -1184,7 +1192,7 @@ static void analyse_chunk(const u8 *data, int n, int cidx) {
     Instr best = findBest(data, n, &estNet, ANALYSE_MAX_STRIDE);
     double verNet=0;
     if(estNet>0){
-        u8 *tmp=malloc(n); memcpy(tmp,data,n);
+        u8 *tmp=(u8*)malloc(n); memcpy(tmp,data,n);
         applyInstr(tmp,n,best);
         double e1=entropy(tmp,n); free(tmp);
         if(e1<H) verNet=(H-e1)*n;
