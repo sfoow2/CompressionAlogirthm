@@ -685,48 +685,60 @@ double RunModules(u8 *data, int size) {
         free(seeds5); free(dirs5); free(ss); free(lc); free(ls);
     }
 
-    // --- Module 6: cross-chunk re-alignment after AND-PRNG reshaping ---
-    // Module 5's per-chunk AND-PRNG changed the global histogram, making the
-    // constant-shift alignment from modules 3+4a stale. Re-run the same xcorr
-    // search to capture any residual cross-chunk misalignment.
-    double e6;
+    // --- Module 6: iterated cross-chunk re-alignment ---
+    // Module 5's AND-PRNG reshaped histograms, making the earlier alignment stale.
+    // Repeat the xcorr constant-shift pass until convergence: each pass may shift
+    // chunks whose optimal shift changed because neighbouring chunks moved.
+    double e6 = e5;
     {
         clock_t t0 = clock();
         int *shifts6 = malloc(num_chunks * sizeof(int));
-        int global[256] = {0};
-        for (int i = 0; i < size; i++) global[cur[i]]++;
-        for (int c = 0; c < num_chunks; c++) {
-            int off = c * CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
-            int local[256] = {0};
-            for (int i = 0; i < len; i++) local[cur[off+i]]++;
-            int rest[256];
-            for (int v = 0; v < 256; v++) rest[v] = global[v] - local[v];
-            int best_s = 0, best_xcorr = -1;
-            for (int s = 0; s < 256; s++) {
-                int xcorr = 0;
-                for (int v = 0; v < 256; v++) xcorr += local[v] * rest[(v+s)&0xFF];
-                if (xcorr > best_xcorr) { best_xcorr = xcorr; best_s = s; }
+        int passes = 0;
+
+        for (int iter = 0; iter < 16; iter++) {
+            int global[256] = {0};
+            for (int i = 0; i < size; i++) global[cur[i]]++;
+
+            int any_nonzero = 0;
+            for (int c = 0; c < num_chunks; c++) {
+                int off = c * CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
+                int local[256] = {0};
+                for (int i = 0; i < len; i++) local[cur[off+i]]++;
+                int rest[256];
+                for (int v = 0; v < 256; v++) rest[v] = global[v] - local[v];
+                int best_s = 0, best_xcorr = -1;
+                for (int s = 0; s < 256; s++) {
+                    int xcorr = 0;
+                    for (int v = 0; v < 256; v++) xcorr += local[v] * rest[(v+s)&0xFF];
+                    if (xcorr > best_xcorr) { best_xcorr = xcorr; best_s = s; }
+                }
+                shifts6[c] = best_s;
+                if (best_s) any_nonzero = 1;
             }
-            shifts6[c] = best_s;
-        }
-        for (int c = 0; c < num_chunks; c++) {
-            int off = c * CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
-            for (int i = 0; i < len; i++) tmp[off+i] = (u8)(cur[off+i] + (u8)shifts6[c]);
-        }
-        e6 = entropy(tmp, size);
-        if (e6 < e5) {
-            int nshifted = 0;
-            for (int c = 0; c < num_chunks; c++) if (shifts6[c]) nshifted++;
+
+            if (!any_nonzero) break;
+
+            for (int c = 0; c < num_chunks; c++) {
+                int off = c * CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
+                for (int i = 0; i < len; i++) tmp[off+i] = (u8)(cur[off+i] + (u8)shifts6[c]);
+            }
+            double e_try = entropy(tmp, size);
+            if (e_try >= e6) break;
+
             memcpy(cur, tmp, size);
-            printf("module 6:  entropy=%lf  profit=%+.2f  total=%+.2f  time=%.1fs"
-                   "  [chunk-align-3  shifted:%d/%d]\n",
-                   e6, (e5-e6)*size, (e0-e6)*size,
-                   (double)(clock()-t0)/CLOCKS_PER_SEC, nshifted, num_chunks);
-        } else {
-            e6 = e5;
-            printf("module 6:  skipped  [chunk-align-3]\n");
+            e6 = e_try;
+            passes++;
         }
+
         free(shifts6);
+
+        if (passes > 0)
+            printf("module 6:  entropy=%lf  profit=%+.2f  total=%+.2f  time=%.1fs"
+                   "  [chunk-align-3  passes:%d]\n",
+                   e6, (e5-e6)*size, (e0-e6)*size,
+                   (double)(clock()-t0)/CLOCKS_PER_SEC, passes);
+        else
+            printf("module 6:  skipped  [chunk-align-3]\n");
     }
 
     {
