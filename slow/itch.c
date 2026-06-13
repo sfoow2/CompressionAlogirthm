@@ -685,9 +685,60 @@ double RunModules(u8 *data, int size) {
         free(seeds5); free(dirs5); free(ss); free(lc); free(ls);
     }
 
-    print_stats("after ", cur, size);
+    // --- Module 6: cross-chunk re-alignment after AND-PRNG reshaping ---
+    // Module 5's per-chunk AND-PRNG changed the global histogram, making the
+    // constant-shift alignment from modules 3+4a stale. Re-run the same xcorr
+    // search to capture any residual cross-chunk misalignment.
+    double e6;
+    {
+        clock_t t0 = clock();
+        int *shifts6 = malloc(num_chunks * sizeof(int));
+        int global[256] = {0};
+        for (int i = 0; i < size; i++) global[cur[i]]++;
+        for (int c = 0; c < num_chunks; c++) {
+            int off = c * CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
+            int local[256] = {0};
+            for (int i = 0; i < len; i++) local[cur[off+i]]++;
+            int rest[256];
+            for (int v = 0; v < 256; v++) rest[v] = global[v] - local[v];
+            int best_s = 0, best_xcorr = -1;
+            for (int s = 0; s < 256; s++) {
+                int xcorr = 0;
+                for (int v = 0; v < 256; v++) xcorr += local[v] * rest[(v+s)&0xFF];
+                if (xcorr > best_xcorr) { best_xcorr = xcorr; best_s = s; }
+            }
+            shifts6[c] = best_s;
+        }
+        for (int c = 0; c < num_chunks; c++) {
+            int off = c * CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
+            for (int i = 0; i < len; i++) tmp[off+i] = (u8)(cur[off+i] + (u8)shifts6[c]);
+        }
+        e6 = entropy(tmp, size);
+        if (e6 < e5) {
+            int nshifted = 0;
+            for (int c = 0; c < num_chunks; c++) if (shifts6[c]) nshifted++;
+            memcpy(cur, tmp, size);
+            printf("module 6:  entropy=%lf  profit=%+.2f  total=%+.2f  time=%.1fs"
+                   "  [chunk-align-3  shifted:%d/%d]\n",
+                   e6, (e5-e6)*size, (e0-e6)*size,
+                   (double)(clock()-t0)/CLOCKS_PER_SEC, nshifted, num_chunks);
+        } else {
+            e6 = e5;
+            printf("module 6:  skipped  [chunk-align-3]\n");
+        }
+        free(shifts6);
+    }
+
+    {
+        int counts[256] = {0}; long sum = 0;
+        for (int i = 0; i < size; i++) { counts[cur[i]]++; sum += cur[i]; }
+        int mode = 0;
+        for (int i = 1; i < 256; i++) if (counts[i] > counts[mode]) mode = i;
+        printf("after : entropy=%lf  total=%+.2f  avg=%.2f  mode=%d (x%d)\n",
+               e6, (e0-e6)*size, (double)sum/size, mode, counts[mode]);
+    }
     free(cur); free(tmp); free(prngs); free(pats);
-    return (e0 - e5) * size;
+    return (e0 - e6) * size;
 }
 
 int main() {
@@ -695,7 +746,7 @@ int main() {
     int size = 4096;
     u8 *data = malloc(size);
     CSV_XY *csv = csv_xy_open("output.csv", "seeds", "profit","null");
-    for (int seeds = 0; seeds < 100; seeds++){
+    for (int seeds = 0; seeds < 1; seeds++){
         srand(seeds);
         for (int i = 0; i < size; i++)
             data[i] = rand() % 256;
