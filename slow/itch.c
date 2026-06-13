@@ -332,6 +332,7 @@ static void print_stats(const char *label, u8 *data, int size) {
            label, (double)sum / size, mode, counts[mode]);
 }
 
+
 double RunModules(u8 *data, int size) {
     const int CHUNK = 256;
     int num_chunks = (size + CHUNK - 1) / CHUNK;
@@ -372,8 +373,6 @@ double RunModules(u8 *data, int size) {
     u8  *as9_log     = malloc(64  * num_chunks);
     u8  *bs9_log     = malloc(64  * num_chunks);
     int n9 = 0;
-    u8  *rots10_log  = malloc(128 * num_chunks);
-    int n10 = 0;
     u8  *ag11_log    = malloc(64  * num_chunks);
     u8  *bg11_log    = malloc(64  * num_chunks);
     int n11 = 0;
@@ -384,7 +383,7 @@ double RunModules(u8 *data, int size) {
 
     // per-outer start indices (index [num_outers] = sentinel)
     int outer_n5[9],  outer_n6[9],  outer_n7[9],  outer_n8[9];
-    int outer_n9[9],  outer_n10[9], outer_n11[9], outer_n12[9];
+    int outer_n9[9],  outer_n11[9], outer_n12[9];
     int num_outers = 0;
 
     double e0 = entropy(cur, size);
@@ -628,9 +627,40 @@ double RunModules(u8 *data, int size) {
         free(sH4); free(sC4);
     }
 
+    // --- Module 16: Gray code encoding per byte ---
+    // Converts bytes between binary and Gray code (g = b ^ (b>>1)).
+    // Triggered ~37% of seeds; helps when byte values cluster in a narrow range.
+    double e16;
+    int ran16 = 0; // 0=skip, 1=binary-to-Gray (b^(b>>1)), 2=Gray-to-binary (inverse)
+    {
+        clock_t t0 = clock();
+        for (int i = 0; i < size; i++) tmp[i] = cur[i] ^ (cur[i] >> 1);
+        double e_b2g = entropy(tmp, size);
+        u8 *tmp2 = malloc(size);
+        for (int i = 0; i < size; i++) {
+            u8 g = cur[i], b = g;
+            g >>= 1; while (g) { b ^= g; g >>= 1; }
+            tmp2[i] = b;
+        }
+        double e_g2b = entropy(tmp2, size);
+        if (e_b2g < e4c && e_b2g <= e_g2b) {
+            ran16 = 1; memcpy(cur, tmp, size); e16 = e_b2g;
+            printf("module 16: entropy=%lf  profit=%+.2f  total=%+.2f  time=%.1fs  [gray-b2g]\n",
+                   e16, (e4c-e16)*size, (e0-e16)*size, (double)(clock()-t0)/CLOCKS_PER_SEC);
+        } else if (e_g2b < e4c) {
+            ran16 = 2; memcpy(cur, tmp2, size); e16 = e_g2b;
+            printf("module 16: entropy=%lf  profit=%+.2f  total=%+.2f  time=%.1fs  [gray-g2b]\n",
+                   e16, (e4c-e16)*size, (e0-e16)*size, (double)(clock()-t0)/CLOCKS_PER_SEC);
+        } else {
+            e16 = e4c;
+            printf("module 16: skipped  [gray]\n");
+        }
+        free(tmp2);
+    }
+
     // --- Outer convergence loop: modules 5-12 ---
     // Cycles all transforms until a full pass makes no improvement.
-    double e_cur = e4c;
+    double e_cur = e16;
 
     // precompute Z/256Z multiplicative inverses for odd values (used by M9, M12)
     u8 inv256[128];
@@ -645,8 +675,7 @@ double RunModules(u8 *data, int size) {
         double e_outer_start = e_cur;
         outer_n5[outer]  = n5;  outer_n6[outer]  = n6;
         outer_n7[outer]  = n7;  outer_n8[outer]  = n8;
-        outer_n9[outer]  = n9;  outer_n10[outer] = n10;
-        outer_n11[outer] = n11; outer_n12[outer] = n12;
+        outer_n9[outer]  = n9;  outer_n11[outer] = n11; outer_n12[outer] = n12;
         if (outer > 0)
             printf("--- outer pass %d (entropy=%.6f) ---\n", outer + 1, e_cur);
 
@@ -964,60 +993,6 @@ double RunModules(u8 *data, int size) {
                 printf("module 9:  skipped  [affine-align]\n");
         }
 
-        // --- Module 10: iterated per-chunk bit rotation (option B) ---
-        // rotl8(v, k) is a GF(2)^8 linear bijection, orthogonal to both additive
-        // shifts (M6) and XOR-constant (M7). Only 8 options per chunk: trivially fast.
-        // Xcorr: sum_v local[v] * rest[rotl8(v,k)] — O(256) per rotation value.
-        {
-            double e_before = e_cur;
-            clock_t t0 = clock();
-            u8 *rots10 = malloc(num_chunks);
-            int passes = 0;
-            for (int iter = 0; iter < 16; iter++) {
-                int global[256] = {0};
-                for (int i = 0; i < size; i++) global[cur[i]]++;
-                int any_nonzero = 0;
-                for (int c = 0; c < num_chunks; c++) {
-                    int off = c * CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
-                    int local[256] = {0};
-                    for (int i = 0; i < len; i++) local[cur[off+i]]++;
-                    int rest[256];
-                    for (int v = 0; v < 256; v++) rest[v] = global[v] - local[v];
-                    int baseline = 0;
-                    for (int v = 0; v < 256; v++) baseline += local[v] * rest[v];
-                    int best_k = 0, best_xcorr = baseline;
-                    for (int k = 1; k < 8; k++) {
-                        int xcorr = 0;
-                        for (int v = 0; v < 256; v++)
-                            xcorr += local[v] * rest[rotl8((u8)v, k)];
-                        if (xcorr > best_xcorr) { best_xcorr = xcorr; best_k = k; }
-                    }
-                    rots10[c] = (u8)best_k;
-                    if (best_k) any_nonzero = 1;
-                }
-                if (!any_nonzero) break;
-                for (int c = 0; c < num_chunks; c++) {
-                    int off = c * CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
-                    for (int i = 0; i < len; i++)
-                        tmp[off+i] = rotl8(cur[off+i], rots10[c]);
-                }
-                double e_try = entropy(tmp, size);
-                if (e_try >= e_cur) break;
-                memcpy(rots10_log + n10*num_chunks, rots10, num_chunks);
-                n10++;
-                memcpy(cur, tmp, size);
-                e_cur = e_try;
-                passes++;
-            }
-            free(rots10);
-            if (passes > 0)
-                printf("module 10: entropy=%lf  profit=%+.2f  total=%+.2f  time=%.1fs"
-                       "  [bit-rot  passes:%d]\n",
-                       e_cur, (e_before-e_cur)*size, (e0-e_cur)*size,
-                       (double)(clock()-t0)/CLOCKS_PER_SEC, passes);
-            else
-                printf("module 10: skipped  [bit-rot]\n");
-        }
 
         // --- Module 11: iterated per-chunk GF(256) affine (option C) ---
         // v -> gf256_mul(a, v) XOR b; a in GF(256)*, b in GF(256).
@@ -1246,8 +1221,7 @@ double RunModules(u8 *data, int size) {
     // sentinel: end-of-log indices for the last outer pass
     outer_n5[num_outers]  = n5;  outer_n6[num_outers]  = n6;
     outer_n7[num_outers]  = n7;  outer_n8[num_outers]  = n8;
-    outer_n9[num_outers]  = n9;  outer_n10[num_outers] = n10;
-    outer_n11[num_outers] = n11; outer_n12[num_outers] = n12;
+    outer_n9[num_outers]  = n9;  outer_n11[num_outers] = n11; outer_n12[num_outers] = n12;
 
     if (outer_passes > 1)
         printf("outer loop: converged in %d passes\n", outer_passes);
@@ -1323,15 +1297,6 @@ double RunModules(u8 *data, int size) {
                     rev[off+i] = gf256_mul(gf256_inv_table[ag], rev[off+i] ^ bg);
             }
         }
-        // M10
-        for (int p = outer_n10[outer+1]-1; p >= outer_n10[outer]; p--) {
-            for (int c = 0; c < num_chunks; c++) {
-                int off = c*CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
-                int k = rots10_log[p*num_chunks+c];
-                for (int i = 0; i < len; i++)
-                    rev[off+i] = rotl8(rev[off+i], 8-k);
-            }
-        }
         // M9
         for (int p = outer_n9[outer+1]-1; p >= outer_n9[outer]; p--) {
             for (int c = 0; c < num_chunks; c++) {
@@ -1386,6 +1351,17 @@ double RunModules(u8 *data, int size) {
                 }
             }
         }
+    }
+
+    // undo M16 (Gray code: b2g inverse is g2b, and vice versa)
+    if (ran16 == 1) { // was b2g → undo with g2b
+        for (int i = 0; i < size; i++) {
+            u8 g = rev[i], b = g;
+            g >>= 1; while (g) { b ^= g; g >>= 1; }
+            rev[i] = b;
+        }
+    } else if (ran16 == 2) { // was g2b → undo with b2g
+        for (int i = 0; i < size; i++) rev[i] = rev[i] ^ (rev[i] >> 1);
     }
 
     // undo single-pass modules in reverse: M4c, M4a, M3, M2, M1
@@ -1448,7 +1424,6 @@ double RunModules(u8 *data, int size) {
     free(shifts6_log); free(xors7_log);
     free(seeds8_log);
     free(as9_log); free(bs9_log);
-    free(rots10_log);
     free(ag11_log); free(bg11_log);
     free(seeds12_log); free(as12_log); free(dirs12_log);
     return (e0 - e_cur) * size;
@@ -1461,9 +1436,9 @@ int main() {
     u8 *data = malloc(size);
     CSV_XY *csv = csv_xy_open("output.csv", "seeds", "profit","null");
     for (int seeds = 0; seeds < 1; seeds++){
-        srand(seeds);
+        xorshift_seed((uint64_t)(seeds + 1) * 0x9e3779b97f4a7c15ULL);
         for (int i = 0; i < size; i++)
-            data[i] = rand() % 256;
+            data[i] = xorshift();
 
         print_stats("before", data, size);
         csv_xy_add(csv, seeds, RunModules(data, size),0);
