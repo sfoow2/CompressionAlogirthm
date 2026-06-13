@@ -406,21 +406,11 @@ double RunModules(u8 *data, int size) {
     }
 
     // --- Module 3: cross-chunk constant-shift alignment ---
-    // Modules 1 and 2 optimised each chunk independently, leaving each chunk with
-    // its own local mode (the value its seed/pattern happened to concentrate bytes at).
-    // Different seeds → different local modes.  Cross-chunk collisions were never
-    // explicitly optimised.  For each chunk we search the 256 possible constant shifts
-    // and pick the one that maximises Σ_v local[v] * rest[(v+s)%256] — i.e. the
-    // cross-correlation of the chunk's distribution against the rest of the buffer.
-    // Within-chunk collisions are invariant to constant shifts (bijection), so this
-    // search can only create new collisions, never destroy existing ones.
-    // Overhead: 1 byte per chunk (shift amount) — fully reversible.
     double e3;
     {
         clock_t t0 = clock();
         int *shifts3 = malloc(num_chunks * sizeof(int));
 
-        // global histogram over current data
         int global[256] = {0};
         for (int i = 0; i < size; i++) global[cur[i]]++;
 
@@ -431,11 +421,9 @@ double RunModules(u8 *data, int size) {
             int local[256] = {0};
             for (int i = 0; i < len; i++) local[cur[off+i]]++;
 
-            // rest-of-buffer histogram (global minus this chunk)
             int rest[256];
             for (int v = 0; v < 256; v++) rest[v] = global[v] - local[v];
 
-            // find shift s* = argmax_s Σ_v local[v] * rest[(v+s) % 256]
             int best_s = 0, best_xcorr = -1;
             for (int s = 0; s < 256; s++) {
                 int xcorr = 0;
@@ -473,8 +461,6 @@ double RunModules(u8 *data, int size) {
     }
 
     // --- Module 4a: second cross-chunk alignment pass ---
-    // Module 3's shifts changed the global histogram, so chunk-vs-rest cross-correlations
-    // are in a new state. A second pass often finds residual misalignment to fix.
     double e4a;
     {
         clock_t t0 = clock();
@@ -517,12 +503,6 @@ double RunModules(u8 *data, int size) {
     }
 
     // --- Module 4c: H/C two-constant cross-chunk alignment ---
-    // Module 3 shifted the whole chunk (H and C move together). Here we give H and C
-    // their own independent constant shifts, each chosen by cross-correlating that
-    // group's distribution against the rest of the buffer. Cross-chunk gains for the
-    // two groups factorise, so s_H* and s_C* can be found with two 256-element searches
-    // rather than a 256x256 grid.  The within-chunk H-C relative shift (s_H - s_C) is
-    // a free parameter; we measure global entropy and only apply if it improves.
     double e4c;
     {
         clock_t t0 = clock();
@@ -590,385 +570,378 @@ double RunModules(u8 *data, int size) {
         free(sH4); free(sC4);
     }
 
-    // --- Module 5: iterated per-chunk AND-PRNG cross-chunk xcorr ---
-    // AND-PRNG (mean~64, small shifts) scored by cross-chunk histogram overlap.
-    // Iterated: each pass may reshape histograms, enabling the next pass to find
-    // more. Stops when no chunk improves or entropy doesn't decrease.
-    // Two-phase search per pass: 64-byte proxy for phase 1, top 2000 full evaluation.
-    double e5 = e4c;
-    {
-        clock_t t0 = clock();
-        SeedScore *ss = malloc(65537 * sizeof(SeedScore));
-        int *seeds5 = malloc(num_chunks * sizeof(int));
-        u8  *dirs5  = malloc(num_chunks);
-        int *lc = malloc(256 * sizeof(int));
-        int *ls = malloc(256 * sizeof(int));
-        int passes = 0;
+    // --- Outer convergence loop: modules 5-9 ---
+    // After M9 reshapes histograms via affine transforms, M5-M8 may find new gains.
+    // We cycle 5->6->7->8->9 until a full pass makes no improvement.
+    double e_cur = e4c;
 
-        for (int iter = 0; iter < 8; iter++) {
-            int global[256] = {0};
-            for (int i = 0; i < size; i++) global[cur[i]]++;
+    // precompute multiplicative inverses mod 256 for all 128 odd values (used by M9)
+    u8 inv256[128];
+    for (int k = 0; k < 128; k++) {
+        int a = 2*k + 1;
+        for (int inv = 1; inv < 256; inv += 2)
+            if (((a * inv) & 0xFF) == 1) { inv256[k] = (u8)inv; break; }
+    }
 
-            int any_found = 0;
-            for (int c = 0; c < num_chunks; c++) {
-                int off = c * CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
-                int local[256] = {0};
-                for (int i = 0; i < len; i++) local[cur[off+i]]++;
-                int rest[256];
-                for (int v = 0; v < 256; v++) rest[v] = global[v] - local[v];
+    int outer_passes = 0;
+    for (int outer = 0; outer < 8; outer++) {
+        double e_outer_start = e_cur;
+        if (outer > 0)
+            printf("--- outer pass %d (entropy=%.6f) ---\n", outer + 1, e_cur);
 
-                int baseline = 0;
-                for (int v = 0; v < 256; v++) baseline += local[v] * rest[v];
+        // --- Module 5: iterated per-chunk AND-PRNG cross-chunk xcorr ---
+        {
+            double e_before = e_cur;
+            clock_t t0 = clock();
+            SeedScore *ss = malloc(65537 * sizeof(SeedScore));
+            int *seeds5 = malloc(num_chunks * sizeof(int));
+            u8  *dirs5  = malloc(num_chunks);
+            int *lc = malloc(256 * sizeof(int));
+            int *ls = malloc(256 * sizeof(int));
+            int passes = 0;
 
-                int pfx = len < 64 ? len : 64;
-                for (int s = 0; s <= 65536; s++) {
-                    memset(lc, 0, 256*sizeof(int)); memset(ls, 0, 256*sizeof(int));
-                    xorshift_seed(s);
-                    for (int i = 0; i < pfx; i++) {
-                        u8 r = randNum_and();
-                        lc[(u8)(cur[off+i] + r)]++;
-                        ls[(u8)(cur[off+i] - r)]++;
+            for (int iter = 0; iter < 8; iter++) {
+                int global[256] = {0};
+                for (int i = 0; i < size; i++) global[cur[i]]++;
+
+                int any_found = 0;
+                for (int c = 0; c < num_chunks; c++) {
+                    int off = c * CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
+                    int local[256] = {0};
+                    for (int i = 0; i < len; i++) local[cur[off+i]]++;
+                    int rest[256];
+                    for (int v = 0; v < 256; v++) rest[v] = global[v] - local[v];
+
+                    int baseline = 0;
+                    for (int v = 0; v < 256; v++) baseline += local[v] * rest[v];
+
+                    int pfx = len < 64 ? len : 64;
+                    for (int s = 0; s <= 65536; s++) {
+                        memset(lc, 0, 256*sizeof(int)); memset(ls, 0, 256*sizeof(int));
+                        xorshift_seed(s);
+                        for (int i = 0; i < pfx; i++) {
+                            u8 r = randNum_and();
+                            lc[(u8)(cur[off+i] + r)]++;
+                            ls[(u8)(cur[off+i] - r)]++;
+                        }
+                        int xc = 0, xs = 0;
+                        for (int v = 0; v < 256; v++) { xc += lc[v]*rest[v]; xs += ls[v]*rest[v]; }
+                        ss[s].seed = s; ss[s].score = xc > xs ? xc : xs;
                     }
-                    int xc = 0, xs = 0;
-                    for (int v = 0; v < 256; v++) { xc += lc[v]*rest[v]; xs += ls[v]*rest[v]; }
-                    ss[s].seed = s; ss[s].score = xc > xs ? xc : xs;
-                }
-                qsort(ss, 65537, sizeof(SeedScore), cmp_score_desc);
+                    qsort(ss, 65537, sizeof(SeedScore), cmp_score_desc);
 
-                int best_s = -1, best_xcorr = baseline;
-                u8 best_dir = 0;
-                for (int k = 0; k < 2000; k++) {
-                    int s = ss[k].seed;
-                    memset(lc, 0, 256*sizeof(int)); memset(ls, 0, 256*sizeof(int));
-                    xorshift_seed(s);
+                    int best_s = -1, best_xcorr = baseline;
+                    u8 best_dir = 0;
+                    for (int k = 0; k < 2000; k++) {
+                        int s = ss[k].seed;
+                        memset(lc, 0, 256*sizeof(int)); memset(ls, 0, 256*sizeof(int));
+                        xorshift_seed(s);
+                        for (int i = 0; i < len; i++) {
+                            u8 r = randNum_and();
+                            lc[(u8)(cur[off+i] + r)]++;
+                            ls[(u8)(cur[off+i] - r)]++;
+                        }
+                        int xc = 0, xs = 0;
+                        for (int v = 0; v < 256; v++) { xc += lc[v]*rest[v]; xs += ls[v]*rest[v]; }
+                        if (xc > best_xcorr) { best_xcorr = xc; best_s = s; best_dir = 0; }
+                        if (xs > best_xcorr) { best_xcorr = xs; best_s = s; best_dir = 1; }
+                    }
+                    seeds5[c] = best_s;
+                    dirs5[c]  = best_dir;
+                    if (best_s >= 0) any_found = 1;
+                }
+
+                if (!any_found) break;
+
+                for (int c = 0; c < num_chunks; c++) {
+                    int off = c * CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
+                    if (seeds5[c] < 0) { memcpy(tmp+off, cur+off, len); continue; }
+                    xorshift_seed(seeds5[c]);
                     for (int i = 0; i < len; i++) {
                         u8 r = randNum_and();
-                        lc[(u8)(cur[off+i] + r)]++;
-                        ls[(u8)(cur[off+i] - r)]++;
+                        tmp[off+i] = dirs5[c] ? (u8)(cur[off+i]-r) : (u8)(cur[off+i]+r);
                     }
-                    int xc = 0, xs = 0;
-                    for (int v = 0; v < 256; v++) { xc += lc[v]*rest[v]; xs += ls[v]*rest[v]; }
-                    if (xc > best_xcorr) { best_xcorr = xc; best_s = s; best_dir = 0; }
-                    if (xs > best_xcorr) { best_xcorr = xs; best_s = s; best_dir = 1; }
                 }
-                seeds5[c] = best_s;
-                dirs5[c]  = best_dir;
-                if (best_s >= 0) any_found = 1;
+
+                double e_try = entropy(tmp, size);
+                if (e_try >= e_cur) break;
+                memcpy(cur, tmp, size);
+                e_cur = e_try;
+                passes++;
             }
 
-            if (!any_found) break;
+            free(ss); free(seeds5); free(dirs5); free(lc); free(ls);
 
-            for (int c = 0; c < num_chunks; c++) {
-                int off = c * CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
-                if (seeds5[c] < 0) { memcpy(tmp+off, cur+off, len); continue; }
-                xorshift_seed(seeds5[c]);
-                for (int i = 0; i < len; i++) {
-                    u8 r = randNum_and();
-                    tmp[off+i] = dirs5[c] ? (u8)(cur[off+i]-r) : (u8)(cur[off+i]+r);
-                }
-            }
-
-            double e_try = entropy(tmp, size);
-            if (e_try >= e5) break;
-            memcpy(cur, tmp, size);
-            e5 = e_try;
-            passes++;
+            if (passes > 0)
+                printf("module 5:  entropy=%lf  profit=%+.2f  total=%+.2f  time=%.1fs"
+                       "  [and-xcorr  passes:%d]\n",
+                       e_cur, (e_before-e_cur)*size, (e0-e_cur)*size,
+                       (double)(clock()-t0)/CLOCKS_PER_SEC, passes);
+            else
+                printf("module 5:  skipped  [and-xcorr]\n");
         }
 
-        free(ss); free(seeds5); free(dirs5); free(lc); free(ls);
+        // --- Module 6: iterated cross-chunk re-alignment ---
+        {
+            double e_before = e_cur;
+            clock_t t0 = clock();
+            int *shifts6 = malloc(num_chunks * sizeof(int));
+            int passes = 0;
 
-        if (passes > 0)
-            printf("module 5:  entropy=%lf  profit=%+.2f  total=%+.2f  time=%.1fs"
-                   "  [and-xcorr  passes:%d]\n",
-                   e5, (e4c-e5)*size, (e0-e5)*size,
-                   (double)(clock()-t0)/CLOCKS_PER_SEC, passes);
-        else
-            printf("module 5:  skipped  [and-xcorr]\n");
-    }
+            for (int iter = 0; iter < 16; iter++) {
+                int global[256] = {0};
+                for (int i = 0; i < size; i++) global[cur[i]]++;
 
-    // --- Module 6: iterated cross-chunk re-alignment ---
-    // Module 5's AND-PRNG reshaped histograms, making the earlier alignment stale.
-    // Repeat the xcorr constant-shift pass until convergence: each pass may shift
-    // chunks whose optimal shift changed because neighbouring chunks moved.
-    double e6 = e5;
-    {
-        clock_t t0 = clock();
-        int *shifts6 = malloc(num_chunks * sizeof(int));
-        int passes = 0;
-
-        for (int iter = 0; iter < 16; iter++) {
-            int global[256] = {0};
-            for (int i = 0; i < size; i++) global[cur[i]]++;
-
-            int any_nonzero = 0;
-            for (int c = 0; c < num_chunks; c++) {
-                int off = c * CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
-                int local[256] = {0};
-                for (int i = 0; i < len; i++) local[cur[off+i]]++;
-                int rest[256];
-                for (int v = 0; v < 256; v++) rest[v] = global[v] - local[v];
-                int best_s = 0, best_xcorr = -1;
-                for (int s = 0; s < 256; s++) {
-                    int xcorr = 0;
-                    for (int v = 0; v < 256; v++) xcorr += local[v] * rest[(v+s)&0xFF];
-                    if (xcorr > best_xcorr) { best_xcorr = xcorr; best_s = s; }
-                }
-                shifts6[c] = best_s;
-                if (best_s) any_nonzero = 1;
-            }
-
-            if (!any_nonzero) break;
-
-            for (int c = 0; c < num_chunks; c++) {
-                int off = c * CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
-                for (int i = 0; i < len; i++) tmp[off+i] = (u8)(cur[off+i] + (u8)shifts6[c]);
-            }
-            double e_try = entropy(tmp, size);
-            if (e_try >= e6) break;
-
-            memcpy(cur, tmp, size);
-            e6 = e_try;
-            passes++;
-        }
-
-        free(shifts6);
-
-        if (passes > 0)
-            printf("module 6:  entropy=%lf  profit=%+.2f  total=%+.2f  time=%.1fs"
-                   "  [chunk-align-3  passes:%d]\n",
-                   e6, (e5-e6)*size, (e0-e6)*size,
-                   (double)(clock()-t0)/CLOCKS_PER_SEC, passes);
-        else
-            printf("module 6:  skipped  [chunk-align-3]\n");
-    }
-
-    // --- Module 7: iterated per-chunk XOR-constant alignment ---
-    // XOR with a constant permutes values via bit-flips, orthogonal to the additive
-    // shifts in modules 3/4a/4c/6. Cross-chunk xcorr after XOR-x is
-    //   sum_v local[v] * rest[v^x]  — O(256^2) per chunk, trivially reversible.
-    double e7 = e6;
-    {
-        clock_t t0 = clock();
-        u8 *xors7 = malloc(num_chunks);
-        int passes = 0;
-
-        for (int iter = 0; iter < 16; iter++) {
-            int global[256] = {0};
-            for (int i = 0; i < size; i++) global[cur[i]]++;
-
-            int any_nonzero = 0;
-            for (int c = 0; c < num_chunks; c++) {
-                int off = c * CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
-                int local[256] = {0};
-                for (int i = 0; i < len; i++) local[cur[off+i]]++;
-                int rest[256];
-                for (int v = 0; v < 256; v++) rest[v] = global[v] - local[v];
-
-                int best_x = 0, best_xcorr = -1;
-                for (int x = 0; x < 256; x++) {
-                    int xcorr = 0;
-                    for (int v = 0; v < 256; v++) xcorr += local[v] * rest[v ^ x];
-                    if (xcorr > best_xcorr) { best_xcorr = xcorr; best_x = x; }
-                }
-                xors7[c] = (u8)best_x;
-                if (best_x) any_nonzero = 1;
-            }
-
-            if (!any_nonzero) break;
-
-            for (int c = 0; c < num_chunks; c++) {
-                int off = c * CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
-                for (int i = 0; i < len; i++) tmp[off+i] = cur[off+i] ^ xors7[c];
-            }
-            double e_try = entropy(tmp, size);
-            if (e_try >= e7) break;
-            memcpy(cur, tmp, size);
-            e7 = e_try;
-            passes++;
-        }
-
-        free(xors7);
-
-        if (passes > 0)
-            printf("module 7:  entropy=%lf  profit=%+.2f  total=%+.2f  time=%.1fs"
-                   "  [xor-align  passes:%d]\n",
-                   e7, (e6-e7)*size, (e0-e7)*size,
-                   (double)(clock()-t0)/CLOCKS_PER_SEC, passes);
-        else
-            printf("module 7:  skipped  [xor-align]\n");
-    }
-
-    // --- Module 8: iterated per-chunk XOR AND-PRNG ---
-    // Fills the 2x2 design matrix:
-    //   additive+fixed=M6  additive+PRNG=M5  XOR+fixed=M7  XOR+PRNG=M8
-    // AND-PRNG (mean~64) flips ~2 bits per byte on average, leaving high-order bits
-    // intact. This reshapes the histogram spread (not just the mode like M7).
-    // Same two-phase seed search as M5; XOR has no +/- direction so we only need
-    // one direction per seed.
-    double e8 = e7;
-    {
-        clock_t t0 = clock();
-        SeedScore *ss = malloc(65537 * sizeof(SeedScore));
-        int *seeds8 = malloc(num_chunks * sizeof(int));
-        int *lx = malloc(256 * sizeof(int));
-        int passes = 0;
-
-        for (int iter = 0; iter < 8; iter++) {
-            int global[256] = {0};
-            for (int i = 0; i < size; i++) global[cur[i]]++;
-
-            int any_found = 0;
-            for (int c = 0; c < num_chunks; c++) {
-                int off = c * CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
-                int local[256] = {0};
-                for (int i = 0; i < len; i++) local[cur[off+i]]++;
-                int rest[256];
-                for (int v = 0; v < 256; v++) rest[v] = global[v] - local[v];
-
-                int baseline = 0;
-                for (int v = 0; v < 256; v++) baseline += local[v] * rest[v];
-
-                int pfx = len < 64 ? len : 64;
-                for (int s = 0; s <= 65536; s++) {
-                    memset(lx, 0, 256*sizeof(int));
-                    xorshift_seed(s);
-                    for (int i = 0; i < pfx; i++) {
-                        u8 r = randNum_and();
-                        lx[cur[off+i] ^ r]++;
-                    }
-                    int xcorr = 0;
-                    for (int v = 0; v < 256; v++) xcorr += lx[v] * rest[v];
-                    ss[s].seed = s; ss[s].score = xcorr;
-                }
-                qsort(ss, 65537, sizeof(SeedScore), cmp_score_desc);
-
-                int best_s = -1, best_xcorr = baseline;
-                for (int k = 0; k < 2000; k++) {
-                    int s = ss[k].seed;
-                    memset(lx, 0, 256*sizeof(int));
-                    xorshift_seed(s);
-                    for (int i = 0; i < len; i++) lx[cur[off+i] ^ randNum_and()]++;
-                    int xcorr = 0;
-                    for (int v = 0; v < 256; v++) xcorr += lx[v] * rest[v];
-                    if (xcorr > best_xcorr) { best_xcorr = xcorr; best_s = s; }
-                }
-                seeds8[c] = best_s;
-                if (best_s >= 0) any_found = 1;
-            }
-
-            if (!any_found) break;
-
-            for (int c = 0; c < num_chunks; c++) {
-                int off = c * CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
-                if (seeds8[c] < 0) { memcpy(tmp+off, cur+off, len); continue; }
-                xorshift_seed(seeds8[c]);
-                for (int i = 0; i < len; i++) tmp[off+i] = cur[off+i] ^ randNum_and();
-            }
-
-            double e_try = entropy(tmp, size);
-            if (e_try >= e8) break;
-            memcpy(cur, tmp, size);
-            e8 = e_try;
-            passes++;
-        }
-
-        free(ss); free(seeds8); free(lx);
-
-        if (passes > 0)
-            printf("module 8:  entropy=%lf  profit=%+.2f  total=%+.2f  time=%.1fs"
-                   "  [xor-and-xcorr  passes:%d]\n",
-                   e8, (e7-e8)*size, (e0-e8)*size,
-                   (double)(clock()-t0)/CLOCKS_PER_SEC, passes);
-        else
-            printf("module 8:  skipped  [xor-and-xcorr]\n");
-    }
-
-    // --- Module 9: iterated per-chunk affine alignment ---
-    // Covers the full affine group Aff(Z/256Z): v -> (a*v + b) mod 256, a odd, any b.
-    // Module 6 is the a=1 subgroup; module 7 is XOR (over GF(2)^8, a different algebra).
-    // Multipliers a=3,5,...,255 stretch/compress value spacing in modular arithmetic.
-    //
-    // Xcorr formula: sum_v local[v] * rest[(a*v+b)%256]
-    //   = sum_u Ha[u] * rest[(u+b)%256]  where Ha[u] = local[a_inv*u % 256]
-    // For each a: precompute Ha (O(256)), then scan 256 lags (O(256^2)).
-    // Total: 128 * 256^2 = 8.4M per chunk per iteration.
-    // Inverse: v -> a_inv*(v - b) mod 256, where a_inv*a = 1 mod 256.
-    double e9 = e8;
-    {
-        clock_t t0 = clock();
-        u8 *as9 = malloc(num_chunks);
-        u8 *bs9 = malloc(num_chunks);
-        int *ha  = malloc(256 * sizeof(int));
-        int passes = 0;
-
-        // precompute multiplicative inverses mod 256 for all 128 odd values
-        u8 inv256[128];
-        for (int k = 0; k < 128; k++) {
-            int a = 2*k + 1;
-            for (int inv = 1; inv < 256; inv += 2)
-                if (((a * inv) & 0xFF) == 1) { inv256[k] = (u8)inv; break; }
-        }
-
-        for (int iter = 0; iter < 8; iter++) {
-            int global[256] = {0};
-            for (int i = 0; i < size; i++) global[cur[i]]++;
-
-            int any_nonidentity = 0;
-            for (int c = 0; c < num_chunks; c++) {
-                int off = c*CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
-                int local[256] = {0};
-                for (int i = 0; i < len; i++) local[cur[off+i]]++;
-                int rest[256];
-                for (int v = 0; v < 256; v++) rest[v] = global[v] - local[v];
-
-                // baseline xcorr: identity (a=1, b=0)
-                int baseline = 0;
-                for (int v = 0; v < 256; v++) baseline += local[v] * rest[v];
-                int best_xcorr = baseline, best_ka = 0, best_b = 0;
-
-                for (int ka = 1; ka < 128; ka++) {   // skip ka=0 (a=1, handled by M6)
-                    int a_inv = inv256[ka];
-                    for (int w = 0; w < 256; w++)
-                        ha[w] = local[(a_inv * w) & 0xFF];
-                    for (int b = 0; b < 256; b++) {
+                int any_nonzero = 0;
+                for (int c = 0; c < num_chunks; c++) {
+                    int off = c * CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
+                    int local[256] = {0};
+                    for (int i = 0; i < len; i++) local[cur[off+i]]++;
+                    int rest[256];
+                    for (int v = 0; v < 256; v++) rest[v] = global[v] - local[v];
+                    int best_s = 0, best_xcorr = -1;
+                    for (int s = 0; s < 256; s++) {
                         int xcorr = 0;
+                        for (int v = 0; v < 256; v++) xcorr += local[v] * rest[(v+s)&0xFF];
+                        if (xcorr > best_xcorr) { best_xcorr = xcorr; best_s = s; }
+                    }
+                    shifts6[c] = best_s;
+                    if (best_s) any_nonzero = 1;
+                }
+
+                if (!any_nonzero) break;
+
+                for (int c = 0; c < num_chunks; c++) {
+                    int off = c * CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
+                    for (int i = 0; i < len; i++) tmp[off+i] = (u8)(cur[off+i] + (u8)shifts6[c]);
+                }
+                double e_try = entropy(tmp, size);
+                if (e_try >= e_cur) break;
+
+                memcpy(cur, tmp, size);
+                e_cur = e_try;
+                passes++;
+            }
+
+            free(shifts6);
+
+            if (passes > 0)
+                printf("module 6:  entropy=%lf  profit=%+.2f  total=%+.2f  time=%.1fs"
+                       "  [chunk-align-3  passes:%d]\n",
+                       e_cur, (e_before-e_cur)*size, (e0-e_cur)*size,
+                       (double)(clock()-t0)/CLOCKS_PER_SEC, passes);
+            else
+                printf("module 6:  skipped  [chunk-align-3]\n");
+        }
+
+        // --- Module 7: iterated per-chunk XOR-constant alignment ---
+        {
+            double e_before = e_cur;
+            clock_t t0 = clock();
+            u8 *xors7 = malloc(num_chunks);
+            int passes = 0;
+
+            for (int iter = 0; iter < 16; iter++) {
+                int global[256] = {0};
+                for (int i = 0; i < size; i++) global[cur[i]]++;
+
+                int any_nonzero = 0;
+                for (int c = 0; c < num_chunks; c++) {
+                    int off = c * CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
+                    int local[256] = {0};
+                    for (int i = 0; i < len; i++) local[cur[off+i]]++;
+                    int rest[256];
+                    for (int v = 0; v < 256; v++) rest[v] = global[v] - local[v];
+
+                    int best_x = 0, best_xcorr = -1;
+                    for (int x = 0; x < 256; x++) {
+                        int xcorr = 0;
+                        for (int v = 0; v < 256; v++) xcorr += local[v] * rest[v ^ x];
+                        if (xcorr > best_xcorr) { best_xcorr = xcorr; best_x = x; }
+                    }
+                    xors7[c] = (u8)best_x;
+                    if (best_x) any_nonzero = 1;
+                }
+
+                if (!any_nonzero) break;
+
+                for (int c = 0; c < num_chunks; c++) {
+                    int off = c * CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
+                    for (int i = 0; i < len; i++) tmp[off+i] = cur[off+i] ^ xors7[c];
+                }
+                double e_try = entropy(tmp, size);
+                if (e_try >= e_cur) break;
+                memcpy(cur, tmp, size);
+                e_cur = e_try;
+                passes++;
+            }
+
+            free(xors7);
+
+            if (passes > 0)
+                printf("module 7:  entropy=%lf  profit=%+.2f  total=%+.2f  time=%.1fs"
+                       "  [xor-align  passes:%d]\n",
+                       e_cur, (e_before-e_cur)*size, (e0-e_cur)*size,
+                       (double)(clock()-t0)/CLOCKS_PER_SEC, passes);
+            else
+                printf("module 7:  skipped  [xor-align]\n");
+        }
+
+        // --- Module 8: iterated per-chunk XOR AND-PRNG ---
+        {
+            double e_before = e_cur;
+            clock_t t0 = clock();
+            SeedScore *ss = malloc(65537 * sizeof(SeedScore));
+            int *seeds8 = malloc(num_chunks * sizeof(int));
+            int *lx = malloc(256 * sizeof(int));
+            int passes = 0;
+
+            for (int iter = 0; iter < 8; iter++) {
+                int global[256] = {0};
+                for (int i = 0; i < size; i++) global[cur[i]]++;
+
+                int any_found = 0;
+                for (int c = 0; c < num_chunks; c++) {
+                    int off = c * CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
+                    int local[256] = {0};
+                    for (int i = 0; i < len; i++) local[cur[off+i]]++;
+                    int rest[256];
+                    for (int v = 0; v < 256; v++) rest[v] = global[v] - local[v];
+
+                    int baseline = 0;
+                    for (int v = 0; v < 256; v++) baseline += local[v] * rest[v];
+
+                    int pfx = len < 64 ? len : 64;
+                    for (int s = 0; s <= 65536; s++) {
+                        memset(lx, 0, 256*sizeof(int));
+                        xorshift_seed(s);
+                        for (int i = 0; i < pfx; i++) {
+                            u8 r = randNum_and();
+                            lx[cur[off+i] ^ r]++;
+                        }
+                        int xcorr = 0;
+                        for (int v = 0; v < 256; v++) xcorr += lx[v] * rest[v];
+                        ss[s].seed = s; ss[s].score = xcorr;
+                    }
+                    qsort(ss, 65537, sizeof(SeedScore), cmp_score_desc);
+
+                    int best_s = -1, best_xcorr = baseline;
+                    for (int k = 0; k < 2000; k++) {
+                        int s = ss[k].seed;
+                        memset(lx, 0, 256*sizeof(int));
+                        xorshift_seed(s);
+                        for (int i = 0; i < len; i++) lx[cur[off+i] ^ randNum_and()]++;
+                        int xcorr = 0;
+                        for (int v = 0; v < 256; v++) xcorr += lx[v] * rest[v];
+                        if (xcorr > best_xcorr) { best_xcorr = xcorr; best_s = s; }
+                    }
+                    seeds8[c] = best_s;
+                    if (best_s >= 0) any_found = 1;
+                }
+
+                if (!any_found) break;
+
+                for (int c = 0; c < num_chunks; c++) {
+                    int off = c * CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
+                    if (seeds8[c] < 0) { memcpy(tmp+off, cur+off, len); continue; }
+                    xorshift_seed(seeds8[c]);
+                    for (int i = 0; i < len; i++) tmp[off+i] = cur[off+i] ^ randNum_and();
+                }
+
+                double e_try = entropy(tmp, size);
+                if (e_try >= e_cur) break;
+                memcpy(cur, tmp, size);
+                e_cur = e_try;
+                passes++;
+            }
+
+            free(ss); free(seeds8); free(lx);
+
+            if (passes > 0)
+                printf("module 8:  entropy=%lf  profit=%+.2f  total=%+.2f  time=%.1fs"
+                       "  [xor-and-xcorr  passes:%d]\n",
+                       e_cur, (e_before-e_cur)*size, (e0-e_cur)*size,
+                       (double)(clock()-t0)/CLOCKS_PER_SEC, passes);
+            else
+                printf("module 8:  skipped  [xor-and-xcorr]\n");
+        }
+
+        // --- Module 9: iterated per-chunk affine alignment ---
+        // v -> (a*v + b) mod 256, a odd. Uses precomputed inv256 from outer scope.
+        {
+            double e_before = e_cur;
+            clock_t t0 = clock();
+            u8 *as9 = malloc(num_chunks);
+            u8 *bs9 = malloc(num_chunks);
+            int *ha  = malloc(256 * sizeof(int));
+            int passes = 0;
+
+            for (int iter = 0; iter < 8; iter++) {
+                int global[256] = {0};
+                for (int i = 0; i < size; i++) global[cur[i]]++;
+
+                int any_nonidentity = 0;
+                for (int c = 0; c < num_chunks; c++) {
+                    int off = c*CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
+                    int local[256] = {0};
+                    for (int i = 0; i < len; i++) local[cur[off+i]]++;
+                    int rest[256];
+                    for (int v = 0; v < 256; v++) rest[v] = global[v] - local[v];
+
+                    int baseline = 0;
+                    for (int v = 0; v < 256; v++) baseline += local[v] * rest[v];
+                    int best_xcorr = baseline, best_ka = 0, best_b = 0;
+
+                    for (int ka = 1; ka < 128; ka++) {
+                        int a_inv = inv256[ka];
                         for (int w = 0; w < 256; w++)
-                            xcorr += ha[w] * rest[(w + b) & 0xFF];
-                        if (xcorr > best_xcorr) {
-                            best_xcorr = xcorr; best_ka = ka; best_b = b;
+                            ha[w] = local[(a_inv * w) & 0xFF];
+                        for (int b = 0; b < 256; b++) {
+                            int xcorr = 0;
+                            for (int w = 0; w < 256; w++)
+                                xcorr += ha[w] * rest[(w + b) & 0xFF];
+                            if (xcorr > best_xcorr) {
+                                best_xcorr = xcorr; best_ka = ka; best_b = b;
+                            }
                         }
                     }
+                    as9[c] = (u8)(2*best_ka + 1);
+                    bs9[c] = (u8)best_b;
+                    if (best_ka != 0 || best_b != 0) any_nonidentity = 1;
                 }
-                as9[c] = (u8)(2*best_ka + 1);
-                bs9[c] = (u8)best_b;
-                if (best_ka != 0 || best_b != 0) any_nonidentity = 1;
+
+                if (!any_nonidentity) break;
+
+                for (int c = 0; c < num_chunks; c++) {
+                    int off = c*CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
+                    u8 a = as9[c], b = bs9[c];
+                    for (int i = 0; i < len; i++)
+                        tmp[off+i] = (u8)((a * (unsigned)cur[off+i] + b) & 0xFF);
+                }
+                double e_try = entropy(tmp, size);
+                if (e_try >= e_cur) break;
+                memcpy(cur, tmp, size);
+                e_cur = e_try;
+                passes++;
             }
 
-            if (!any_nonidentity) break;
+            free(ha); free(as9); free(bs9);
 
-            for (int c = 0; c < num_chunks; c++) {
-                int off = c*CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
-                u8 a = as9[c], b = bs9[c];
-                for (int i = 0; i < len; i++)
-                    tmp[off+i] = (u8)((a * (unsigned)cur[off+i] + b) & 0xFF);
-            }
-            double e_try = entropy(tmp, size);
-            if (e_try >= e9) break;
-            memcpy(cur, tmp, size);
-            e9 = e_try;
-            passes++;
+            if (passes > 0)
+                printf("module 9:  entropy=%lf  profit=%+.2f  total=%+.2f  time=%.1fs"
+                       "  [affine-align  passes:%d]\n",
+                       e_cur, (e_before-e_cur)*size, (e0-e_cur)*size,
+                       (double)(clock()-t0)/CLOCKS_PER_SEC, passes);
+            else
+                printf("module 9:  skipped  [affine-align]\n");
         }
 
-        free(ha); free(as9); free(bs9);
-
-        if (passes > 0)
-            printf("module 9:  entropy=%lf  profit=%+.2f  total=%+.2f  time=%.1fs"
-                   "  [affine-align  passes:%d]\n",
-                   e9, (e8-e9)*size, (e0-e9)*size,
-                   (double)(clock()-t0)/CLOCKS_PER_SEC, passes);
-        else
-            printf("module 9:  skipped  [affine-align]\n");
+        outer_passes++;
+        if (e_cur >= e_outer_start) break;
     }
+
+    if (outer_passes > 1)
+        printf("outer loop: converged in %d passes\n", outer_passes);
 
     {
         int counts[256] = {0}; long sum = 0;
@@ -976,10 +949,9 @@ double RunModules(u8 *data, int size) {
         int mode = 0;
         for (int i = 1; i < 256; i++) if (counts[i] > counts[mode]) mode = i;
         printf("after : entropy=%lf  total=%+.2f  avg=%.2f  mode=%d (x%d)\n",
-               e9, (e0-e9)*size, (double)sum/size, mode, counts[mode]);
+               e_cur, (e0-e_cur)*size, (double)sum/size, mode, counts[mode]);
 
         // --- Structural diagnostics ---
-        // delta distribution: how concentrated are adjacent-byte differences?
         int delta[256] = {0};
         for (int i = 0; i < size-1; i++) delta[(u8)(cur[i+1] - cur[i])]++;
         double h_delta = entropy((u8*)NULL, 0); // placeholder
@@ -994,7 +966,6 @@ double RunModules(u8 *data, int size) {
         printf("struct: delta_entropy=%.4f  delta_mode=%d (x%d)\n",
                h_delta, dmode, delta[dmode]);
 
-        // per-bit statistics: fraction of 1s in each bit plane
         int bit1[8] = {0};
         for (int i = 0; i < size; i++)
             for (int b = 0; b < 8; b++)
@@ -1003,7 +974,6 @@ double RunModules(u8 *data, int size) {
         for (int b = 7; b >= 0; b--) printf(" b%d=%.2f", b, (double)bit1[b]/size);
         printf("\n");
 
-        // cross-chunk same-position XOR: how different are corresponding positions?
         int xdelta[256] = {0};
         for (int j = 0; j < CHUNK && j+CHUNK < size; j++)
             xdelta[(u8)(cur[j] ^ cur[j+CHUNK])]++;
@@ -1013,7 +983,7 @@ double RunModules(u8 *data, int size) {
                xmode, xdelta[xmode], CHUNK);
     }
     free(cur); free(tmp); free(prngs); free(pats);
-    return (e0 - e9) * size;
+    return (e0 - e_cur) * size;
 }
 
 int main() {
@@ -1021,7 +991,7 @@ int main() {
     int size = 4096;
     u8 *data = malloc(size);
     CSV_XY *csv = csv_xy_open("output.csv", "seeds", "profit","null");
-    for (int seeds = 0; seeds < 20; seeds++){
+    for (int seeds = 0; seeds < 25; seeds++){
         srand(seeds);
         for (int i = 0; i < size; i++)
             data[i] = rand() % 256;
