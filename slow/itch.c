@@ -760,8 +760,6 @@ double RunModules(u8 *data, int size) {
                        "  [and-xcorr  passes:%d]\n",
                        e_cur, (e_before-e_cur)*size, (e0-e_cur)*size,
                        (double)(clock()-t0)/CLOCKS_PER_SEC, passes);
-            else
-                printf("module 5:  skipped  [and-xcorr]\n");
         }
 
         // --- Module 6: iterated cross-chunk re-alignment ---
@@ -808,8 +806,6 @@ double RunModules(u8 *data, int size) {
                        "  [chunk-align-3  passes:%d]\n",
                        e_cur, (e_before-e_cur)*size, (e0-e_cur)*size,
                        (double)(clock()-t0)/CLOCKS_PER_SEC, passes);
-            else
-                printf("module 6:  skipped  [chunk-align-3]\n");
         }
 
         // --- Module 7: iterated per-chunk XOR-constant alignment ---
@@ -856,8 +852,6 @@ double RunModules(u8 *data, int size) {
                        "  [xor-align  passes:%d]\n",
                        e_cur, (e_before-e_cur)*size, (e0-e_cur)*size,
                        (double)(clock()-t0)/CLOCKS_PER_SEC, passes);
-            else
-                printf("module 7:  skipped  [xor-align]\n");
         }
 
         // --- Module 8: iterated per-chunk XOR AND-PRNG ---
@@ -924,8 +918,6 @@ double RunModules(u8 *data, int size) {
                        "  [xor-and-xcorr  passes:%d]\n",
                        e_cur, (e_before-e_cur)*size, (e0-e_cur)*size,
                        (double)(clock()-t0)/CLOCKS_PER_SEC, passes);
-            else
-                printf("module 8:  skipped  [xor-and-xcorr]\n");
         }
 
         // --- Module 9: iterated per-chunk Z/256Z affine alignment ---
@@ -989,8 +981,6 @@ double RunModules(u8 *data, int size) {
                        "  [affine-align  passes:%d]\n",
                        e_cur, (e_before-e_cur)*size, (e0-e_cur)*size,
                        (double)(clock()-t0)/CLOCKS_PER_SEC, passes);
-            else
-                printf("module 9:  skipped  [affine-align]\n");
         }
 
 
@@ -1060,8 +1050,6 @@ double RunModules(u8 *data, int size) {
                        "  [gf256-affine  passes:%d]\n",
                        e_cur, (e_before-e_cur)*size, (e0-e_cur)*size,
                        (double)(clock()-t0)/CLOCKS_PER_SEC, passes);
-            else
-                printf("module 11: skipped  [gf256-affine]\n");
         }
 
         // --- Module 12: iterated per-chunk Z/256Z affine + AND-PRNG (option A) ---
@@ -1210,8 +1198,6 @@ double RunModules(u8 *data, int size) {
                        "  [affine-prng  passes:%d]\n",
                        e_cur, (e_before-e_cur)*size, (e0-e_cur)*size,
                        (double)(clock()-t0)/CLOCKS_PER_SEC, passes);
-            else
-                printf("module 12: skipped  [affine-prng]\n");
         }
 
         outer_passes++;
