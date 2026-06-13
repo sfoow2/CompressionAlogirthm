@@ -380,10 +380,12 @@ double RunModules(u8 *data, int size) {
     u8  *as12_log    = malloc(32  * num_chunks);
     u8  *dirs12_log  = malloc(32  * num_chunks);
     int n12 = 0;
+    u8  *rots13_log  = malloc(64  * num_chunks);
+    int n13 = 0;
 
     // per-outer start indices (index [num_outers] = sentinel)
     int outer_n5[9],  outer_n6[9],  outer_n7[9],  outer_n8[9];
-    int outer_n9[9],  outer_n11[9], outer_n12[9];
+    int outer_n9[9],  outer_n11[9], outer_n12[9], outer_n13[9];
     int num_outers = 0;
 
     double e0 = entropy(cur, size);
@@ -658,9 +660,78 @@ double RunModules(u8 *data, int size) {
         free(tmp2);
     }
 
+    // --- Module 20: even/odd byte deinterleave ---
+    // Splits the stream into even-indexed bytes (first half) and odd-indexed bytes (second half).
+    // Triggers when per-position PRNG modules (M5, M12) create an even/odd distribution asymmetry.
+    double e20;
+    int ran20 = 0;
+    {
+        clock_t t0 = clock();
+        for (int i = 0; i < size/2; i++) {
+            tmp[i]          = cur[i*2];
+            tmp[i + size/2] = cur[i*2 + 1];
+        }
+        e20 = entropy(tmp, size);
+        if (e20 < e16) {
+            ran20 = 1; memcpy(cur, tmp, size);
+            printf("module 20: entropy=%lf  profit=%+.2f  total=%+.2f  time=%.1fs  [even-odd-split]\n",
+                   e20, (e16-e20)*size, (e0-e20)*size, (double)(clock()-t0)/CLOCKS_PER_SEC);
+        } else {
+            e20 = e16;
+        }
+    }
+
+    // --- Module 21: cross-chunk XOR butterfly ---
+    // Treats block as 16x256 matrix. At each byte position, applies 4-stage XOR butterfly
+    // across the 16 chunk values, concentrating inter-chunk correlation into low-index slots.
+    // Inverse: same butterfly stages applied in reverse order.
+    double e21;
+    int ran21 = 0;
+    {
+        clock_t t0 = clock();
+        memcpy(tmp, cur, size);
+        int fwd_strides[4] = {8, 4, 2, 1};
+        for (int si = 0; si < 4; si++) {
+            int st = fwd_strides[si];
+            for (int j = 0; j < CHUNK; j++)
+                for (int c = 0; c < num_chunks; c++)
+                    if ((c % (2*st)) < st)
+                        tmp[(c+st)*CHUNK + j] ^= tmp[c*CHUNK + j];
+        }
+        e21 = entropy(tmp, size);
+        if (e21 < e20) {
+            ran21 = 1; memcpy(cur, tmp, size);
+            printf("module 21: entropy=%lf  profit=%+.2f  total=%+.2f  time=%.1fs  [chunk-xor-butterfly]\n",
+                   e21, (e20-e21)*size, (e0-e21)*size, (double)(clock()-t0)/CLOCKS_PER_SEC);
+        } else {
+            e21 = e20;
+        }
+    }
+
+    // --- Module 22: nibble plane separation ---
+    // For each pair (cur[2i], cur[2i+1]): pack high nibbles together, low nibbles together.
+    // High nibble plane is concentrated near 6 when mode=0x60; separating it lowers combined H.
+    double e22;
+    int ran22 = 0;
+    {
+        clock_t t0 = clock();
+        for (int i = 0; i < size/2; i++) {
+            tmp[i]          = (cur[2*i] >> 4) | (cur[2*i+1] & 0xF0);
+            tmp[i + size/2] = (cur[2*i] & 0xF) | ((cur[2*i+1] & 0xF) << 4);
+        }
+        e22 = entropy(tmp, size);
+        if (e22 < e21) {
+            ran22 = 1; memcpy(cur, tmp, size);
+            printf("module 22: entropy=%lf  profit=%+.2f  total=%+.2f  time=%.1fs  [nibble-split]\n",
+                   e22, (e21-e22)*size, (e0-e22)*size, (double)(clock()-t0)/CLOCKS_PER_SEC);
+        } else {
+            e22 = e21;
+        }
+    }
+
     // --- Outer convergence loop: modules 5-12 ---
     // Cycles all transforms until a full pass makes no improvement.
-    double e_cur = e16;
+    double e_cur = e22;
 
     // precompute Z/256Z multiplicative inverses for odd values (used by M9, M12)
     u8 inv256[128];
@@ -676,6 +747,7 @@ double RunModules(u8 *data, int size) {
         outer_n5[outer]  = n5;  outer_n6[outer]  = n6;
         outer_n7[outer]  = n7;  outer_n8[outer]  = n8;
         outer_n9[outer]  = n9;  outer_n11[outer] = n11; outer_n12[outer] = n12;
+        outer_n13[outer] = n13;
         if (outer > 0)
             printf("--- outer pass %d (entropy=%.6f) ---\n", outer + 1, e_cur);
 
@@ -850,6 +922,58 @@ double RunModules(u8 *data, int size) {
             if (passes > 0)
                 printf("module 7:  entropy=%lf  profit=%+.2f  total=%+.2f  time=%.1fs"
                        "  [xor-align  passes:%d]\n",
+                       e_cur, (e_before-e_cur)*size, (e0-e_cur)*size,
+                       (double)(clock()-t0)/CLOCKS_PER_SEC, passes);
+        }
+
+        // --- Module 13: per-chunk cyclic bit rotation ---
+        // rotl8(v, k) permutes the histogram of a chunk identically to how an
+        // additive shift (M6) does — but via a different group action on {0..255}.
+        // The 8-rotation group is not a subgroup of Z/256Z addition, so this finds
+        // alignments that M6 cannot reach. Overhead: 3 bits per chunk.
+        {
+            double e_before = e_cur;
+            clock_t t0 = clock();
+            u8 *rots13 = malloc(num_chunks);
+            int passes = 0;
+            for (int iter = 0; iter < 8; iter++) {
+                int global[256] = {0};
+                for (int i = 0; i < size; i++) global[cur[i]]++;
+                int any_nonzero = 0;
+                for (int c = 0; c < num_chunks; c++) {
+                    int off = c * CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
+                    int local[256] = {0};
+                    for (int i = 0; i < len; i++) local[cur[off+i]]++;
+                    int rest[256];
+                    for (int v = 0; v < 256; v++) rest[v] = global[v] - local[v];
+                    int best_k = 0, best_xcorr = -1;
+                    for (int k = 0; k < 8; k++) {
+                        int xcorr = 0;
+                        for (int v = 0; v < 256; v++)
+                            xcorr += local[v] * rest[rotl8((u8)v, k)];
+                        if (xcorr > best_xcorr) { best_xcorr = xcorr; best_k = k; }
+                    }
+                    rots13[c] = (u8)best_k;
+                    if (best_k) any_nonzero = 1;
+                }
+                if (!any_nonzero) break;
+                for (int c = 0; c < num_chunks; c++) {
+                    int off = c * CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
+                    for (int i = 0; i < len; i++)
+                        tmp[off+i] = rotl8(cur[off+i], rots13[c]);
+                }
+                double e_try = entropy(tmp, size);
+                if (e_try >= e_cur) break;
+                memcpy(rots13_log + n13*num_chunks, rots13, num_chunks);
+                n13++;
+                memcpy(cur, tmp, size);
+                e_cur = e_try;
+                passes++;
+            }
+            free(rots13);
+            if (passes > 0)
+                printf("module 13: entropy=%lf  profit=%+.2f  total=%+.2f  time=%.1fs"
+                       "  [bit-rotate  passes:%d]\n",
                        e_cur, (e_before-e_cur)*size, (e0-e_cur)*size,
                        (double)(clock()-t0)/CLOCKS_PER_SEC, passes);
         }
@@ -1208,6 +1332,7 @@ double RunModules(u8 *data, int size) {
     outer_n5[num_outers]  = n5;  outer_n6[num_outers]  = n6;
     outer_n7[num_outers]  = n7;  outer_n8[num_outers]  = n8;
     outer_n9[num_outers]  = n9;  outer_n11[num_outers] = n11; outer_n12[num_outers] = n12;
+    outer_n13[num_outers] = n13;
 
     if (outer_passes > 1)
         printf("outer loop: converged in %d passes\n", outer_passes);
@@ -1305,6 +1430,16 @@ double RunModules(u8 *data, int size) {
                     rev[off+i] ^= randNum_and();
             }
         }
+        // M13
+        for (int p = outer_n13[outer+1]-1; p >= outer_n13[outer]; p--) {
+            for (int c = 0; c < num_chunks; c++) {
+                int off = c*CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
+                u8 k = rots13_log[p*num_chunks+c];
+                u8 inv_k = (8 - k) & 7;
+                for (int i = 0; i < len; i++)
+                    rev[off+i] = rotl8(rev[off+i], inv_k);
+            }
+        }
         // M7 (XOR is self-inverse)
         for (int p = outer_n7[outer+1]-1; p >= outer_n7[outer]; p--) {
             for (int c = 0; c < num_chunks; c++) {
@@ -1337,6 +1472,40 @@ double RunModules(u8 *data, int size) {
                 }
             }
         }
+    }
+
+    // undo M22 (nibble split: reconstruct original bytes from packed nibble planes)
+    if (ran22) {
+        u8 *rb = malloc(size);
+        for (int i = 0; i < size/2; i++) {
+            rb[2*i]   = ((rev[i] & 0xF) << 4) | (rev[i + size/2] & 0xF);
+            rb[2*i+1] = (rev[i] & 0xF0) | ((rev[i + size/2] >> 4) & 0xF);
+        }
+        memcpy(rev, rb, size);
+        free(rb);
+    }
+
+    // undo M21 (XOR butterfly: apply same butterfly stages in reverse order)
+    if (ran21) {
+        int inv_strides[4] = {1, 2, 4, 8};
+        for (int si = 0; si < 4; si++) {
+            int st = inv_strides[si];
+            for (int j = 0; j < CHUNK; j++)
+                for (int c = 0; c < num_chunks; c++)
+                    if ((c % (2*st)) < st)
+                        rev[(c+st)*CHUNK + j] ^= rev[c*CHUNK + j];
+        }
+    }
+
+    // undo M20 (even/odd split: reinterleave the two halves)
+    if (ran20) {
+        u8 *rb = malloc(size);
+        for (int i = 0; i < size/2; i++) {
+            rb[2*i]   = rev[i];
+            rb[2*i+1] = rev[i + size/2];
+        }
+        memcpy(rev, rb, size);
+        free(rb);
     }
 
     // undo M16 (Gray code: b2g inverse is g2b, and vice versa)
@@ -1412,6 +1581,7 @@ double RunModules(u8 *data, int size) {
     free(as9_log); free(bs9_log);
     free(ag11_log); free(bg11_log);
     free(seeds12_log); free(as12_log); free(dirs12_log);
+    free(rots13_log);
     return (e0 - e_cur) * size;
 }
 
