@@ -33,6 +33,7 @@ u8 xorshift(void) {
 }
 
 u8 randNum_add(void) { u8 a = xorshift(); u8 b = xorshift(); return a | b; }
+u8 randNum_and(void) { u8 a = xorshift(); u8 b = xorshift(); return a & b; }
 
 static uint64_t shuffle_rng(uint64_t *s) {
     *s ^= *s << 13; *s ^= *s >> 7; *s ^= *s << 17;
@@ -167,6 +168,18 @@ static int score_seed_pattern_sub(u8 *data, int len, int seed, int pat) {
     xorshift_seed(seed);
     for (int i = 0; i < len; i++) {
         u8 v = pattern_applies(i, pat) ? (u8)(data[i] - randNum_add()) : data[i];
+        score += counts[v];
+        counts[v]++;
+    }
+    return score;
+}
+
+static int score_seed_and(u8 *data, int len, int seed) {
+    int counts[256] = {0};
+    int score = 0;
+    xorshift_seed(seed);
+    for (int i = 0; i < len; i++) {
+        u8 v = data[i] + randNum_and();
         score += counts[v];
         counts[v]++;
     }
@@ -575,10 +588,106 @@ double RunModules(u8 *data, int size) {
         }
 
         free(sH4); free(sC4);
-        print_stats("after ", cur, size);
-        free(cur); free(tmp); free(prngs); free(pats);
-        return (e0 - e4c) * size;
     }
+
+    // --- Module 5: per-chunk AND-PRNG with cross-chunk xcorr scoring ---
+    // Within-chunk PRNG space is saturated by modules 1+2. Score AND-PRNG seeds by
+    // cross-chunk histogram overlap at lag 0 (modules 3+4a already aligned peaks).
+    // Two-phase search: phase 1 filters 65537 seeds with a 64-byte proxy (max of
+    // add/sub xcorr), phase 2 evaluates top 2000 on full 256 bytes, both directions.
+    double e5;
+    {
+        clock_t t0 = clock();
+        int *seeds5 = malloc(num_chunks * sizeof(int));
+        u8  *dirs5  = malloc(num_chunks);
+        SeedScore *ss = malloc(65537 * sizeof(SeedScore));
+        int *lc = malloc(256 * sizeof(int));
+        int *ls = malloc(256 * sizeof(int));
+
+        int global[256] = {0};
+        for (int i = 0; i < size; i++) global[cur[i]]++;
+
+        for (int c = 0; c < num_chunks; c++) {
+            int off = c * CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
+            int local[256] = {0};
+            for (int i = 0; i < len; i++) local[cur[off+i]]++;
+            int rest[256];
+            for (int v = 0; v < 256; v++) rest[v] = global[v] - local[v];
+
+            int baseline = 0;
+            for (int v = 0; v < 256; v++) baseline += local[v] * rest[v];
+
+            // Phase 1: all seeds, 64-byte prefix, rank by max(add_xcorr, sub_xcorr)
+            int pfx = len < 64 ? len : 64;
+            for (int s = 0; s <= 65536; s++) {
+                memset(lc, 0, 256 * sizeof(int));
+                memset(ls, 0, 256 * sizeof(int));
+                xorshift_seed(s);
+                for (int i = 0; i < pfx; i++) {
+                    u8 r = randNum_and();
+                    lc[(u8)(cur[off+i] + r)]++;
+                    ls[(u8)(cur[off+i] - r)]++;
+                }
+                int xc = 0, xs = 0;
+                for (int v = 0; v < 256; v++) { xc += lc[v]*rest[v]; xs += ls[v]*rest[v]; }
+                ss[s].seed = s;
+                ss[s].score = xc > xs ? xc : xs;
+            }
+            qsort(ss, 65537, sizeof(SeedScore), cmp_score_desc);
+
+            // Phase 2: top 2000 seeds, full chunk, both directions
+            int best_s = -1, best_xcorr = baseline;
+            u8 best_dir = 0;
+            for (int k = 0; k < 2000; k++) {
+                int s = ss[k].seed;
+                memset(lc, 0, 256 * sizeof(int));
+                memset(ls, 0, 256 * sizeof(int));
+                xorshift_seed(s);
+                for (int i = 0; i < len; i++) {
+                    u8 r = randNum_and();
+                    lc[(u8)(cur[off+i] + r)]++;
+                    ls[(u8)(cur[off+i] - r)]++;
+                }
+                int xc = 0, xs = 0;
+                for (int v = 0; v < 256; v++) { xc += lc[v]*rest[v]; xs += ls[v]*rest[v]; }
+                if (xc > best_xcorr) { best_xcorr = xc; best_s = s; best_dir = 0; }
+                if (xs > best_xcorr) { best_xcorr = xs; best_s = s; best_dir = 1; }
+            }
+            seeds5[c] = best_s;
+            dirs5[c]  = best_dir;
+        }
+
+        for (int c = 0; c < num_chunks; c++) {
+            int off = c * CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
+            if (seeds5[c] < 0) {
+                memcpy(tmp + off, cur + off, len);
+            } else {
+                xorshift_seed(seeds5[c]);
+                for (int i = 0; i < len; i++) {
+                    u8 r = randNum_and();
+                    tmp[off+i] = dirs5[c] ? (u8)(cur[off+i] - r) : (u8)(cur[off+i] + r);
+                }
+            }
+        }
+
+        e5 = entropy(tmp, size);
+        if (e5 < e4c) {
+            memcpy(cur, tmp, size);
+            printf("module 5:  entropy=%lf  profit=%+.2f  total=%+.2f  time=%.1fs"
+                   "  [and-xcorr]\n",
+                   e5, (e4c-e5)*size, (e0-e5)*size,
+                   (double)(clock()-t0)/CLOCKS_PER_SEC);
+        } else {
+            e5 = e4c;
+            printf("module 5:  skipped  [and-xcorr]\n");
+        }
+
+        free(seeds5); free(dirs5); free(ss); free(lc); free(ls);
+    }
+
+    print_stats("after ", cur, size);
+    free(cur); free(tmp); free(prngs); free(pats);
+    return (e0 - e5) * size;
 }
 
 int main() {
@@ -586,7 +695,7 @@ int main() {
     int size = 4096;
     u8 *data = malloc(size);
     CSV_XY *csv = csv_xy_open("output.csv", "seeds", "profit","null");
-    for (int seeds = 0; seeds < 50; seeds++){
+    for (int seeds = 0; seeds < 100; seeds++){
         srand(seeds);
         for (int i = 0; i < size; i++)
             data[i] = rand() % 256;
