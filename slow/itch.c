@@ -86,12 +86,14 @@ static u8 gf256_exp[512];   // doubled table: gf256_exp[i+255]=gf256_exp[i]
 static u8 gf256_inv_table[256];
 
 static void init_gf256_tables(void) {
+    // Generator 0x03 is a primitive root of GF(256, 0x11b); 0x02 only has order 51.
     int x = 1;
     for (int i = 0; i < 255; i++) {
         gf256_exp[i] = (u8)x;
         gf256_log[x] = (u8)i;
-        x <<= 1;
-        if (x & 0x100) x ^= 0x11b;
+        // multiply x by {03} = xtime(x) XOR x
+        int xt = ((x << 1) & 0xFF) ^ ((x & 0x80) ? 0x1b : 0);
+        x = xt ^ x;
     }
     gf256_log[0] = 0;   // log(0) undefined; set to 0 safely
     for (int i = 255; i < 512; i++) gf256_exp[i] = gf256_exp[i - 255];
@@ -336,9 +338,54 @@ double RunModules(u8 *data, int size) {
 
     u8  *cur   = malloc(size);
     u8  *tmp   = malloc(size);
+    u8  *orig  = malloc(size);
     int *prngs = malloc(num_chunks * sizeof(int));
     int *pats  = malloc(num_chunks * sizeof(int));
     memcpy(cur, data, size);
+    memcpy(orig, data, size);
+
+    // --- parameter logs for reversal ---
+    int ran1 = 0;
+    int *seeds1      = malloc(num_chunks * sizeof(int));
+    int ran2 = 0;
+    int *seeds2      = malloc(num_chunks * sizeof(int));
+    int *pats2       = malloc(num_chunks * sizeof(int));
+    int ran3 = 0;
+    int *shifts3_log = malloc(num_chunks * sizeof(int));
+    int ran4a = 0;
+    int *shifts4a_log= malloc(num_chunks * sizeof(int));
+    int ran4c = 0;
+    int *sH4_log     = malloc(num_chunks * sizeof(int));
+    int *sC4_log     = malloc(num_chunks * sizeof(int));
+    int *pats4c      = malloc(num_chunks * sizeof(int));
+
+    // multi-pass logs: [pass_index * num_chunks + chunk]
+    int *seeds5_log  = malloc(64  * num_chunks * sizeof(int));
+    u8  *dirs5_log   = malloc(64  * num_chunks);
+    int n5 = 0;
+    int *shifts6_log = malloc(128 * num_chunks * sizeof(int));
+    int n6 = 0;
+    u8  *xors7_log   = malloc(128 * num_chunks);
+    int n7 = 0;
+    int *seeds8_log  = malloc(64  * num_chunks * sizeof(int));
+    int n8 = 0;
+    u8  *as9_log     = malloc(64  * num_chunks);
+    u8  *bs9_log     = malloc(64  * num_chunks);
+    int n9 = 0;
+    u8  *rots10_log  = malloc(128 * num_chunks);
+    int n10 = 0;
+    u8  *ag11_log    = malloc(64  * num_chunks);
+    u8  *bg11_log    = malloc(64  * num_chunks);
+    int n11 = 0;
+    int *seeds12_log = malloc(32  * num_chunks * sizeof(int));
+    u8  *as12_log    = malloc(32  * num_chunks);
+    u8  *dirs12_log  = malloc(32  * num_chunks);
+    int n12 = 0;
+
+    // per-outer start indices (index [num_outers] = sentinel)
+    int outer_n5[9],  outer_n6[9],  outer_n7[9],  outer_n8[9];
+    int outer_n9[9],  outer_n10[9], outer_n11[9], outer_n12[9];
+    int num_outers = 0;
 
     double e0 = entropy(cur, size);
     printf("start:    entropy=%lf  (%d chunks x %d bytes)\n", e0, num_chunks, CHUNK);
@@ -366,6 +413,8 @@ double RunModules(u8 *data, int size) {
         }
         e1 = entropy(tmp, size);
         if (e1 < e0) {
+            ran1 = 1;
+            memcpy(seeds1, prngs, num_chunks * sizeof(int));
             memcpy(cur, tmp, size);
             printf("module 1: entropy=%lf  profit=%+.2f  time=%.1fs\n",
                    e1, (e0 - e1) * size, (double)(clock() - t0) / CLOCKS_PER_SEC);
@@ -406,6 +455,9 @@ double RunModules(u8 *data, int size) {
         }
         e2 = entropy(tmp, size);
         if (e2 < e1) {
+            ran2 = 1;
+            memcpy(seeds2, prngs, num_chunks * sizeof(int));
+            memcpy(pats2,  pats,  num_chunks * sizeof(int));
             memcpy(cur, tmp, size);
             printf("module 2: entropy=%lf  profit=%+.2f  total=%+.2f  time=%.1fs"
                    "  [odd:%d even:%d 0110:%d 1001:%d]\n",
@@ -450,6 +502,8 @@ double RunModules(u8 *data, int size) {
         }
         e3 = entropy(tmp, size);
         if (e3 < e2) {
+            ran3 = 1;
+            memcpy(shifts3_log, shifts3, num_chunks * sizeof(int));
             int nshifted = 0;
             for (int c = 0; c < num_chunks; c++) if (shifts3[c]) nshifted++;
             memcpy(cur, tmp, size);
@@ -492,6 +546,8 @@ double RunModules(u8 *data, int size) {
         }
         e4a = entropy(tmp, size);
         if (e4a < e3) {
+            ran4a = 1;
+            memcpy(shifts4a_log, shifts4a, num_chunks * sizeof(int));
             int nshifted = 0;
             for (int c = 0; c < num_chunks; c++) if (shifts4a[c]) nshifted++;
             memcpy(cur, tmp, size);
@@ -556,6 +612,10 @@ double RunModules(u8 *data, int size) {
         }
         e4c = entropy(tmp, size);
         if (e4c < e4a) {
+            ran4c = 1;
+            memcpy(sH4_log,  sH4,  num_chunks * sizeof(int));
+            memcpy(sC4_log,  sC4,  num_chunks * sizeof(int));
+            memcpy(pats4c,   pats, num_chunks * sizeof(int));
             memcpy(cur, tmp, size);
             printf("module 4c: entropy=%lf  profit=%+.2f  total=%+.2f  time=%.1fs"
                    "  [hc-align]\n",
@@ -583,6 +643,10 @@ double RunModules(u8 *data, int size) {
     int outer_passes = 0;
     for (int outer = 0; outer < 8; outer++) {
         double e_outer_start = e_cur;
+        outer_n5[outer]  = n5;  outer_n6[outer]  = n6;
+        outer_n7[outer]  = n7;  outer_n8[outer]  = n8;
+        outer_n9[outer]  = n9;  outer_n10[outer] = n10;
+        outer_n11[outer] = n11; outer_n12[outer] = n12;
         if (outer > 0)
             printf("--- outer pass %d (entropy=%.6f) ---\n", outer + 1, e_cur);
 
@@ -654,6 +718,9 @@ double RunModules(u8 *data, int size) {
                 }
                 double e_try = entropy(tmp, size);
                 if (e_try >= e_cur) break;
+                memcpy(seeds5_log + n5*num_chunks, seeds5, num_chunks*sizeof(int));
+                memcpy(dirs5_log  + n5*num_chunks, dirs5,  num_chunks);
+                n5++;
                 memcpy(cur, tmp, size);
                 e_cur = e_try;
                 passes++;
@@ -700,6 +767,8 @@ double RunModules(u8 *data, int size) {
                 }
                 double e_try = entropy(tmp, size);
                 if (e_try >= e_cur) break;
+                memcpy(shifts6_log + n6*num_chunks, shifts6, num_chunks*sizeof(int));
+                n6++;
                 memcpy(cur, tmp, size);
                 e_cur = e_try;
                 passes++;
@@ -746,6 +815,8 @@ double RunModules(u8 *data, int size) {
                 }
                 double e_try = entropy(tmp, size);
                 if (e_try >= e_cur) break;
+                memcpy(xors7_log + n7*num_chunks, xors7, num_chunks);
+                n7++;
                 memcpy(cur, tmp, size);
                 e_cur = e_try;
                 passes++;
@@ -812,6 +883,8 @@ double RunModules(u8 *data, int size) {
                 }
                 double e_try = entropy(tmp, size);
                 if (e_try >= e_cur) break;
+                memcpy(seeds8_log + n8*num_chunks, seeds8, num_chunks*sizeof(int));
+                n8++;
                 memcpy(cur, tmp, size);
                 e_cur = e_try;
                 passes++;
@@ -874,6 +947,9 @@ double RunModules(u8 *data, int size) {
                 }
                 double e_try = entropy(tmp, size);
                 if (e_try >= e_cur) break;
+                memcpy(as9_log + n9*num_chunks, as9, num_chunks);
+                memcpy(bs9_log + n9*num_chunks, bs9, num_chunks);
+                n9++;
                 memcpy(cur, tmp, size);
                 e_cur = e_try;
                 passes++;
@@ -927,6 +1003,8 @@ double RunModules(u8 *data, int size) {
                 }
                 double e_try = entropy(tmp, size);
                 if (e_try >= e_cur) break;
+                memcpy(rots10_log + n10*num_chunks, rots10, num_chunks);
+                n10++;
                 memcpy(cur, tmp, size);
                 e_cur = e_try;
                 passes++;
@@ -994,6 +1072,9 @@ double RunModules(u8 *data, int size) {
                 }
                 double e_try = entropy(tmp, size);
                 if (e_try >= e_cur) break;
+                memcpy(ag11_log + n11*num_chunks, ag11, num_chunks);
+                memcpy(bg11_log + n11*num_chunks, bg11, num_chunks);
+                n11++;
                 memcpy(cur, tmp, size);
                 e_cur = e_try;
                 passes++;
@@ -1137,6 +1218,10 @@ double RunModules(u8 *data, int size) {
                 }
                 double e_try = entropy(tmp, size);
                 if (e_try >= e_cur) break;
+                memcpy(seeds12_log + n12*num_chunks, seeds12, num_chunks*sizeof(int));
+                memcpy(as12_log    + n12*num_chunks, as12,    num_chunks);
+                memcpy(dirs12_log  + n12*num_chunks, dirs12,  num_chunks);
+                n12++;
                 memcpy(cur, tmp, size);
                 e_cur = e_try;
                 passes++;
@@ -1155,8 +1240,14 @@ double RunModules(u8 *data, int size) {
         }
 
         outer_passes++;
+        num_outers++;
         if (e_cur >= e_outer_start) break;
     }
+    // sentinel: end-of-log indices for the last outer pass
+    outer_n5[num_outers]  = n5;  outer_n6[num_outers]  = n6;
+    outer_n7[num_outers]  = n7;  outer_n8[num_outers]  = n8;
+    outer_n9[num_outers]  = n9;  outer_n10[num_outers] = n10;
+    outer_n11[num_outers] = n11; outer_n12[num_outers] = n12;
 
     if (outer_passes > 1)
         printf("outer loop: converged in %d passes\n", outer_passes);
@@ -1198,7 +1289,168 @@ double RunModules(u8 *data, int size) {
         printf("struct: cross_chunk_xor_mode=%d (x%d of %d pairs)\n",
                xmode, xdelta[xmode], CHUNK);
     }
-    free(cur); free(tmp); free(prngs); free(pats);
+    // --- REVERSAL + VERIFICATION ---
+    u8 *rev = malloc(size);
+    memcpy(rev, cur, size);
+
+    // undo outer loop modules in reverse outer-pass order, reverse module order
+    for (int outer = num_outers - 1; outer >= 0; outer--) {
+        // M12
+        for (int p = outer_n12[outer+1]-1; p >= outer_n12[outer]; p--) {
+            for (int c = 0; c < num_chunks; c++) {
+                int off = c*CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
+                int seed = seeds12_log[p*num_chunks+c];
+                if (seed < 0) continue;
+                u8 a = as12_log[p*num_chunks+c];
+                u8 dir = dirs12_log[p*num_chunks+c];
+                u8 a_inv = inv256[(a-1)/2];
+                xorshift_seed(seed);
+                for (int i = 0; i < len; i++) {
+                    u8 rr = randNum_and();
+                    u8 v = rev[off+i];
+                    u8 u = dir ? (u8)(v+rr) : (u8)(v-rr);
+                    rev[off+i] = (u8)((a_inv * (unsigned)u) & 0xFF);
+                }
+            }
+        }
+        // M11
+        for (int p = outer_n11[outer+1]-1; p >= outer_n11[outer]; p--) {
+            for (int c = 0; c < num_chunks; c++) {
+                int off = c*CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
+                u8 ag = ag11_log[p*num_chunks+c];
+                u8 bg = bg11_log[p*num_chunks+c];
+                for (int i = 0; i < len; i++)
+                    rev[off+i] = gf256_mul(gf256_inv_table[ag], rev[off+i] ^ bg);
+            }
+        }
+        // M10
+        for (int p = outer_n10[outer+1]-1; p >= outer_n10[outer]; p--) {
+            for (int c = 0; c < num_chunks; c++) {
+                int off = c*CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
+                int k = rots10_log[p*num_chunks+c];
+                for (int i = 0; i < len; i++)
+                    rev[off+i] = rotl8(rev[off+i], 8-k);
+            }
+        }
+        // M9
+        for (int p = outer_n9[outer+1]-1; p >= outer_n9[outer]; p--) {
+            for (int c = 0; c < num_chunks; c++) {
+                int off = c*CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
+                u8 a = as9_log[p*num_chunks+c];
+                u8 b = bs9_log[p*num_chunks+c];
+                u8 a_inv = inv256[(a-1)/2];
+                for (int i = 0; i < len; i++)
+                    rev[off+i] = (u8)((a_inv * (unsigned)((rev[off+i]-b) & 0xFF)) & 0xFF);
+            }
+        }
+        // M8 (XOR is self-inverse)
+        for (int p = outer_n8[outer+1]-1; p >= outer_n8[outer]; p--) {
+            for (int c = 0; c < num_chunks; c++) {
+                int off = c*CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
+                int seed = seeds8_log[p*num_chunks+c];
+                if (seed < 0) continue;
+                xorshift_seed(seed);
+                for (int i = 0; i < len; i++)
+                    rev[off+i] ^= randNum_and();
+            }
+        }
+        // M7 (XOR is self-inverse)
+        for (int p = outer_n7[outer+1]-1; p >= outer_n7[outer]; p--) {
+            for (int c = 0; c < num_chunks; c++) {
+                int off = c*CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
+                u8 x = xors7_log[p*num_chunks+c];
+                for (int i = 0; i < len; i++)
+                    rev[off+i] ^= x;
+            }
+        }
+        // M6
+        for (int p = outer_n6[outer+1]-1; p >= outer_n6[outer]; p--) {
+            for (int c = 0; c < num_chunks; c++) {
+                int off = c*CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
+                u8 s = (u8)shifts6_log[p*num_chunks+c];
+                for (int i = 0; i < len; i++)
+                    rev[off+i] = (u8)(rev[off+i] - s);
+            }
+        }
+        // M5
+        for (int p = outer_n5[outer+1]-1; p >= outer_n5[outer]; p--) {
+            for (int c = 0; c < num_chunks; c++) {
+                int off = c*CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
+                int seed = seeds5_log[p*num_chunks+c];
+                if (seed < 0) continue;
+                u8 dir = dirs5_log[p*num_chunks+c];
+                xorshift_seed(seed);
+                for (int i = 0; i < len; i++) {
+                    u8 rr = randNum_and();
+                    rev[off+i] = dir ? (u8)(rev[off+i]+rr) : (u8)(rev[off+i]-rr);
+                }
+            }
+        }
+    }
+
+    // undo single-pass modules in reverse: M4c, M4a, M3, M2, M1
+    if (ran4c) {
+        for (int c = 0; c < num_chunks; c++) {
+            int off = c*CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
+            int pat = pats4c[c];
+            for (int i = 0; i < len; i++) {
+                u8 s = (u8)(pattern_applies(i, pat) ? sH4_log[c] : sC4_log[c]);
+                rev[off+i] = (u8)(rev[off+i] - s);
+            }
+        }
+    }
+    if (ran4a) {
+        for (int c = 0; c < num_chunks; c++) {
+            int off = c*CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
+            for (int i = 0; i < len; i++)
+                rev[off+i] = (u8)(rev[off+i] - (u8)shifts4a_log[c]);
+        }
+    }
+    if (ran3) {
+        for (int c = 0; c < num_chunks; c++) {
+            int off = c*CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
+            for (int i = 0; i < len; i++)
+                rev[off+i] = (u8)(rev[off+i] - (u8)shifts3_log[c]);
+        }
+    }
+    if (ran2) {
+        for (int c = 0; c < num_chunks; c++) {
+            int off = c*CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
+            int pat = pats2[c];
+            xorshift_seed(seeds2[c]);
+            for (int i = 0; i < len; i++)
+                if (pattern_applies(i, pat))
+                    rev[off+i] = (u8)(rev[off+i] - randNum_add());
+        }
+    }
+    if (ran1) {
+        for (int c = 0; c < num_chunks; c++) {
+            int off = c*CHUNK, len = (off+CHUNK<=size)?CHUNK:(size-off);
+            xorshift_seed(seeds1[c]);
+            for (int i = 0; i < len; i++)
+                rev[off+i] = (u8)(rev[off+i] - randNum_add());
+        }
+    }
+
+    int mismatches = 0;
+    for (int i = 0; i < size; i++) if (rev[i] != orig[i]) mismatches++;
+    if (mismatches == 0)
+        printf("verify: PASS — all %d bytes recovered exactly\n", size);
+    else
+        printf("verify: FAIL — %d/%d bytes mismatch\n", mismatches, size);
+    free(rev);
+
+    free(cur); free(tmp); free(orig); free(prngs); free(pats);
+    free(seeds1); free(seeds2); free(pats2);
+    free(shifts3_log); free(shifts4a_log);
+    free(sH4_log); free(sC4_log); free(pats4c);
+    free(seeds5_log); free(dirs5_log);
+    free(shifts6_log); free(xors7_log);
+    free(seeds8_log);
+    free(as9_log); free(bs9_log);
+    free(rots10_log);
+    free(ag11_log); free(bg11_log);
+    free(seeds12_log); free(as12_log); free(dirs12_log);
     return (e0 - e_cur) * size;
 }
 
