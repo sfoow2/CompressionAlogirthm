@@ -1,0 +1,150 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <math.h>
+#include <time.h>
+
+typedef uint8_t u8;
+
+double entropy(u8 *data, int size){
+    int freq[256] = {0};
+    for (int x = 0; x < size; x++) freq[data[x]]++;
+    double entropy = 0.0;
+    for (int i = 0; i < 256; i++) {
+        if (freq[i] > 0) {
+            double p = (double)freq[i] / size;
+            entropy -= p * log2(p);
+        }
+    }
+    return entropy;
+}
+
+
+
+void regret_analysis_from_block(const u8 *data, int n) {
+    uint64_t freq[256] = {0};
+    for (int i = 0; i < n; i++) freq[data[i]]++;
+
+    double ent = 0.0;
+    for (int i = 0; i < 256; i++) {
+        if (!freq[i]) continue;
+        double p = (double)freq[i] / (double)n;
+        ent -= p * log2(p);
+    }
+
+    double savings = (log2(256.0) - ent) * n / 8.0;
+    double regret  = (255.0 / 2.0) * log2((double)n / 256.0) / 8.0;
+    printf("  Theoretical save = %.1f bytes\n", savings);
+    printf("  Regret (worst)   = %.1f bytes\n", regret);
+}
+
+double FindBest(u8* data, int size) {
+    double base = entropy(data, size);
+    double best_gain = 0.0;
+    int best_instr = -1;
+    int best_amp = 0;
+    int best_stride = 0;
+
+    u8* tmp = malloc(size);
+    clock_t t_start = clock();
+
+    // instr 0: xor odd  (10 bits)
+    // instr 1: xor even (10 bits)
+    for (int instr = 0; instr <= 1; instr++) {
+        for (int amp = 0; amp < 256; amp++) {
+            memcpy(tmp, data, size);
+            for (int i = 0; i < size; i++) {
+                int odd = i & 1;
+                if (instr == 0 &&  odd) tmp[i] ^= (u8)amp;
+                if (instr == 1 && !odd) tmp[i] ^= (u8)amp;
+            }
+            double gain = (base - entropy(tmp, size)) * size - 10.0;
+            if (gain > best_gain) {
+                best_gain = gain; best_instr = instr;
+                best_amp = amp;   best_stride = 0;
+            }
+        }
+    }
+    // instr 2: xor stride, stride 2..18 (15 bits: 2 type + 5 stride + 8 amp)
+    for (int stride = 2; stride <= 18; stride++) {
+        for (int amp = 0; amp < 256; amp++) {
+            memcpy(tmp, data, size);
+            for (int i = 0; i < size; i += stride) tmp[i] ^= (u8)amp;
+            double gain = (base - entropy(tmp, size)) * size - 15.0;
+            if (gain > best_gain) {
+                best_gain = gain; best_instr = 2;
+                best_amp = amp;   best_stride = stride;
+            }
+        }
+    }
+    // instr 3: xor delta (2 bits, no amp) — each byte XORed with previous
+    {
+        memcpy(tmp, data, size);
+        for (int i = 1; i < size; i++) tmp[i] ^= tmp[i-1];
+        double gain = (base - entropy(tmp, size)) * size - 2.0;
+        if (gain > best_gain) {
+            best_gain = gain; best_instr = 3;
+            best_amp = 0;     best_stride = 0;
+        }
+    }
+    free(tmp);
+
+    if (best_instr == -1) {
+        printf("FindBest: no beneficial instruction found\n");
+        return 0.0;
+    }
+
+    if (best_instr == 0)
+        for (int i = 0; i < size; i++) { if (i & 1)  data[i] ^= (u8)best_amp; }
+    else if (best_instr == 1)
+        for (int i = 0; i < size; i++) { if (!(i & 1)) data[i] ^= (u8)best_amp; }
+    else if (best_instr == 2)
+        for (int i = 0; i < size; i += best_stride) data[i] ^= (u8)best_amp;
+    else if (best_instr == 3)
+        for (int i = 1; i < size; i++) data[i] ^= data[i-1];
+
+    double total_ms = (double)(clock() - t_start) / CLOCKS_PER_SEC * 1000.0;
+
+    if (best_instr == 2)
+        printf("FindBest: instr=2 (xor stride) stride=%d amp=0x%02X  net_gain=%.2f bits  time=%.2f ms\n",
+               best_stride, best_amp, best_gain, total_ms);
+    else if (best_instr == 3)
+        printf("FindBest: instr=3 (xor delta)  net_gain=%.2f bits  time=%.2f ms\n",
+               best_gain, total_ms);
+    else
+        printf("FindBest: instr=%d (%s) amp=0x%02X  net_gain=%.2f bits  time=%.2f ms\n",
+               best_instr, best_instr == 0 ? "xor odd" : "xor even", best_amp, best_gain,
+               total_ms);
+
+    return best_gain;
+}
+
+
+void main(){
+    int size = 4096;
+    u8* data = malloc(size);
+    srand(2);
+    for (int x = 0; x < size; x++){
+        data[x] = rand() % 256;
+    }
+
+    printf("started %lf\n", entropy(data,size));
+
+    double total_gain = 0.0;
+    double g;
+    while ((g = FindBest(data, size)) > 0.0) total_gain += g;
+
+    printf("after   %lf\n", entropy(data,size));
+    printf("total net gain: %.2f bits\n", total_gain);
+
+    // Write binary to file
+    FILE* f = fopen("C:/Users/lukac/Documents/compressor/output.bin", "wb");
+    fwrite(data, 1, size, f);
+    fclose(f);
+    printf("Written %d bytes to output.bin\n", size);
+
+    regret_analysis_from_block(data,size);
+
+    free(data);
+}
