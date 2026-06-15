@@ -1,150 +1,499 @@
-#include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <math.h>
 #include <time.h>
 
-typedef uint8_t u8;
+typedef uint8_t  u8;
+typedef uint16_t u16;
+typedef uint32_t u32;
 
-double entropy(u8 *data, int size){
+#define TOTAL     4096
+#define MAX_INSTR 256
+
+static double ltable[TOTAL + 1];
+
+void InitTable(void) {
+    ltable[0] = 0.0;
+    for (int k = 1; k <= TOTAL; k++)
+        ltable[k] = (double)k / TOTAL * log2((double)k / TOTAL);
+}
+
+/* total entropy in bits (not bps) */
+double EntropyBits(u8* data) {
     int freq[256] = {0};
-    for (int x = 0; x < size; x++) freq[data[x]]++;
-    double entropy = 0.0;
-    for (int i = 0; i < 256; i++) {
-        if (freq[i] > 0) {
-            double p = (double)freq[i] / size;
-            entropy -= p * log2(p);
+    for (int i = 0; i < TOTAL; i++) freq[data[i]]++;
+    double h = 0.0;
+    for (int j = 0; j < 256; j++)
+        h -= (double)TOTAL * ltable[freq[j]];
+    return h;
+}
+
+/* overhead = 3-bit type tag + param bits */
+#define OH_PRNG  19.0   /* 3 + 16          */
+#define OH_SCR   27.0   /* 3 + 24          */
+#define OH_XOS   16.0   /* 3 + 8 + 5       */
+#define OH_ADS   22.0   /* 3 + 8 + 8 + 3   */
+#define OH_PRNX  19.0   /* 3 + 16  (XOR PRNG) */
+#define OH_ADSL  22.0   /* 3 + 8 + 8 + 5   (stride 9-33) */
+#define OH_XAS   22.0   /* 3 + 8 + 8 + 3   */
+#define OH_XASL  22.0   /* 3 + 8 + 8 + 5   (stride 9-33) */
+
+typedef struct { u8 type; u32 p0, p1, p2; } Instr;
+#define INSTR_PRNG 0
+#define INSTR_SCR  1
+#define INSTR_XOS  2
+#define INSTR_ADS  3
+#define INSTR_PRNX 4   /* XOR PRNG         */
+#define INSTR_ADSL 5   /* ADS stride 9-33  */
+#define INSTR_XAS  6
+#define INSTR_XASL 7   /* XAS stride 9-33  */
+
+/* ---- apply functions ---- */
+
+void ApplyPRNG(u8* in, u8* out, u16 seed) {
+    u16 s = seed;
+    for (int i = 0; i < TOTAL; i++) {
+        s ^= s << 7; s ^= s >> 9; s ^= s << 8;
+        out[i] = in[i] + (u8)(s ^ (s >> 8));
+    }
+}
+
+/* Fisher-Yates with 24-bit LCG seed */
+void ApplyScramble(u8* in, u8* out, u32 seed24) {
+    memcpy(out, in, TOTAL);
+    u32 rng = (seed24 & 0xFFFFFF) | 0x1000000u;
+    for (int i = TOTAL - 1; i > 0; i--) {
+        rng = rng * 1664525u + 1013904223u;
+        int j = (int)((rng >> 8) % (u32)(i + 1));
+        u8 t = out[i]; out[i] = out[j]; out[j] = t;
+    }
+}
+
+/* XOR with amp at every stride-th position (stride 1..33) */
+void ApplyXOS(u8* in, u8* out, u8 amp, int stride) {
+    memcpy(out, in, TOTAL);
+    for (int i = 0; i < TOTAL; i += stride)
+        out[i] ^= amp;
+}
+
+/* alternating +amp1/+amp2 at every stride-th position (stride 1..8) */
+void ApplyADS(u8* in, u8* out, u8 amp1, u8 amp2, int stride) {
+    memcpy(out, in, TOTAL);
+    int t = 0;
+    for (int i = 0; i < TOTAL; i += stride, t ^= 1)
+        out[i] = in[i] + (t ? amp2 : amp1);
+}
+
+/* XOR with xorshift stream instead of ADD */
+void ApplyPRNGX(u8* in, u8* out, u16 seed) {
+    u16 s = seed;
+    for (int i = 0; i < TOTAL; i++) {
+        s ^= s << 7; s ^= s >> 9; s ^= s << 8;
+        out[i] = in[i] ^ (u8)(s ^ (s >> 8));
+    }
+}
+
+/* alternating XOR amp1/amp2 at every stride-th position (stride 1..8) */
+void ApplyXAS(u8* in, u8* out, u8 amp1, u8 amp2, int stride) {
+    memcpy(out, in, TOTAL);
+    int t = 0;
+    for (int i = 0; i < TOTAL; i += stride, t ^= 1)
+        out[i] = in[i] ^ (t ? amp2 : amp1);
+}
+
+/* ---- search functions (return net bits saved, positive = gain) ---- */
+
+double SearchPRNG(u8* data, double base, u16* bp_seed) {
+    double best = base + OH_PRNG;
+    *bp_seed = 1;
+    int freq[256];
+    for (int seed = 1; seed <= 65535; seed++) {
+        memset(freq, 0, 256 * sizeof(int));
+        u16 s = (u16)seed;
+        for (int i = 0; i < TOTAL; i++) {
+            s ^= s << 7; s ^= s >> 9; s ^= s << 8;
+            freq[(u8)(data[i] + (u8)(s ^ (s >> 8)))]++;
         }
+        double cost = OH_PRNG;
+        for (int j = 0; j < 256; j++) cost -= (double)TOTAL * ltable[freq[j]];
+        if (cost < best) { best = cost; *bp_seed = (u16)seed; }
     }
-    return entropy;
+    return base - best;
 }
 
+/* fast: precompute hit/base freq tables, O(256) per (stride,amp) */
+double SearchXOS(u8* data, double base, u8* bp_amp, int* bp_stride) {
+    double best_net = -1e18;
+    *bp_amp = 0; *bp_stride = 1;
+    int total_f[256] = {0};
+    for (int i = 0; i < TOTAL; i++) total_f[data[i]]++;
 
+    for (int stride = 1; stride <= 33; stride++) {
+        int hit[256] = {0};
+        for (int i = 0; i < TOTAL; i += stride) hit[data[i]]++;
+        int base_f[256];
+        for (int v = 0; v < 256; v++) base_f[v] = total_f[v] - hit[v];
 
-void regret_analysis_from_block(const u8 *data, int n) {
-    uint64_t freq[256] = {0};
-    for (int i = 0; i < n; i++) freq[data[i]]++;
-
-    double ent = 0.0;
-    for (int i = 0; i < 256; i++) {
-        if (!freq[i]) continue;
-        double p = (double)freq[i] / (double)n;
-        ent -= p * log2(p);
-    }
-
-    double savings = (log2(256.0) - ent) * n / 8.0;
-    double regret  = (255.0 / 2.0) * log2((double)n / 256.0) / 8.0;
-    printf("  Theoretical save = %.1f bytes\n", savings);
-    printf("  Regret (worst)   = %.1f bytes\n", regret);
-}
-
-double FindBest(u8* data, int size) {
-    double base = entropy(data, size);
-    double best_gain = 0.0;
-    int best_instr = -1;
-    int best_amp = 0;
-    int best_stride = 0;
-
-    u8* tmp = malloc(size);
-    clock_t t_start = clock();
-
-    // instr 0: xor odd  (10 bits)
-    // instr 1: xor even (10 bits)
-    for (int instr = 0; instr <= 1; instr++) {
         for (int amp = 0; amp < 256; amp++) {
-            memcpy(tmp, data, size);
-            for (int i = 0; i < size; i++) {
-                int odd = i & 1;
-                if (instr == 0 &&  odd) tmp[i] ^= (u8)amp;
-                if (instr == 1 && !odd) tmp[i] ^= (u8)amp;
-            }
-            double gain = (base - entropy(tmp, size)) * size - 10.0;
-            if (gain > best_gain) {
-                best_gain = gain; best_instr = instr;
-                best_amp = amp;   best_stride = 0;
-            }
+            int rf[256];
+            memcpy(rf, base_f, sizeof(rf));
+            for (int v = 0; v < 256; v++) rf[v ^ amp] += hit[v];
+            double cost = OH_XOS;
+            for (int j = 0; j < 256; j++) cost -= (double)TOTAL * ltable[rf[j]];
+            double net = base - cost;
+            if (net > best_net) { best_net = net; *bp_amp = (u8)amp; *bp_stride = stride; }
         }
     }
-    // instr 2: xor stride, stride 2..18 (15 bits: 2 type + 5 stride + 8 amp)
-    for (int stride = 2; stride <= 18; stride++) {
-        for (int amp = 0; amp < 256; amp++) {
-            memcpy(tmp, data, size);
-            for (int i = 0; i < size; i += stride) tmp[i] ^= (u8)amp;
-            double gain = (base - entropy(tmp, size)) * size - 15.0;
-            if (gain > best_gain) {
-                best_gain = gain; best_instr = 2;
-                best_amp = amp;   best_stride = stride;
-            }
-        }
-    }
-    // instr 3: xor delta (2 bits, no amp) — each byte XORed with previous
-    {
-        memcpy(tmp, data, size);
-        for (int i = 1; i < size; i++) tmp[i] ^= tmp[i-1];
-        double gain = (base - entropy(tmp, size)) * size - 2.0;
-        if (gain > best_gain) {
-            best_gain = gain; best_instr = 3;
-            best_amp = 0;     best_stride = 0;
-        }
-    }
-    free(tmp);
-
-    if (best_instr == -1) {
-        printf("FindBest: no beneficial instruction found\n");
-        return 0.0;
-    }
-
-    if (best_instr == 0)
-        for (int i = 0; i < size; i++) { if (i & 1)  data[i] ^= (u8)best_amp; }
-    else if (best_instr == 1)
-        for (int i = 0; i < size; i++) { if (!(i & 1)) data[i] ^= (u8)best_amp; }
-    else if (best_instr == 2)
-        for (int i = 0; i < size; i += best_stride) data[i] ^= (u8)best_amp;
-    else if (best_instr == 3)
-        for (int i = 1; i < size; i++) data[i] ^= data[i-1];
-
-    double total_ms = (double)(clock() - t_start) / CLOCKS_PER_SEC * 1000.0;
-
-    if (best_instr == 2)
-        printf("FindBest: instr=2 (xor stride) stride=%d amp=0x%02X  net_gain=%.2f bits  time=%.2f ms\n",
-               best_stride, best_amp, best_gain, total_ms);
-    else if (best_instr == 3)
-        printf("FindBest: instr=3 (xor delta)  net_gain=%.2f bits  time=%.2f ms\n",
-               best_gain, total_ms);
-    else
-        printf("FindBest: instr=%d (%s) amp=0x%02X  net_gain=%.2f bits  time=%.2f ms\n",
-               best_instr, best_instr == 0 ? "xor odd" : "xor even", best_amp, best_gain,
-               total_ms);
-
-    return best_gain;
+    return best_net;
 }
 
+/* fast: precompute a/b group freq tables, O(256) per (stride,amp1,amp2) */
+double SearchADS(u8* data, double base, u8* bp_a1, u8* bp_a2, int* bp_stride) {
+    double best_net = -1e18;
+    *bp_a1 = 0; *bp_a2 = 0; *bp_stride = 1;
+    int total_f[256] = {0};
+    for (int i = 0; i < TOTAL; i++) total_f[data[i]]++;
 
-void main(){
-    int size = 4096;
-    u8* data = malloc(size);
-    srand(2);
-    for (int x = 0; x < size; x++){
-        data[x] = rand() % 256;
+    for (int stride = 1; stride <= 8; stride++) {
+        int a_f[256] = {0}, b_f[256] = {0};
+        int hit = 0;
+        for (int i = 0; i < TOTAL; i += stride, hit++)
+            (hit & 1 ? b_f : a_f)[data[i]]++;
+        int base_f[256];
+        for (int v = 0; v < 256; v++)
+            base_f[v] = total_f[v] - a_f[v] - b_f[v];
+
+        for (int a1 = 0; a1 < 256; a1++) {
+            int bpa[256];
+            memcpy(bpa, base_f, sizeof(bpa));
+            for (int v = 0; v < 256; v++) bpa[(v + a1) & 255] += a_f[v];
+
+            for (int a2 = 0; a2 < 256; a2++) {
+                int rf[256];
+                memcpy(rf, bpa, sizeof(rf));
+                for (int v = 0; v < 256; v++) rf[(v + a2) & 255] += b_f[v];
+                double cost = OH_ADS;
+                for (int j = 0; j < 256; j++) cost -= (double)TOTAL * ltable[rf[j]];
+                double net = base - cost;
+                if (net > best_net) {
+                    best_net = net;
+                    *bp_a1 = (u8)a1; *bp_a2 = (u8)a2; *bp_stride = stride;
+                }
+            }
+        }
+    }
+    return best_net;
+}
+
+/* XOR PRNG: same search as PRNG but XOR instead of ADD */
+double SearchPRNGX(u8* data, double base, u16* bp_seed) {
+    double best = base + OH_PRNX;
+    *bp_seed = 1;
+    int freq[256];
+    for (int seed = 1; seed <= 65535; seed++) {
+        memset(freq, 0, 256 * sizeof(int));
+        u16 s = (u16)seed;
+        for (int i = 0; i < TOTAL; i++) {
+            s ^= s << 7; s ^= s >> 9; s ^= s << 8;
+            freq[(u8)(data[i] ^ (u8)(s ^ (s >> 8)))]++;
+        }
+        double cost = OH_PRNX;
+        for (int j = 0; j < 256; j++) cost -= (double)TOTAL * ltable[freq[j]];
+        if (cost < best) { best = cost; *bp_seed = (u16)seed; }
+    }
+    return base - best;
+}
+
+/* ADS with stride 9-33 (extends coverage beyond ADS stride 1-8) */
+double SearchADSL(u8* data, double base, u8* bp_a1, u8* bp_a2, int* bp_stride) {
+    double best_net = -1e18;
+    *bp_a1 = 0; *bp_a2 = 0; *bp_stride = 9;
+    int total_f[256] = {0};
+    for (int i = 0; i < TOTAL; i++) total_f[data[i]]++;
+
+    for (int stride = 9; stride <= 33; stride++) {
+        int a_f[256] = {0}, b_f[256] = {0};
+        int hit = 0;
+        for (int i = 0; i < TOTAL; i += stride, hit++)
+            (hit & 1 ? b_f : a_f)[data[i]]++;
+        int base_f[256];
+        for (int v = 0; v < 256; v++)
+            base_f[v] = total_f[v] - a_f[v] - b_f[v];
+
+        for (int a1 = 0; a1 < 256; a1++) {
+            int bpa[256];
+            memcpy(bpa, base_f, sizeof(bpa));
+            for (int v = 0; v < 256; v++) bpa[(v + a1) & 255] += a_f[v];
+            for (int a2 = 0; a2 < 256; a2++) {
+                int rf[256];
+                memcpy(rf, bpa, sizeof(rf));
+                for (int v = 0; v < 256; v++) rf[(v + a2) & 255] += b_f[v];
+                double cost = OH_ADSL;
+                for (int j = 0; j < 256; j++) cost -= (double)TOTAL * ltable[rf[j]];
+                double net = base - cost;
+                if (net > best_net) { best_net = net; *bp_a1=(u8)a1; *bp_a2=(u8)a2; *bp_stride=stride; }
+            }
+        }
+    }
+    return best_net;
+}
+
+/* same freq-table trick as SearchADS but XOR instead of ADD */
+double SearchXAS(u8* data, double base, u8* bp_a1, u8* bp_a2, int* bp_stride) {
+    double best_net = -1e18;
+    *bp_a1 = 0; *bp_a2 = 0; *bp_stride = 1;
+    int total_f[256] = {0};
+    for (int i = 0; i < TOTAL; i++) total_f[data[i]]++;
+
+    for (int stride = 1; stride <= 8; stride++) {
+        int a_f[256] = {0}, b_f[256] = {0};
+        int hit = 0;
+        for (int i = 0; i < TOTAL; i += stride, hit++)
+            (hit & 1 ? b_f : a_f)[data[i]]++;
+        int base_f[256];
+        for (int v = 0; v < 256; v++)
+            base_f[v] = total_f[v] - a_f[v] - b_f[v];
+
+        for (int a1 = 0; a1 < 256; a1++) {
+            int bpa[256];
+            memcpy(bpa, base_f, sizeof(bpa));
+            for (int v = 0; v < 256; v++) bpa[v ^ a1] += a_f[v];
+
+            for (int a2 = 0; a2 < 256; a2++) {
+                int rf[256];
+                memcpy(rf, bpa, sizeof(rf));
+                for (int v = 0; v < 256; v++) rf[v ^ a2] += b_f[v];
+                double cost = OH_XAS;
+                for (int j = 0; j < 256; j++) cost -= (double)TOTAL * ltable[rf[j]];
+                double net = base - cost;
+                if (net > best_net) {
+                    best_net = net;
+                    *bp_a1 = (u8)a1; *bp_a2 = (u8)a2; *bp_stride = stride;
+                }
+            }
+        }
+    }
+    return best_net;
+}
+
+/* XAS with stride 9-33 (extends coverage beyond XAS stride 1-8) */
+double SearchXASL(u8* data, double base, u8* bp_a1, u8* bp_a2, int* bp_stride) {
+    double best_net = -1e18;
+    *bp_a1 = 0; *bp_a2 = 0; *bp_stride = 9;
+    int total_f[256] = {0};
+    for (int i = 0; i < TOTAL; i++) total_f[data[i]]++;
+
+    for (int stride = 9; stride <= 33; stride++) {
+        int a_f[256] = {0}, b_f[256] = {0};
+        int hit = 0;
+        for (int i = 0; i < TOTAL; i += stride, hit++)
+            (hit & 1 ? b_f : a_f)[data[i]]++;
+        int base_f[256];
+        for (int v = 0; v < 256; v++)
+            base_f[v] = total_f[v] - a_f[v] - b_f[v];
+
+        for (int a1 = 0; a1 < 256; a1++) {
+            int bpa[256];
+            memcpy(bpa, base_f, sizeof(bpa));
+            for (int v = 0; v < 256; v++) bpa[v ^ a1] += a_f[v];
+            for (int a2 = 0; a2 < 256; a2++) {
+                int rf[256];
+                memcpy(rf, bpa, sizeof(rf));
+                for (int v = 0; v < 256; v++) rf[v ^ a2] += b_f[v];
+                double cost = OH_XASL;
+                for (int j = 0; j < 256; j++) cost -= (double)TOTAL * ltable[rf[j]];
+                double net = base - cost;
+                if (net > best_net) { best_net = net; *bp_a1=(u8)a1; *bp_a2=(u8)a2; *bp_stride=stride; }
+            }
+        }
+    }
+    return best_net;
+}
+
+/* try all 7 non-scramble types; apply best if gain > 0 */
+int GreedyStep(u8* cur, u8* tmp, Instr* instrs, int* n) {
+    double base = EntropyBits(cur);
+
+    u16 prng_s, prnx_s;
+    u8  xos_a;             int xos_str;
+    u8  ads_a1, ads_a2;    int ads_str;
+    u8  adsl_a1, adsl_a2;  int adsl_str;
+    u8  xas_a1, xas_a2;    int xas_str;
+    u8  xasl_a1, xasl_a2;  int xasl_str;
+
+    double np  = SearchPRNG (cur, base, &prng_s);
+    double nx  = SearchXOS  (cur, base, &xos_a, &xos_str);
+    double na  = SearchADS  (cur, base, &ads_a1, &ads_a2, &ads_str);
+    double npx = SearchPRNGX(cur, base, &prnx_s);
+    double nal = SearchADSL (cur, base, &adsl_a1, &adsl_a2, &adsl_str);
+    double nxa = SearchXAS  (cur, base, &xas_a1, &xas_a2, &xas_str);
+    double nxl = SearchXASL (cur, base, &xasl_a1, &xasl_a2, &xasl_str);
+
+    double best = np; int bt = INSTR_PRNG;
+    if (nx  > best) { best = nx;  bt = INSTR_XOS;  }
+    if (na  > best) { best = na;  bt = INSTR_ADS;  }
+    if (npx > best) { best = npx; bt = INSTR_PRNX; }
+    if (nal > best) { best = nal; bt = INSTR_ADSL; }
+    if (nxa > best) { best = nxa; bt = INSTR_XAS;  }
+    if (nxl > best) { best = nxl; bt = INSTR_XASL; }
+
+    char pb[48], xb[48], ab[48], pxb[48], alb[48], xab[48], xlb[48];
+    snprintf(pb,  sizeof(pb),  "PRNG     seed=%u",                 prng_s);
+    snprintf(xb,  sizeof(xb),  "XOS      amp=%u stride=%d",        xos_a, xos_str);
+    snprintf(ab,  sizeof(ab),  "ADS      a1=%u a2=%u stride=%d",   ads_a1, ads_a2, ads_str);
+    snprintf(pxb, sizeof(pxb), "PRNG-X   seed=%u",                 prnx_s);
+    snprintf(alb, sizeof(alb), "ADS-L    a1=%u a2=%u stride=%d",   adsl_a1, adsl_a2, adsl_str);
+    snprintf(xab, sizeof(xab), "XAS      a1=%u a2=%u stride=%d",   xas_a1, xas_a2, xas_str);
+    snprintf(xlb, sizeof(xlb), "XAS-L    a1=%u a2=%u stride=%d",   xasl_a1, xasl_a2, xasl_str);
+
+    #define MARK(t) ((bt==(t) && best>0) ? "  <--" : "")
+    printf("  %-42s  %+8.2f bits%s\n", pb,  np,  MARK(INSTR_PRNG));
+    printf("  %-42s  %+8.2f bits%s\n", xb,  nx,  MARK(INSTR_XOS));
+    printf("  %-42s  %+8.2f bits%s\n", ab,  na,  MARK(INSTR_ADS));
+    printf("  %-42s  %+8.2f bits%s\n", pxb, npx, MARK(INSTR_PRNX));
+    printf("  %-42s  %+8.2f bits%s\n", alb, nal, MARK(INSTR_ADSL));
+    printf("  %-42s  %+8.2f bits%s\n", xab, nxa, MARK(INSTR_XAS));
+    printf("  %-42s  %+8.2f bits%s\n", xlb, nxl, MARK(INSTR_XASL));
+    #undef MARK
+
+    if (best <= 0.0) { printf("  no gain\n"); return 0; }
+
+    if (bt == INSTR_PRNG) {
+        ApplyPRNG (cur, tmp, prng_s);
+        instrs[(*n)++] = (Instr){INSTR_PRNG, prng_s, 0, 0};
+    } else if (bt == INSTR_XOS) {
+        ApplyXOS  (cur, tmp, xos_a, xos_str);
+        instrs[(*n)++] = (Instr){INSTR_XOS, xos_a, (u32)xos_str, 0};
+    } else if (bt == INSTR_ADS) {
+        ApplyADS  (cur, tmp, ads_a1, ads_a2, ads_str);
+        instrs[(*n)++] = (Instr){INSTR_ADS, ads_a1, ads_a2, (u32)ads_str};
+    } else if (bt == INSTR_PRNX) {
+        ApplyPRNGX(cur, tmp, prnx_s);
+        instrs[(*n)++] = (Instr){INSTR_PRNX, prnx_s, 0, 0};
+    } else if (bt == INSTR_ADSL) {
+        ApplyADS  (cur, tmp, adsl_a1, adsl_a2, adsl_str);
+        instrs[(*n)++] = (Instr){INSTR_ADSL, adsl_a1, adsl_a2, (u32)adsl_str};
+    } else if (bt == INSTR_XAS) {
+        ApplyXAS  (cur, tmp, xas_a1, xas_a2, xas_str);
+        instrs[(*n)++] = (Instr){INSTR_XAS, xas_a1, xas_a2, (u32)xas_str};
+    } else {
+        ApplyXAS  (cur, tmp, xasl_a1, xasl_a2, xasl_str);
+        instrs[(*n)++] = (Instr){INSTR_XASL, xasl_a1, xasl_a2, (u32)xasl_str};
+    }
+    memcpy(cur, tmp, TOTAL);
+    printf("  => entropy: %.4f bps\n", EntropyBits(cur) / TOTAL);
+    return 1;
+}
+
+int main(void) {
+    InitTable();
+
+    u8 data[TOTAL];
+    srand(42);
+    for (int i = 0; i < TOTAL; i++) data[i] = (u8)(rand() & 0xFF);
+
+    double e_in = EntropyBits(data);
+    printf("input:  %.4f bps  (%.2f bits)\n\n", e_in / TOTAL, e_in);
+
+    Instr instrs[MAX_INSTR];
+    int n = 0;
+    u8 cur[TOTAL], tmp[TOTAL];
+    memcpy(cur, data, TOTAL);
+
+    printf("=== greedy phase ===\n");
+    clock_t t0 = clock();
+    while (n < MAX_INSTR && GreedyStep(cur, tmp, instrs, &n));
+    printf("greedy done: %d instrs, %.1f ms\n\n",
+           n, (double)(clock() - t0) / CLOCKS_PER_SEC * 1000.0);
+
+    /* scramble escape: search 65535 seeds with XOS stride=2 proxy,
+       then run greedy (no nested scramble) on the best one */
+    #define MAX_ESCAPES 8
+
+    for (int esc = 0; esc < MAX_ESCAPES && n < MAX_INSTR; esc++) {
+        double base_esc = EntropyBits(cur);
+        double best_scr_net = 0.0;
+        u16 best_scr_seed = 0;
+        u8 scr_tmp[TOTAL];
+
+        printf("=== scramble escape #%d (65535 seeds) ===\n", esc+1);
+        clock_t ts = clock();
+
+        /* XOS stride=2 proxy: fast enough for 65535 seeds */
+        for (u16 seed = 1; seed != 0; seed++) {
+            ApplyScramble(cur, scr_tmp, (u32)seed);
+            int sf[256] = {0};
+            for (int i = 0; i < TOTAL; i++) sf[scr_tmp[i]]++;
+            int hit[256] = {0};
+            for (int i = 0; i < TOTAL; i += 2) hit[scr_tmp[i]]++;
+            int bf[256];
+            for (int v = 0; v < 256; v++) bf[v] = sf[v] - hit[v];
+            for (int amp = 0; amp < 256; amp++) {
+                int rf[256];
+                memcpy(rf, bf, sizeof(rf));
+                for (int v = 0; v < 256; v++) rf[v ^ amp] += hit[v];
+                double cost = OH_SCR + OH_XOS;
+                for (int j = 0; j < 256; j++) cost -= (double)TOTAL * ltable[rf[j]];
+                double net = base_esc - cost;
+                if (net > best_scr_net) { best_scr_net = net; best_scr_seed = seed; }
+            }
+        }
+        printf("  search: %.1f ms\n", (double)(clock()-ts)/CLOCKS_PER_SEC*1000.0);
+
+        if (best_scr_seed == 0) {
+            printf("  no beneficial scramble found, stopping\n");
+            break;
+        }
+
+        printf("  -> SCRAMBLE seed=%u (probe net=%.2f bits)\n",
+               (unsigned)best_scr_seed, best_scr_net);
+        ApplyScramble(cur, tmp, (u32)best_scr_seed);
+        memcpy(cur, tmp, TOTAL);
+        instrs[n++] = (Instr){INSTR_SCR, best_scr_seed, 0, 0};
+
+        /* greedy-only pass after scramble — no further scramble nesting */
+        int improved = 0;
+        while (n < MAX_INSTR && GreedyStep(cur, tmp, instrs, &n))
+            improved = 1;
+        if (!improved) {
+            printf("  scramble gave no greedy gain, stopping\n");
+            break;
+        }
     }
 
-    printf("started %lf\n", entropy(data,size));
+    double e_out = EntropyBits(cur);
+    double gross  = e_in - e_out;
+    double overhead = 0;
+    for (int k = 0; k < n; k++) {
+        switch (instrs[k].type) {
+            case INSTR_PRNG: overhead += OH_PRNG; break;
+            case INSTR_SCR:  overhead += OH_SCR;  break;
+            case INSTR_XOS:  overhead += OH_XOS;  break;
+            case INSTR_ADS:  overhead += OH_ADS;  break;
+            case INSTR_PRNX: overhead += OH_PRNX; break;
+            case INSTR_ADSL: overhead += OH_ADSL; break;
+            case INSTR_XAS:  overhead += OH_XAS;  break;
+            case INSTR_XASL: overhead += OH_XASL; break;
+        }
+    }
 
-    double total_gain = 0.0;
-    double g;
-    while ((g = FindBest(data, size)) > 0.0) total_gain += g;
+    printf("output:   %.4f bps  (%.2f bits)\n", e_out / TOTAL, e_out);
+    printf("gross:    %.2f bits\n", gross);
+    printf("overhead: %.0f bits\n", overhead);
+    printf("net:      %.2f bits\n", gross - overhead);
 
-    printf("after   %lf\n", entropy(data,size));
-    printf("total net gain: %.2f bits\n", total_gain);
+    FILE* fi = fopen("C:/Users/lukac/Documents/compressor/instructions.bin", "wb");
+    u32 ni = (u32)n;
+    fwrite(&ni, 4, 1, fi);
+    fwrite(instrs, sizeof(Instr), n, fi);
+    fclose(fi);
 
-    // Write binary to file
-    FILE* f = fopen("C:/Users/lukac/Documents/compressor/output.bin", "wb");
-    fwrite(data, 1, size, f);
-    fclose(f);
-    printf("Written %d bytes to output.bin\n", size);
+    FILE* fd = fopen("C:/Users/lukac/Documents/compressor/output.bin", "wb");
+    fwrite(cur, 1, TOTAL, fd);
+    fclose(fd);
 
-    regret_analysis_from_block(data,size);
-
-    free(data);
+    printf("written instructions.bin + output.bin  (%d instrs)\n", n);
+    return 0;
 }
