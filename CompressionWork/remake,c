@@ -56,29 +56,23 @@ static float byteEntropy(const u8 *d, int n) {
 }
 
 int main(int argc, char **argv) {
-    const char *FILE_PATH = argc >= 2 ? argv[1] : "C:/Users/lukac/Documents/compressor/test.zip";
-    const char *OUT_PATH  = argc >= 3 ? argv[2] : "C:/Users/lukac/Documents/compressor/transformed.bin";
+    const char *OUT_PATH = "C:/Users/lukac/Documents/compressor/transformed.bin";
 
     #define TARGET_MATCH 0.75
 
-    FILE *f = fopen(FILE_PATH, "rb");
-    if (!f) { fprintf(stderr, "Cannot open %s\n", FILE_PATH); return 1; }
-    fseek(f, 0, SEEK_END);
-    int size = (int)ftell(f);
-    rewind(f);
-
+    int size = 4096;
     u8 *data = malloc(size);
-    fread(data, 1, size, f);
-    fclose(f);
-
+    srand(17);
+    for (int x = 0; x < size; x++){
+        data[x] = rand() % 256;
+    }
+    
     printf("Original entropy = %.6f\n", byteEntropy(data, size));
 
     /* seed size — constant across passes since file size doesn't change */
     double gain    = TARGET_MATCH - 0.5;
     int SEED_BYTES = (int)ceil(gain * gain * 2.0 * size / log(256.0));
     if (SEED_BYTES < 8) SEED_BYTES = 8;
-    printf("Target %.0f%% -> SEED_BYTES = %d\n\n",
-           TARGET_MATCH * 100.0, SEED_BYTES);
 
     int bits_len = (size + 7) / 8;
     u8 *bits     = malloc(bits_len);
@@ -90,25 +84,20 @@ int main(int argc, char **argv) {
     for (int ti = 0; ti < N_THRESH; ti++)
         thresh_seeds[ti] = malloc(SEED_BYTES);
 
-    int total_header = 0;
+    int   total_header = 0;
+    float orig_entropy = byteEntropy(data, size);
+    float prev_entropy = orig_entropy;
 
-    /* count initial bytes<128 so we can detect when a pass yields nothing */
     int below_prev = 0;
     for (int i = 0; i < size; i++) if (data[i] < 128) below_prev++;
 
     for (int pass = 0; ; pass++) {
-        printf("--- Pass %d ---\n", pass + 1);
-
         /* build bitstream from current work buffer */
         memset(bits, 0, bits_len);
-        int ones = 0;
         for (int i = 0; i < size; i++) {
-            if (work[i] < 128) {
+            if (work[i] < 128)
                 bits[i / 8] |= (1 << (7 - (i % 8)));
-                ones++;
-            }
         }
-        printf("Bitstream: %d ones (%.2f%%)\n", ones, 100.0 * ones / size);
 
         /* brute-force: all thresholds x 256 seeds per segment — parallel over segments */
         memset(thresh_totals, 0, N_THRESH * sizeof(int64_t));
@@ -140,10 +129,6 @@ int main(int argc, char **argv) {
         for (int ti = 1; ti < N_THRESH; ti++)
             if (thresh_totals[ti] > thresh_totals[best_ti]) best_ti = ti;
 
-        printf("Match: %.4f%%  [thresh=%d]\n",
-               100.0 * (double)thresh_totals[best_ti] / size,
-               THRESHOLDS[best_ti]);
-
         /* apply transform in-place — each segment is independent */
         int best_thresh = THRESHOLDS[best_ti];
         #pragma omp parallel for schedule(static)
@@ -158,35 +143,37 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* per-pass stats */
         int below = 0;
         for (int i = 0; i < size; i++) if (work[i] < 128) below++;
-        printf("Entropy: %.6f   bytes<128: %d (%.2f%%)  improved: %d\n\n",
-               byteEntropy(work, size), below, 100.0 * below / size,
-               below_prev - below);
 
-        total_header += 1 + SEED_BYTES;   /* 1 thresh byte + seed array */
+        float cur_entropy = byteEntropy(work, size);
+        int   gain_bytes  = (int)((prev_entropy - cur_entropy) * size / 8.0f + 0.5f);
+        int   pass_cost   = 1 + SEED_BYTES;
+        int   net         = gain_bytes - pass_cost;
 
-        int improved = below_prev - below;
-        if (improved <= 1 + SEED_BYTES) {
-            printf("Header cost (%d) >= improvement (%d) — stopping after %d pass(es).\n\n",
-                   1 + SEED_BYTES, improved, pass + 1);
-            /* undo this pass's header cost since it wasn't worthwhile */
-            total_header -= 1 + SEED_BYTES;
+        total_header += pass_cost;
+
+        if (gain_bytes <= pass_cost) {
+            printf("Pass %-2d  gain: %4dB  header: %3d  net: %+5d  [stopped]\n",
+                   pass + 1, gain_bytes, pass_cost, net);
+            total_header -= pass_cost;
             break;
         }
+        printf("Pass %-2d  gain: %4dB  header: %3d  net: %+5d\n",
+               pass + 1, gain_bytes, pass_cost, net);
+        prev_entropy = cur_entropy;
         below_prev = below;
     }
 
-    printf("Total header cost: %d bytes (%d pass(es) x (1 + %d))\n",
-           total_header, total_header / (1 + SEED_BYTES), SEED_BYTES);
-    printf("HEADER_BYTES=%d\n", total_header);
+    int total_gain = (int)((orig_entropy - prev_entropy) * size / 8.0f + 0.5f);
+    printf("\nTotal profit: %+d bytes  (header: %d)\n",
+           total_gain - total_header, total_header);
+    printf("Final entropy: %.6f  (was %.6f)\n", prev_entropy, orig_entropy);
 
     FILE *fout = fopen(OUT_PATH, "wb");
     if (fout) {
         fwrite(work, 1, size, fout);
         fclose(fout);
-        printf("Wrote %d bytes -> %s\n", size, OUT_PATH);
     } else {
         fprintf(stderr, "Cannot write %s\n", OUT_PATH);
     }
