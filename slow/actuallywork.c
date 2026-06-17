@@ -58,8 +58,11 @@ enum {
     T_NIBLUT,    /* low-nibble permutation LUT: lut[0..7] in amp (4 bits each), lut[8..15] in stride */
     T_NIBCXOR,   /* cross-nibble XOR: amp=0 → lo^=hi, amp=1 → hi^=lo; self-inverse; stride/phase */
     T_CRMBCXOR,  /* cross-crumb XOR: XOR 2-bit crumb k with crumb j; amp=j|(k<<2); self-inverse */
+    T_GRAYCODE,  /* Gray code: v→v^(v>>1); inverse via successive XOR-shifts; stride/phase     */
+    T_BITASWAP,  /* swap adjacent bits: (v&0xAA)>>1 | (v&0x55)<<1; self-inverse; stride/phase */
+    T_PRNGFLIP,  /* PRNG byte flip: xs16 LSB per byte; if 1 apply ~d[i], else no-op; amp=seed */
     T_REFLECT,   /* Elias remap around mode M: r=(v-M) signed, out=r>=0?2r:(-2r-1); amp=M    */
-    NTYPES       /* = 19 */
+    NTYPES       /* = 23 */
 };
 
 typedef struct { u8 type; int stride, phase; u32 amp; } Instr;
@@ -124,6 +127,9 @@ static double entropy_bits(const u8 *d, int n) {
 #define OH_NIBLUT         (TAGB + 64.0)         /* 16 × 4-bit LUT entries */
 #define OH_NIBCXOR_BASE   (TAGB + SB + 1.0)     /* 1 direction bit + stride/phase */
 #define OH_CRMBCXOR_BASE  (TAGB + SB + 4.0)     /* 2+2 bits for crumb indices j,k */
+#define OH_GRAYCODE_BASE  (TAGB + SB)            /* no amp — fixed bijection */
+#define OH_BITASWAP_BASE  (TAGB + SB)            /* swap adjacent bits — no amp */
+#define OH_PRNGFLIP       (TAGB + 16.0)          /* one 16-bit seed, no stride/phase */
 /* Stride-adaptive phase cost: log2(s) bits for phase in [0,s). Use in search loops. */
 static inline double pb_bits(int s) { return (s > 1) ? log2((double)s) : 0.0; }
 #define OH_SP(base, s)  ((base) + pb_bits(s))
@@ -372,6 +378,36 @@ static void ap_bitrev(u8 *d, int n, int s, int p) {
     for (int i = p; i < n; i += s) d[i] = bitrev8(d[i]);
 }
 
+/* GRAY_CODE: encode each byte as its 8-bit Gray code: v → v ^ (v>>1).
+ * Consecutive integers differ by exactly 1 bit, so clusters of nearby values
+ * map to codes sharing many bits.
+ * Inverse: decode via xor-prefix-sum: g ^= g>>4; g ^= g>>2; g ^= g>>1. */
+static inline u8 gray_enc(u8 v) { return (u8)(v ^ (v >> 1)); }
+static inline u8 gray_dec(u8 g) { g ^= (g >> 4); g ^= (g >> 2); g ^= (g >> 1); return g; }
+static void ap_graycode(u8 *d, int n, int s, int p) {
+    for (int i = p; i < n; i += s) d[i] = gray_enc(d[i]);
+}
+static void inv_graycode(u8 *d, int n, int s, int p) {
+    for (int i = p; i < n; i += s) d[i] = gray_dec(d[i]);
+}
+
+/* BIT_ADJ_SWAP: swap adjacent bits within each byte at stride/phase positions.
+ * Bit 0↔1, 2↔3, 4↔5, 6↔7: v = ((v & 0xAA)>>1) | ((v & 0x55)<<1). Self-inverse. */
+static void ap_bitaswap(u8 *d, int n, int s, int p) {
+    for (int i = p; i < n; i += s)
+        d[i] = (u8)(((d[i] & 0xAA) >> 1) | ((d[i] & 0x55) << 1));
+}
+
+/* PRNG_FLIP: for each byte, generate 1 bit from xs16 PRNG; if 1, apply bitwise NOT.
+ * amp = 16-bit seed. Self-inverse (same PRNG sequence, same flip/no-op decisions). */
+static void ap_prngflip(u8 *d, int n, u32 amp) {
+    u16 s = (u16)(amp & 0xFFFF);
+    for (int i = 0; i < n; i++) {
+        u16 r = xs16_next(&s);
+        if (r & 1) d[i] ^= 0xFF;
+    }
+}
+
 /* REFLECT: Elias-style bijection centered on mode M.
  * r = (int8_t)(v - M); out = (r >= 0) ? 2*r : -2*r - 1
  * Maps: M→0, M±1→2/1, M±2→4/3, ..., M+127→254, M-128→255. Bijective on 0..255. */
@@ -411,6 +447,9 @@ static void apply_instr(u8 *d, int n, Instr t) {
         case T_NIBLUT:    ap_niblut(d, n, t.amp, t.stride); break;
         case T_NIBCXOR:   ap_nibcxor(d, n, t.stride, t.phase, t.amp); break;
         case T_CRMBCXOR:  ap_crmbcxor(d, n, t.stride, t.phase, t.amp); break;
+        case T_GRAYCODE:  ap_graycode(d, n, t.stride, t.phase); break;
+        case T_BITASWAP:  ap_bitaswap(d, n, t.stride, t.phase); break;
+        case T_PRNGFLIP:  ap_prngflip(d, n, t.amp); break;
         case T_REFLECT:   ap_reflect(d, n, (u8)t.amp); break;
     }
 }
@@ -435,6 +474,9 @@ static void invert_instr(u8 *d, int n, Instr t) {
         case T_NIBLUT:    inv_niblut(d, n, t.amp, t.stride); break;
         case T_NIBCXOR:   ap_nibcxor(d, n, t.stride, t.phase, t.amp); break;  /* self-inv */
         case T_CRMBCXOR:  ap_crmbcxor(d, n, t.stride, t.phase, t.amp); break; /* self-inv */
+        case T_GRAYCODE:  inv_graycode(d, n, t.stride, t.phase); break;
+        case T_BITASWAP:  ap_bitaswap(d, n, t.stride, t.phase); break;  /* self-inv */
+        case T_PRNGFLIP:  ap_prngflip(d, n, t.amp); break;              /* self-inv */
         case T_REFLECT:   inv_reflect(d, n, (u8)t.amp); break;
     }
 }
@@ -988,6 +1030,65 @@ static double search_nibcxor(const u8 *d, int n, double Sb, Instr *out) {
     return best;
 }
 
+/* PRNG_FLIP: seed scan; for each seed simulate flip/no-op and compute output freq. */
+static double search_prngflip(const u8 *d, int n, double Sb, Instr *out) {
+    double best = -1e18; u32 bseed = 1;
+    for (u32 seed = 1; seed < PRNG_SEEDS; seed++) {
+        u16 s = (u16)seed;
+        int f[256] = {0};
+        for (int i = 0; i < n; i++) {
+            u16 r = xs16_next(&s);
+            f[(r & 1) ? (d[i] ^ 0xFF) : d[i]]++;
+        }
+        double net = (S_from_freq(f) - Sb) - OH_PRNGFLIP;
+        if (net > best) { best = net; bseed = seed; }
+    }
+    out->type = T_PRNGFLIP; out->stride = 0; out->phase = 0; out->amp = bseed;
+    return best;
+}
+
+/* GRAY_CODE: try all stride/phase; use freq-table permutation trick. */
+static double search_graycode(const u8 *d, int n, double Sb, Instr *out) {
+    int total[256]; freq_of(d, n, total);
+    /* precompute gray_enc permutation table */
+    int gmap[256];
+    for (int v = 0; v < 256; v++) gmap[v] = gray_enc((u8)v);
+    double best = -1e18; int bs = 1, bp = 0;
+    for (int s = 1; s <= g_stride_lim; s++) {
+        double oh = OH_SP(OH_GRAYCODE_BASE, s);
+        for (int p = 0; p < s; p++) {
+            int rf[256];
+            for (int v = 0; v < 256; v++) rf[v] = total[v];
+            for (int i = p; i < n; i += s) { rf[d[i]]--; rf[gmap[d[i]]]++; }
+            double net = (S_from_freq(rf) - Sb) - oh;
+            if (net > best) { best = net; bs = s; bp = p; }
+        }
+    }
+    out->type = T_GRAYCODE; out->stride = bs; out->phase = bp; out->amp = 0;
+    return best;
+}
+
+/* BIT_ADJ_SWAP: fixed bijection, freq-table trick. */
+static double search_bitaswap(const u8 *d, int n, double Sb, Instr *out) {
+    int total[256]; freq_of(d, n, total);
+    double best = -1e18; int bs = 1, bp = 0;
+    for (int s = 1; s <= g_stride_lim; s++) {
+        double oh = OH_SP(OH_BITASWAP_BASE, s);
+        for (int p = 0; p < s; p++) {
+            int rf[256];
+            for (int v = 0; v < 256; v++) rf[v] = total[v];
+            for (int i = p; i < n; i += s) {
+                u8 w = (u8)(((d[i] & 0xAA) >> 1) | ((d[i] & 0x55) << 1));
+                rf[d[i]]--; rf[w]++;
+            }
+            double net = (S_from_freq(rf) - Sb) - oh;
+            if (net > best) { best = net; bs = s; bp = p; }
+        }
+    }
+    out->type = T_BITASWAP; out->stride = bs; out->phase = bp; out->amp = 0;
+    return best;
+}
+
 /* CRUMB_CROSS_XOR: try all 12 ordered (j,k) pairs at every stride/phase. */
 static double search_crmbcxor(const u8 *d, int n, double Sb, Instr *out) {
     int total[256]; freq_of(d, n, total);
@@ -1156,12 +1257,16 @@ static const InstrDesc REGISTRY[] = {
     { "NIBBLE_LUT", search_niblut,    0 },
     { "NIB_CXOR",   search_nibcxor,   0 },
     { "CRMB_CXOR",  search_crmbcxor,  0 },
+    { "GRAY_CODE",  search_graycode,  0 },
+    { "BIT_ASWAP",  search_bitaswap,  0 },
+    { "PRNG_FLIP",  search_prngflip,  1 },
 };
 #define NREG ((int)(sizeof(REGISTRY)/sizeof(REGISTRY[0])))
 static const char *TYPE_NAME[NTYPES] = {
     "XOR_PHASE","ADD_NIBS","QUAD_ADD","PRNG_DUAL","OCT_NIBX",
     "STRIDE_ADD","PRNG_BIT","BYTE_ROT","HALF_XOR","HALF_ADD","BYTE_MUL",
-    "TRIPLE_XOR","VALUE_XOR","BIT_REV","BP_XOR","PRNG_ADD","NIBBLE_LUT","NIB_CXOR","CRMB_CXOR","REFLECT"
+    "TRIPLE_XOR","VALUE_XOR","BIT_REV","BP_XOR","PRNG_ADD","NIBBLE_LUT","NIB_CXOR","CRMB_CXOR",
+    "GRAY_CODE","BIT_ASWAP","PRNG_FLIP","REFLECT"
 };
 
 
@@ -1329,7 +1434,10 @@ static int selftest(void) {
         { T_NIBCXOR, 3, 1, 0 },  /* dir=0: lo ^= hi */
         { T_NIBCXOR,  3, 1, 1 },          /* dir=1: hi ^= lo */
         { T_CRMBCXOR, 3, 1, (0|(2<<2)) }, /* j=0 (bits[1:0]), k=2 (bits[5:4]) */
-        { T_REFLECT,  0, 0, 0x40u },
+        { T_GRAYCODE,  3, 1, 0 },
+        { T_BITASWAP,  3, 1, 0 },
+        { T_PRNGFLIP,  0, 0, 1234u },
+        { T_REFLECT,   0, 0, 0x40u },
     };
     int nt = (int)(sizeof(tv) / sizeof(tv[0])), fails = 0;
     for (int i = 0; i < nt; i++) {
