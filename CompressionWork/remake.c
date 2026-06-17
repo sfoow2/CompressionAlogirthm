@@ -235,11 +235,26 @@ int main(int argc, char **argv) {
     printf("Final entropy: %.6f  (was %.6f)\n", prev_entropy, orig_entropy);
 
     FILE *fout = fopen(OUT_PATH, "wb");
-    if (fout) {
-        fwrite(work, 1, size, fout);
-        fclose(fout);
+    if (fout) { fwrite(work, 1, size, fout); fclose(fout); }
+    else       { fprintf(stderr, "Cannot write %s\n", OUT_PATH); }
+
+    const char *OH_PATH = "C:/Users/lukac/Documents/compressor/overhead.bin";
+    FILE *foh = fopen(OH_PATH, "wb");
+    if (foh) {
+        uint8_t  np  = (uint8_t)n_passes;
+        fwrite(&np, 1, 1, foh);
+        for (int p = 0; p < n_passes; p++) {
+            uint16_t sb16  = (uint16_t)passes[p].sb;
+            uint8_t  th8   = (uint8_t) passes[p].thresh;
+            fwrite(&sb16, 2, 1,             foh);
+            fwrite(&th8,  1, 1,             foh);
+            fwrite(passes[p].seeds, 1, passes[p].sb, foh);
+        }
+        long oh_size = ftell(foh);
+        fclose(foh);
+        printf("overhead.bin: %ld bytes\n", oh_size);
     } else {
-        fprintf(stderr, "Cannot write %s\n", OUT_PATH);
+        fprintf(stderr, "Cannot write %s\n", OH_PATH);
     }
 
     free(bits);
