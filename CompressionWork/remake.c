@@ -4,6 +4,8 @@
 #include <string.h>
 #include <math.h>
 #include <omp.h>
+#include <windows.h>
+#include <bcrypt.h>
 
 typedef uint8_t  u8;
 typedef uint64_t u64;
@@ -65,9 +67,7 @@ int main(int argc, char **argv) {
 
     int size = argc > 1 ? atoi(argv[1]) : 65536;
     u8 *data = malloc(size);
-    srand(17);
-    for (int x = 0; x < size; x++)
-        data[x] = rand() % 256;
+    BCryptGenRandom(NULL, data, size, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
 
     float orig_entropy = byteEntropy(data, size);
     printf("Original entropy = %.6f\n", orig_entropy);
