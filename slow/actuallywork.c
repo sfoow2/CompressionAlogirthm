@@ -1285,7 +1285,6 @@ static int try_scramble(u8 *d, int n, Instr *ilist, double *nets, int *ni, int v
     double best_gain = 0.0, best_edelta = 0.0;
 
     g_fast_search = 1;
-    g_stride_lim  = 8;   /* cap stride in lookahead to keep each search call ~1ms */
     for (int si = 0; si < 14; si++) {
         u8 scbuf[BLOCK];
         memcpy(scbuf, d, n);
@@ -1294,10 +1293,10 @@ static int try_scramble(u8 *d, int n, Instr *ilist, double *nets, int *ni, int v
         int fsc[256]; freq_of(scbuf, n, fsc);
         double edelta = S_from_freq(fsc) - Sb;
 
-        /* 5-iter lookahead (fast mode: no slow PRNG searches) */
+        /* 3-iter lookahead: ~15 bits unlocked on average, well above OH_SCRAMBLE=9 */
         u8 tmp[BLOCK]; memcpy(tmp, scbuf, n);
         double unlocked = 0.0;
-        for (int iter = 0; iter < 5; iter++) {
+        for (int iter = 0; iter < 3; iter++) {
             Instr t; double net = best_instr(tmp, n, &t);
             if (net <= 0.0) break;
             apply_instr(tmp, n, t);
@@ -1308,7 +1307,6 @@ static int try_scramble(u8 *d, int n, Instr *ilist, double *nets, int *ni, int v
         if (gain > best_gain) { best_gain = gain; best_si = si; best_edelta = edelta; }
     }
     g_fast_search = 0;
-    g_stride_lim  = MAX_STRIDE;
 
     if (best_si < 0) return 0;
 
