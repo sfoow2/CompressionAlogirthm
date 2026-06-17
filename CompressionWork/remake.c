@@ -43,6 +43,11 @@ static float lowerBitsEntropy(const u8 *d, int n) {
     return (float)e;
 }
 
+#define MAX_SB     512
+#define MAX_PASSES  32
+
+typedef struct { int sb; int thresh; u8 seeds[MAX_SB]; } PassParams;
+
 static float byteEntropy(const u8 *d, int n) {
     int freq[256] = {0};
     for (int i = 0; i < n; i++) freq[d[i]]++;
@@ -58,9 +63,7 @@ static float byteEntropy(const u8 *d, int n) {
 int main(int argc, char **argv) {
     const char *OUT_PATH = "C:/Users/lukac/Documents/compressor/transformed.bin";
 
-#define MAX_SB 512
-
-    int size = 4096;
+    int size = argc > 1 ? atoi(argv[1]) : 65536;
     u8 *data = malloc(size);
     srand(17);
     for (int x = 0; x < size; x++)
@@ -77,6 +80,10 @@ int main(int argc, char **argv) {
 
     u8 cand_seeds[4][MAX_SB];
     u8 best_seeds[MAX_SB];
+
+    PassParams passes[MAX_PASSES];
+    u8        *pass_bits[MAX_PASSES];
+    int        n_passes = 0;
 
     int   total_header = 0;
     float prev_entropy = orig_entropy;
@@ -183,10 +190,44 @@ int main(int argc, char **argv) {
             }
         }
 
+        passes[n_passes].sb     = best_sb;
+        passes[n_passes].thresh = best_thresh_val;
+        memcpy(passes[n_passes].seeds, best_seeds, best_sb);
+        pass_bits[n_passes] = malloc(bits_len);
+        memcpy(pass_bits[n_passes], bits, bits_len);
+        n_passes++;
+
         printf("Pass %-2d  gain: %4dB  header: %3d  net: %+5d  (sb=%d)\n",
                pass + 1, best_gain, pcost, best_net, best_sb);
         prev_entropy = best_ent_after;
     }
+
+    /* decode: replay passes in reverse; undo |= 0x80 only where the bitstream
+       said byte was originally < 128 (PRNG=1 on >=128 bytes was a no-op) */
+    u8 *decoded = malloc(size);
+    memcpy(decoded, work, size);
+    for (int p = n_passes - 1; p >= 0; p--) {
+        int sb     = passes[p].sb;
+        int thresh = passes[p].thresh;
+        for (int seg = 0; seg < sb; seg++) {
+            int seg_start = (int)((int64_t)seg       * size / sb);
+            int seg_end   = (int)((int64_t)(seg + 1) * size / sb);
+            DispGen g = { (u64)passes[p].seeds[seg] * 2654435761ULL
+                          + 1442695040888963407ULL, 0 };
+            for (int i = seg_start; i < seg_end; i++) {
+                int was_below = (pass_bits[p][i / 8] >> (7 - (i % 8))) & 1;
+                if (disp_next_t(&g, thresh) == 1 && was_below)
+                    decoded[i] &= ~0x80;
+            }
+        }
+        free(pass_bits[p]);
+    }
+    int mismatches = 0;
+    for (int i = 0; i < size; i++)
+        if (decoded[i] != data[i]) mismatches++;
+    printf("\nDecode: %s", mismatches == 0 ? "OK — round-trip verified\n" : "FAIL\n");
+    if (mismatches) printf("  %d mismatches\n", mismatches);
+    free(decoded);
 
     int total_gain = (int)((orig_entropy - prev_entropy) * size / 8.0f + 0.5f);
     printf("\nTotal profit: %+d bytes  (header: %d)\n",
