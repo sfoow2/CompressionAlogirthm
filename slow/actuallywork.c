@@ -42,7 +42,6 @@ enum {
     T_XORP = 0,  /* XOR amp at (stride,phase) subset       */
     T_ANIBS,     /* nibble-wise add (lo+=al, hi+=ah)       */
     T_QUADADD,   /* 4-way pos split, 4 ADD amps            */
-    T_PRNGD,     /* PRNG dual: even/odd pos XOR two xs16 seeds  */
     T_OCTNIBX,   /* 8-way pos split, 8 nibble (lo-nibble only) XOR amps */
     T_STRIDEADD, /* ADD amp (nonzero) at (stride,phase) subset, stride in 1..64 */
     T_PRNGBIT,   /* PRNG selects bit pos (0-7) per byte; XOR that bit with (amp>>bit_pos)&1 */
@@ -60,9 +59,12 @@ enum {
     T_CRMBCXOR,  /* cross-crumb XOR: XOR 2-bit crumb k with crumb j; amp=j|(k<<2); self-inverse */
     T_GRAYCODE,  /* Gray code: v→v^(v>>1); inverse via successive XOR-shifts; stride/phase     */
     T_BITASWAP,  /* swap adjacent bits: (v&0xAA)>>1 | (v&0x55)<<1; self-inverse; stride/phase */
-    T_PRNGFLIP,  /* PRNG byte flip: xs16 LSB per byte; if 1 apply ~d[i], else no-op; amp=seed */
-    T_REFLECT,   /* Elias remap around mode M: r=(v-M) signed, out=r>=0?2r:(-2r-1); amp=M    */
-    NTYPES       /* = 23 */
+    T_PRNGFLIP,   /* PRNG byte flip: xs16 LSB per byte; if 1 apply ~d[i], else no-op; amp=seed  */
+    T_PLANEPRNG,  /* per-bit-plane PRNG XOR: XOR bit k with xs16 LSB; amp=seed|(k<<16)         */
+    T_PLANEDELTA, /* bit-plane delta at stride: d[i] bit k ^= d[i-s] bit k; amp=k; RTL forward */
+    T_PRNGXLOC,   /* PRNG local XOR: walk pos+=(xs16&smask)+1, d[pos]^=xb; amp=seed|(xb<<16)|(midx<<24) */
+    T_REFLECT,    /* Elias remap around mode M: r=(v-M) signed, out=r>=0?2r:(-2r-1); amp=M     */
+    NTYPES        /* = 25 */
 };
 
 typedef struct { u8 type; int stride, phase; u32 amp; } Instr;
@@ -111,7 +113,6 @@ static double entropy_bits(const u8 *d, int n) {
 #define OH_XORP_BASE    (TAGB + SB + 8.0)
 #define OH_NIBS_BASE    (TAGB + SB + 8.0)
 #define OH_QUAD_BASE    (TAGB + SB + 32.0)
-#define OH_PRNGD        (TAGB + 32.0)       /* 2 independent 16-bit seeds, no stride/phase */
 #define OH_OCTNIBX_BASE (TAGB + SB + 32.0) /* 8 bands * 4-bit lo-nibble XOR amp each */
 #define OH_STRIDEADD_BASE (TAGB + SB + 8.0)
 #define OH_PRNGBIT      (TAGB + 16.0 + 8.0) /* 16-bit seed + 8-bit flip-mask, no stride/phase */
@@ -129,7 +130,10 @@ static double entropy_bits(const u8 *d, int n) {
 #define OH_CRMBCXOR_BASE  (TAGB + SB + 4.0)     /* 2+2 bits for crumb indices j,k */
 #define OH_GRAYCODE_BASE  (TAGB + SB)            /* no amp — fixed bijection */
 #define OH_BITASWAP_BASE  (TAGB + SB)            /* swap adjacent bits — no amp */
-#define OH_PRNGFLIP       (TAGB + 16.0)          /* one 16-bit seed, no stride/phase */
+#define OH_PRNGFLIP        (TAGB + 16.0)          /* one 16-bit seed, no stride/phase */
+#define OH_PLANEPRNG       (TAGB + 19.0)          /* 16-bit seed + 3-bit plane index k */
+#define OH_PLANEDELTA_BASE (TAGB + SB + 3.0)      /* 6-bit stride + 3-bit plane index k, no phase */
+#define OH_PRNGXLOC        (TAGB + 27.0)           /* 16-bit seed + 8-bit XOR byte + 3-bit step-mask index */
 /* Stride-adaptive phase cost: log2(s) bits for phase in [0,s). Use in search loops. */
 static inline double pb_bits(int s) { return (s > 1) ? log2((double)s) : 0.0; }
 #define OH_SP(base, s)  ((base) + pb_bits(s))
@@ -264,13 +268,6 @@ static void inv_quadadd(u8 *d, int n, int s, int p, u32 amp) {
     for (int i = p; i < n; i += s, k++) d[i] = (u8)(d[i] - a[k & 3]);
 }
 /* PRNG dual: even positions XOR xs16(seed1), odd positions XOR xs16(seed2). Self-inverse. */
-static void ap_prngd(u8 *d, int n, u32 amp) {
-    u16 s1 = (u16)(amp & 0xFFFF), s2 = (u16)((amp >> 16) & 0xFFFF);
-    for (int i = 0; i < n; i++) {
-        u8 b = (i & 1) ? xs16_next(&s2) : xs16_next(&s1);
-        d[i] ^= b;
-    }
-}
 /* 8-way position split (k % 8), lo-nibble-only XOR per band. Self-inverse. */
 static void ap_octnibx(u8 *d, int n, int s, int p, u32 amp) {
     u8 x[8];
@@ -408,6 +405,43 @@ static void ap_prngflip(u8 *d, int n, u32 amp) {
     }
 }
 
+/* PLANE_PRNG: for bit plane k, XOR each byte's bit k with xs16 LSB. Self-inverse. */
+static void ap_planeprng(u8 *d, int n, u32 amp) {
+    u16 s = (u16)(amp & 0xFFFF);
+    u8 kmask = (u8)(1u << ((amp >> 16) & 7));
+    for (int i = 0; i < n; i++) {
+        u16 r = xs16_next(&s);
+        if (r & 1) d[i] ^= kmask;
+    }
+}
+
+/* PLANE_DELTA: delta-encode bit plane k at stride s.
+ * Forward (right-to-left, non-recursive): d[i] bit k ^= d[i-s] bit k.
+ * Inverse (left-to-right): same operation using already-restored d[i-s]. */
+static void ap_planedelta(u8 *d, int n, int s, int k) {
+    for (int i = n - 1; i >= s; i--)
+        d[i] ^= (u8)(((d[i-s] >> k) & 1) << k);
+}
+static void inv_planedelta(u8 *d, int n, int s, int k) {
+    for (int i = s; i < n; i++)
+        d[i] ^= (u8)(((d[i-s] >> k) & 1) << k);
+}
+
+/* PRNG_XLOC: local walk XOR. amp = seed(0-15) | xb(16-23) | midx(24-26).
+ * midx selects step mask from {1,3,7,15,31,63,127,255} → step ranges {1-2..1-256}.
+ * Self-inverse: same walk replayed from seed undoes all XORs. */
+static const int XLOC_MASKS[8] = {1, 3, 7, 15, 31, 63, 127, 255};
+static void ap_prngxloc(u8 *d, int n, u32 amp) {
+    u16 s = (u16)(amp & 0xFFFF);
+    u8 xb = (u8)(amp >> 16);
+    int smask = XLOC_MASKS[(amp >> 24) & 7];
+    int nm1 = n - 1, pos = 0;
+    for (int i = 0; i < n; i++) {
+        pos = (pos + (xs16_next(&s) & smask) + 1) & nm1;
+        d[pos] ^= xb;
+    }
+}
+
 /* REFLECT: Elias-style bijection centered on mode M.
  * r = (int8_t)(v - M); out = (r >= 0) ? 2*r : -2*r - 1
  * Maps: M→0, M±1→2/1, M±2→4/3, ..., M+127→254, M-128→255. Bijective on 0..255. */
@@ -431,7 +465,6 @@ static void apply_instr(u8 *d, int n, Instr t) {
         case T_XORP:      ap_xorp(d, n, t.stride, t.phase, t.amp); break;
         case T_ANIBS:     ap_anibs(d, n, t.stride, t.phase, t.amp); break;
         case T_QUADADD:   ap_quadadd(d, n, t.stride, t.phase, t.amp); break;
-        case T_PRNGD:     ap_prngd(d, n, t.amp); break;
         case T_OCTNIBX:   ap_octnibx(d, n, t.stride, t.phase, t.amp); break;
         case T_STRIDEADD: ap_strideadd(d, n, t.stride, t.phase, t.amp); break;
         case T_PRNGBIT:   ap_prngbit(d, n, t.amp); break;
@@ -449,8 +482,11 @@ static void apply_instr(u8 *d, int n, Instr t) {
         case T_CRMBCXOR:  ap_crmbcxor(d, n, t.stride, t.phase, t.amp); break;
         case T_GRAYCODE:  ap_graycode(d, n, t.stride, t.phase); break;
         case T_BITASWAP:  ap_bitaswap(d, n, t.stride, t.phase); break;
-        case T_PRNGFLIP:  ap_prngflip(d, n, t.amp); break;
-        case T_REFLECT:   ap_reflect(d, n, (u8)t.amp); break;
+        case T_PRNGFLIP:   ap_prngflip(d, n, t.amp); break;
+        case T_PLANEPRNG:  ap_planeprng(d, n, t.amp); break;
+        case T_PLANEDELTA: ap_planedelta(d, n, t.stride, (int)t.amp); break;
+        case T_PRNGXLOC:   ap_prngxloc(d, n, t.amp); break;
+        case T_REFLECT:    ap_reflect(d, n, (u8)t.amp); break;
     }
 }
 static void invert_instr(u8 *d, int n, Instr t) {
@@ -458,7 +494,6 @@ static void invert_instr(u8 *d, int n, Instr t) {
         case T_XORP:      ap_xorp(d, n, t.stride, t.phase, t.amp); break;      /* self-inv */
         case T_ANIBS:     inv_anibs(d, n, t.stride, t.phase, t.amp); break;
         case T_QUADADD:   inv_quadadd(d, n, t.stride, t.phase, t.amp); break;
-        case T_PRNGD:     ap_prngd(d, n, t.amp); break;                        /* self-inv */
         case T_OCTNIBX:   ap_octnibx(d, n, t.stride, t.phase, t.amp); break;  /* self-inv */
         case T_STRIDEADD: inv_strideadd(d, n, t.stride, t.phase, t.amp); break;
         case T_PRNGBIT:   ap_prngbit(d, n, t.amp); break;                      /* self-inv */
@@ -476,8 +511,11 @@ static void invert_instr(u8 *d, int n, Instr t) {
         case T_CRMBCXOR:  ap_crmbcxor(d, n, t.stride, t.phase, t.amp); break; /* self-inv */
         case T_GRAYCODE:  inv_graycode(d, n, t.stride, t.phase); break;
         case T_BITASWAP:  ap_bitaswap(d, n, t.stride, t.phase); break;  /* self-inv */
-        case T_PRNGFLIP:  ap_prngflip(d, n, t.amp); break;              /* self-inv */
-        case T_REFLECT:   inv_reflect(d, n, (u8)t.amp); break;
+        case T_PRNGFLIP:   ap_prngflip(d, n, t.amp); break;                       /* self-inv */
+        case T_PLANEPRNG:  ap_planeprng(d, n, t.amp); break;                      /* self-inv */
+        case T_PLANEDELTA: inv_planedelta(d, n, t.stride, (int)t.amp); break;
+        case T_PRNGXLOC:   ap_prngxloc(d, n, t.amp); break;   /* self-inv */
+        case T_REFLECT:    inv_reflect(d, n, (u8)t.amp); break;
     }
 }
 
@@ -600,47 +638,6 @@ static double search_ksplit_add(const u8 *d, int n, double Sb, Instr *out, int K
 }
 static double search_quadadd(const u8 *d, int n, double Sb, Instr *out) {
     return search_ksplit_add(d, n, Sb, out, 4, T_QUADADD, OH_QUAD_BASE);
-}
-/* PRNG dual: two xs16 seeds for even/odd positions; coord descent */
-static double search_prngd(const u8 *d, int n, double Sb, Instr *out) {
-    double best = -1e18;
-    u16 best_s1 = 1, best_s2 = 1;
-    /* pass 1: fix s2=1, scan s1 */
-    for (u32 seed = 1; seed < PRNG_SEEDS; seed++) {
-        int f[256] = {0};
-        u16 s1 = (u16)seed, s2 = 1;
-        for (int i = 0; i < n; i++) {
-            u8 b = (i & 1) ? xs16_next(&s2) : xs16_next(&s1);
-            f[d[i] ^ b]++;
-        }
-        double net = (S_from_freq(f) - Sb) - OH_PRNGD;
-        if (net > best) { best = net; best_s1 = (u16)seed; }
-    }
-    /* pass 2: fix best s1, scan s2 */
-    for (u32 seed = 1; seed < PRNG_SEEDS; seed++) {
-        int f[256] = {0};
-        u16 s1 = best_s1, s2 = (u16)seed;
-        for (int i = 0; i < n; i++) {
-            u8 b = (i & 1) ? xs16_next(&s2) : xs16_next(&s1);
-            f[d[i] ^ b]++;
-        }
-        double net = (S_from_freq(f) - Sb) - OH_PRNGD;
-        if (net > best) { best = net; best_s2 = (u16)seed; }
-    }
-    /* pass 3: second coordinate-descent round -- fix best s2, rescan s1 */
-    for (u32 seed = 1; seed < PRNG_SEEDS; seed++) {
-        int f[256] = {0};
-        u16 s1 = (u16)seed, s2 = best_s2;
-        for (int i = 0; i < n; i++) {
-            u8 b = (i & 1) ? xs16_next(&s2) : xs16_next(&s1);
-            f[d[i] ^ b]++;
-        }
-        double net = (S_from_freq(f) - Sb) - OH_PRNGD;
-        if (net > best) { best = net; best_s1 = (u16)seed; }
-    }
-    out->type = T_PRNGD; out->stride = 0; out->phase = 0;
-    out->amp = (u32)best_s1 | ((u32)best_s2 << 16);
-    return best;
 }
 /* 8-way position split (k%8), lo-nibble-only XOR amp per band -- finer position
  * granularity than QUAD_XOR at the same overhead, since amps are nibble- not byte-wide. */
@@ -1233,6 +1230,96 @@ static double search_bpxor(const u8 *d, int n, double Sb, Instr *out) {
     return best;
 }
 
+/* Shared amp-finder: given a parity mask (1=position gets XOR'd), try all 255 XOR bytes.
+ * f_bms[v] = base_freq[v] - count_s[v], so result freq = f_bms[v] + count_s[v^xb]. */
+static double find_best_xamp(const u8 *d, int n, const u8 *par,
+                               const int *base_freq, double Sb, int *xb_out) {
+    int count_s[256] = {0};
+    for (int i = 0; i < n; i++) if (par[i]) count_s[d[i]]++;
+    int f_bms[256];
+    for (int v = 0; v < 256; v++) f_bms[v] = base_freq[v] - count_s[v];
+    double best = -1e18; *xb_out = 1;
+    for (int xb = 1; xb < 256; xb++) {
+        double S = 0.0;
+        for (int v = 0; v < 256; v++) S += hlog[f_bms[v] + count_s[v ^ xb]];
+        double net = (S - Sb) - OH_PRNGXLOC;
+        if (net > best) { best = net; *xb_out = xb; }
+    }
+    return best;
+}
+
+/* Try all 4 step masks in parallel from the same xs16 stream per seed.
+ * Parity arrays are 4×4096 bytes (16 KB) — fits in L1. */
+static double search_prngxloc(const u8 *d, int n, double Sb, Instr *out) {
+    int base_freq[256]; freq_of(d, n, base_freq);
+    double best = -1e18; u32 bseed = 1; int bxb = 1, bmidx = 2;
+    u8 par[8][BLOCK];
+    int nm1 = n - 1;
+    for (u32 seed = 1; seed < PRNG_SEEDS; seed++) {
+        u16 s = (u16)seed;
+        memset(par, 0, sizeof(par));
+        int pos[8] = {0,0,0,0,0,0,0,0};
+        for (int i = 0; i < n; i++) {
+            u16 r = xs16_next(&s);
+            for (int m = 0; m < 8; m++) {
+                pos[m] = (pos[m] + (r & XLOC_MASKS[m]) + 1) & nm1;
+                par[m][pos[m]] ^= 1;
+            }
+        }
+        for (int m = 0; m < 8; m++) {
+            int xb; double net = find_best_xamp(d, n, par[m], base_freq, Sb, &xb);
+            if (net > best) { best = net; bseed = seed; bxb = xb; bmidx = m; }
+        }
+    }
+    out->type = T_PRNGXLOC; out->stride = 0; out->phase = 0;
+    out->amp = (u32)bseed | ((u32)bxb << 16) | ((u32)(bmidx & 7) << 24);
+    return best;
+}
+
+/* PLANE_PRNG: for each xs16 seed, compute flip/noflip histograms once, then test all 8 planes. */
+static double search_planeprng(const u8 *d, int n, double Sb, Instr *out) {
+    double best = -1e18; int bk = 0; u32 bseed = 1;
+    for (u32 seed = 1; seed < PRNG_SEEDS; seed++) {
+        u16 s = (u16)seed;
+        int flip[256] = {0}, noflip[256] = {0};
+        for (int i = 0; i < n; i++) {
+            u16 r = xs16_next(&s);
+            if (r & 1) flip[d[i]]++;
+            else        noflip[d[i]]++;
+        }
+        for (int k = 0; k < 8; k++) {
+            int f[256] = {0};
+            int kmask = 1 << k;
+            for (int v = 0; v < 256; v++) {
+                f[v]         += noflip[v];
+                f[v ^ kmask] += flip[v];
+            }
+            double net = (S_from_freq(f) - Sb) - OH_PLANEPRNG;
+            if (net > best) { best = net; bk = k; bseed = seed; }
+        }
+    }
+    out->type = T_PLANEPRNG; out->stride = 0; out->phase = 0;
+    out->amp = bseed | ((u32)bk << 16);
+    return best;
+}
+
+/* PLANE_DELTA: try all 8 planes × all strides; simulate RTL delta in one pass. */
+static double search_planedelta(const u8 *d, int n, double Sb, Instr *out) {
+    double best = -1e18; int bk = 0, bs = 1;
+    for (int k = 0; k < 8; k++) {
+        for (int s = 1; s <= g_stride_lim; s++) {
+            int f[256] = {0};
+            for (int i = 0; i < s && i < n; i++) f[d[i]]++;
+            for (int i = s; i < n; i++)
+                f[d[i] ^ (u8)(((d[i-s] >> k) & 1) << k)]++;
+            double net = (S_from_freq(f) - Sb) - OH_PLANEDELTA_BASE;
+            if (net > best) { best = net; bk = k; bs = s; }
+        }
+    }
+    out->type = T_PLANEDELTA; out->stride = bs; out->phase = 0; out->amp = (u32)bk;
+    return best;
+}
+
 /* registry of selectable instructions */
 typedef double (*SearchFn)(const u8 *, int, double, Instr *);
 typedef struct { const char *name; SearchFn search; int slow; } InstrDesc;
@@ -1241,7 +1328,6 @@ static const InstrDesc REGISTRY[] = {
     { "XOR_PHASE",  search_xorp,      0 },
     { "ADD_NIBS",   search_anibs,     0 },
     { "QUAD_ADD",   search_quadadd,   0 },
-    { "PRNG_DUAL",  search_prngd,     1 },   /* slow: 65535-seed scan */
     { "OCT_NIBX",   search_octnibx,   0 },
     { "STRIDE_ADD", search_strideadd, 0 },
     { "PRNG_BIT",   search_prngbit,   1 },   /* slow: 65535-seed scan */
@@ -1259,14 +1345,18 @@ static const InstrDesc REGISTRY[] = {
     { "CRMB_CXOR",  search_crmbcxor,  0 },
     { "GRAY_CODE",  search_graycode,  0 },
     { "BIT_ASWAP",  search_bitaswap,  0 },
-    { "PRNG_FLIP",  search_prngflip,  1 },
+    { "PRNG_FLIP",   search_prngflip,   1 },
+    { "PLANE_PRNG",  search_planeprng,  1 }, /* slow: 65535-seed × 8 planes */
+    { "PLANE_DELTA", search_planedelta, 0 },
+    { "PRNG_XLOC",   search_prngxloc,   1 }, /* slow: 65535-seed × 4-masks × 255-amp */
 };
 #define NREG ((int)(sizeof(REGISTRY)/sizeof(REGISTRY[0])))
 static const char *TYPE_NAME[NTYPES] = {
-    "XOR_PHASE","ADD_NIBS","QUAD_ADD","PRNG_DUAL","OCT_NIBX",
+    "XOR_PHASE","ADD_NIBS","QUAD_ADD","OCT_NIBX",
     "STRIDE_ADD","PRNG_BIT","BYTE_ROT","HALF_XOR","HALF_ADD","BYTE_MUL",
     "TRIPLE_XOR","VALUE_XOR","BIT_REV","BP_XOR","PRNG_ADD","NIBBLE_LUT","NIB_CXOR","CRMB_CXOR",
-    "GRAY_CODE","BIT_ASWAP","PRNG_FLIP","REFLECT"
+    "GRAY_CODE","BIT_ASWAP","PRNG_FLIP","PLANE_PRNG","PLANE_DELTA",
+    "PRNG_XLOC","REFLECT"
 };
 
 
@@ -1416,7 +1506,6 @@ static int selftest(void) {
         { T_XORP,     3, 1, 0x5A },
         { T_ANIBS,    3, 1, 0x35 },
         { T_QUADADD,  3, 1, 0x11223344u },
-        { T_PRNGD,    0, 0, (1234u|(5678u<<16)) },
         { T_OCTNIBX,  3, 1, 0x12345678u },
         { T_STRIDEADD,3, 1, 0x37 },
         { T_PRNGBIT,  0, 0, (0xABCDu | (0xA5u << 16)) },
@@ -1436,8 +1525,11 @@ static int selftest(void) {
         { T_CRMBCXOR, 3, 1, (0|(2<<2)) }, /* j=0 (bits[1:0]), k=2 (bits[5:4]) */
         { T_GRAYCODE,  3, 1, 0 },
         { T_BITASWAP,  3, 1, 0 },
-        { T_PRNGFLIP,  0, 0, 1234u },
-        { T_REFLECT,   0, 0, 0x40u },
+        { T_PRNGFLIP,   0, 0, 1234u },
+        { T_PLANEPRNG,  0, 0, (1234u | (3u << 16)) },   /* seed=1234, plane k=3 */
+        { T_PLANEDELTA, 4, 0, 2u },                        /* stride=4, plane k=2 */
+        { T_PRNGXLOC,   0, 0, (1234u | (0x42u << 16) | (2u << 24)) }, /* seed=1234, xb=0x42, midx=2(mask=7) */
+        { T_REFLECT,    0, 0, 0x40u },
     };
     int nt = (int)(sizeof(tv) / sizeof(tv[0])), fails = 0;
     for (int i = 0; i < nt; i++) {
@@ -1458,9 +1550,40 @@ static Instr  g_ilist[MAXINSTR];
 static double g_nets[MAXINSTR];
 static int    g_last_ni = 0;
 
+/* overhead in bits for a single applied instruction (mirrors search OH formulas) */
+static double instr_oh(Instr t) {
+    switch (t.type) {
+        case T_XORP:      return OH_SP(OH_XORP_BASE,       t.stride);
+        case T_ANIBS:     return OH_SP(OH_NIBS_BASE,       t.stride);
+        case T_QUADADD:   return OH_SP(OH_QUAD_BASE,       t.stride);
+        case T_OCTNIBX:   return OH_SP(OH_OCTNIBX_BASE,    t.stride);
+        case T_STRIDEADD: return OH_SP(OH_STRIDEADD_BASE,  t.stride);
+        case T_PRNGBIT:   return OH_PRNGBIT;
+        case T_BYTEROT:   return OH_SP(OH_BYTEROT_BASE,    t.stride);
+        case T_HALFXOR:   return OH_SP(OH_HALFXOR_BASE,    t.stride);
+        case T_HALFADD:   return OH_SP(OH_HALFADD_BASE,    t.stride);
+        case T_BYTEMUL:   return OH_SP(OH_BYTEMUL_BASE,    t.stride);
+        case T_TRIPLEXOR: return OH_SP(OH_TRIPLEXOR_BASE,  t.stride);
+        case T_VALUEXOR:  return OH_SP(OH_VALUEXOR_BASE,   t.stride);
+        case T_BITREV:    return OH_SP(OH_BITREV_BASE,     t.stride);
+        case T_BPXOR:     return OH_BPXOR;
+        case T_PRNGADD:   return OH_PRNGADD;
+        case T_NIBLUT:    return OH_NIBLUT;
+        case T_NIBCXOR:   return OH_SP(OH_NIBCXOR_BASE,    t.stride);
+        case T_CRMBCXOR:  return OH_SP(OH_CRMBCXOR_BASE,   t.stride);
+        case T_GRAYCODE:  return OH_SP(OH_GRAYCODE_BASE,   t.stride);
+        case T_BITASWAP:  return OH_SP(OH_BITASWAP_BASE,   t.stride);
+        case T_PRNGFLIP:   return OH_PRNGFLIP;
+        case T_PLANEPRNG:  return OH_PLANEPRNG;
+        case T_PLANEDELTA: return OH_PLANEDELTA_BASE;
+        case T_PRNGXLOC:   return OH_PRNGXLOC;
+        default:           return 0.0;
+    }
+}
+
 /* reduce one block, verify round-trip, accumulate per-type counts + net stats */
 static double do_block(u8 *data, int n, int *counts,
-                       double *type_net_sum, double *type_net_max,
+                       double *type_net_sum, double *type_net_max, double *type_oh_sum,
                        int verbose, int *ok_out) {
     u8 orig[BLOCK];
     memcpy(orig, data, n);
@@ -1471,6 +1594,7 @@ static double do_block(u8 *data, int n, int *counts,
         counts[t]++;
         type_net_sum[t] += g_nets[i];
         if (g_nets[i] > type_net_max[t]) type_net_max[t] = g_nets[i];
+        type_oh_sum[t]  += instr_oh(g_ilist[i]);
     }
 
     u8 dec[BLOCK];
@@ -1509,6 +1633,7 @@ int main(int argc, char **argv) {
     int counts[NTYPES] = {0};
     double type_net_sum[NTYPES] = {0};
     double type_net_max[NTYPES];
+    double type_oh_sum[NTYPES]  = {0};
     for (int t = 0; t < NTYPES; t++) type_net_max[t] = 0.0;
     double total_net = 0.0, total_ein = 0.0, total_eout = 0.0;
     double total_overhead = 0.0;
@@ -1523,7 +1648,7 @@ int main(int argc, char **argv) {
         u8 *data = all + (size_t)b * BLOCK;
         double e_in = entropy_bits(data, BLOCK);
         int ok = 0;
-        double net = do_block(data, BLOCK, counts, type_net_sum, type_net_max, NB == 1, &ok);
+        double net = do_block(data, BLOCK, counts, type_net_sum, type_net_max, type_oh_sum, NB == 1, &ok);
         double e_out = entropy_bits(data, BLOCK);
         double raw  = e_in - e_out;
         double oh   = raw - net;
@@ -1533,6 +1658,20 @@ int main(int argc, char **argv) {
         printf("  block %2d: %.4f -> %.4f bps  net=%+.1f  %s  [%d instrs  raw=%+.1f  OH=%.1f bits]\n",
                b, e_in / BLOCK, e_out / BLOCK, net, ok ? "ok" : "FAIL",
                g_last_ni, raw, oh);
+        if (NB == 1) {
+            int fq[256]; freq_of(data, BLOCK, fq);
+            printf("\n--- frequency dump (compressed block) ---\n");
+            printf("  val  freq  |  val  freq  |  val  freq  |  val  freq\n");
+            for (int row = 0; row < 64; row++) {
+                for (int col = 0; col < 4; col++) {
+                    int v = row + col * 64;
+                    printf("  %3d %5d  ", v, fq[v]);
+                    if (col < 3) printf("|");
+                }
+                printf("\n");
+            }
+            printf("-----------------------------------------\n\n");
+        }
         fflush(stdout);
 
         /* serialise instructions for entropy measurement */
@@ -1569,16 +1708,18 @@ int main(int argc, char **argv) {
     free(ibuf);
     printf("round-trip: %s (%d/%d blocks)\n", fails ? "*** FAIL ***" : "OK", NB - fails, NB);
     printf("types fired (across all blocks): %d / %d\n\n", fired, NTYPES);
-    printf("  %-14s %6s  %8s  %8s\n", "type", "fires", "avg net", "top net");
-    printf("  %-14s %6s  %8s  %8s\n", "----", "-----", "-------", "-------");
+    printf("  %-14s %6s  %8s  %8s  %12s\n", "type", "fires", "avg net", "top net", "effectivness");
+    printf("  %-14s %6s  %8s  %8s  %12s\n", "----", "-----", "-------", "-------", "------------");
     for (int t = 0; t < NTYPES; t++) {
         if (counts[t] == 0) {
             printf("  %-14s %6d\n", TYPE_NAME[t], 0);
         } else {
-            printf("  %-14s %6d  %+8.1f  %+8.1f\n",
+            double eff = (type_oh_sum[t] > 0.0) ? type_net_sum[t] / type_oh_sum[t] : 0.0;
+            printf("  %-14s %6d  %+8.1f  %+8.1f  %11.2fx\n",
                    TYPE_NAME[t], counts[t],
                    type_net_sum[t] / counts[t],
-                   type_net_max[t]);
+                   type_net_max[t],
+                   eff);
         }
     }
 
