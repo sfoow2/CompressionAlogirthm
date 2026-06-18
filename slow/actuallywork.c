@@ -56,12 +56,11 @@ enum {
     T_CRMBCXOR,  /* cross-crumb XOR: XOR 2-bit crumb k with crumb j; amp=j|(k<<2); self-inverse */
     T_GRAYCODE,  /* Gray code: v→v^(v>>1); inverse via successive XOR-shifts; stride/phase     */
     T_BITASWAP,  /* swap adjacent bits: (v&0xAA)>>1 | (v&0x55)<<1; self-inverse; stride/phase */
-    T_PRNGFLIP,   /* PRNG byte flip: xs16 LSB per byte; if 1 apply ~d[i], else no-op; amp=seed  */
     T_PLANEPRNG,  /* per-bit-plane PRNG XOR: XOR bit k with xs16 LSB; amp=seed|(k<<16)         */
     T_PLANEDELTA, /* bit-plane delta at stride: d[i] bit k ^= d[i-s] bit k; amp=k; RTL forward */
     T_PRNGXLOC,   /* PRNG local XOR: walk pos+=(xs16&smask)+1, d[pos]^=xb; amp=seed|(xb<<16)|(midx<<24) */
     T_REFLECT,    /* Elias remap around mode M: r=(v-M) signed, out=r>=0?2r:(-2r-1); amp=M     */
-    NTYPES        /* = 22 */
+    NTYPES        /* = 21 */
 };
 
 typedef struct { u8 type; int stride, phase; u32 amp; } Instr;
@@ -137,7 +136,6 @@ static inline double oh_splitxor(int kidx, int s) {
 #define OH_CRMBCXOR_BASE  (TAGB + SB + 4.0)     /* 2+2 bits for crumb indices j,k */
 #define OH_GRAYCODE_BASE  (TAGB + SB)            /* no amp — fixed bijection */
 #define OH_BITASWAP_BASE  (TAGB + SB)            /* swap adjacent bits — no amp */
-#define OH_PRNGFLIP        (TAGB + 16.0)          /* one 16-bit seed, no stride/phase */
 #define OH_PLANEPRNG       (TAGB + 19.0)          /* 16-bit seed + 3-bit plane index k */
 #define OH_PLANEDELTA_BASE (TAGB + SB + 3.0)      /* 6-bit stride + 3-bit plane index k, no phase */
 #define OH_PRNGXLOC        (TAGB + 27.0)           /* 16-bit seed + 8-bit XOR byte + 3-bit step-mask index */
@@ -409,15 +407,6 @@ static void ap_bitaswap(u8 *d, int n, int s, int p) {
         d[i] = (u8)(((d[i] & 0xAA) >> 1) | ((d[i] & 0x55) << 1));
 }
 
-/* PRNG_FLIP: for each byte, generate 1 bit from xs16 PRNG; if 1, apply bitwise NOT.
- * amp = 16-bit seed. Self-inverse (same PRNG sequence, same flip/no-op decisions). */
-static void ap_prngflip(u8 *d, int n, u32 amp) {
-    u16 s = (u16)(amp & 0xFFFF);
-    for (int i = 0; i < n; i++) {
-        u16 r = xs16_next(&s);
-        if (r & 1) d[i] ^= 0xFF;
-    }
-}
 
 /* PLANE_PRNG: for bit plane k, XOR each byte's bit k with xs16 LSB. Self-inverse. */
 static void ap_planeprng(u8 *d, int n, u32 amp) {
@@ -496,7 +485,6 @@ static void apply_instr(u8 *d, int n, Instr t) {
         case T_CRMBCXOR:  ap_crmbcxor(d, n, t.stride, t.phase, t.amp); break;
         case T_GRAYCODE:  ap_graycode(d, n, t.stride, t.phase); break;
         case T_BITASWAP:  ap_bitaswap(d, n, t.stride, t.phase); break;
-        case T_PRNGFLIP:   ap_prngflip(d, n, t.amp); break;
         case T_PLANEPRNG:  ap_planeprng(d, n, t.amp); break;
         case T_PLANEDELTA: ap_planedelta(d, n, t.stride, (int)t.amp); break;
         case T_PRNGXLOC:   ap_prngxloc(d, n, t.amp); break;
@@ -525,7 +513,6 @@ static void invert_instr(u8 *d, int n, Instr t) {
         case T_CRMBCXOR:  ap_crmbcxor(d, n, t.stride, t.phase, t.amp); break; /* self-inv */
         case T_GRAYCODE:  inv_graycode(d, n, t.stride, t.phase); break;
         case T_BITASWAP:  ap_bitaswap(d, n, t.stride, t.phase); break;  /* self-inv */
-        case T_PRNGFLIP:   ap_prngflip(d, n, t.amp); break;                       /* self-inv */
         case T_PLANEPRNG:  ap_planeprng(d, n, t.amp); break;                      /* self-inv */
         case T_PLANEDELTA: inv_planedelta(d, n, t.stride, (int)t.amp); break;
         case T_PRNGXLOC:   ap_prngxloc(d, n, t.amp); break;   /* self-inv */
@@ -1005,22 +992,6 @@ static double search_nibcxor(const u8 *d, int n, double Sb, Instr *out) {
     return best;
 }
 
-/* PRNG_FLIP: seed scan; for each seed simulate flip/no-op and compute output freq. */
-static double search_prngflip(const u8 *d, int n, double Sb, Instr *out) {
-    double best = -1e18; u32 bseed = 1;
-    for (u32 seed = 1; seed < PRNG_SEEDS; seed++) {
-        u16 s = (u16)seed;
-        int f[256] = {0};
-        for (int i = 0; i < n; i++) {
-            u16 r = xs16_next(&s);
-            f[(r & 1) ? (d[i] ^ 0xFF) : d[i]]++;
-        }
-        double net = (S_from_freq(f) - Sb) - OH_PRNGFLIP;
-        if (net > best) { best = net; bseed = seed; }
-    }
-    out->type = T_PRNGFLIP; out->stride = 0; out->phase = 0; out->amp = bseed;
-    return best;
-}
 
 /* GRAY_CODE: try all stride/phase; use freq-table permutation trick. */
 static double search_graycode(const u8 *d, int n, double Sb, Instr *out) {
@@ -1300,49 +1271,54 @@ static double search_planedelta(const u8 *d, int n, double Sb, Instr *out) {
 
 /* registry of selectable instructions */
 typedef double (*SearchFn)(const u8 *, int, double, Instr *);
-typedef struct { const char *name; SearchFn search; int slow; } InstrDesc;
+/* prng_first=1: always run on layer 0; other types skipped on layer 0 */
+typedef struct { const char *name; SearchFn search; int slow; int prng_first; } InstrDesc;
 
 static const InstrDesc REGISTRY[] = {
-    { "XOR_PHASE",  search_xorp,      0 },
-    { "ADD_NIBS",   search_anibs,     0 },
-    { "SPLIT_ADD",  search_splitadd,  0 },
-    { "SPLIT_XOR",  search_splitxor,  0 },
-    { "STRIDE_ADD", search_strideadd, 0 },
-    { "PRNG_BIT",   search_prngbit,   1 },   /* slow: 65535-seed scan */
-    { "BYTE_ROT",   search_byterot,   0 },
+    { "XOR_PHASE",  search_xorp,      0, 0 },
+    { "ADD_NIBS",   search_anibs,     0, 0 },
+    { "SPLIT_ADD",  search_splitadd,  0, 0 },
+    { "SPLIT_XOR",  search_splitxor,  0, 0 },
+    { "STRIDE_ADD", search_strideadd, 0, 0 },
+    { "PRNG_BIT",   search_prngbit,   1, 1 },
+    { "BYTE_ROT",   search_byterot,   0, 0 },
     /* HALF_XOR merged into SPLIT_XOR kidx=3 */
     /* HALF_ADD merged into SPLIT_ADD kidx=3 */
-    { "BYTE_MUL",   search_bytemul,   0 },
+    { "BYTE_MUL",   search_bytemul,   0, 0 },
     /* TRIPLE_XOR merged into SPLIT_XOR kidx=1 */
-    { "VALUE_XOR",  search_valuexor,  1 }, /* slow: O(stride²×8×127×128) brute force */
-    { "BIT_REV",    search_bitrev,    0 },
-    { "BP_XOR",     search_bpxor,     0 },
-    { "PRNG_ADD",   search_prngadd,   1 },   /* slow: 65535-seed scan × 3 passes */
-    { "NIBBLE_LUT", search_niblut,    0 },
-    { "NIB_CXOR",   search_nibcxor,   0 },
-    { "CRMB_CXOR",  search_crmbcxor,  0 },
-    { "GRAY_CODE",  search_graycode,  0 },
-    { "BIT_ASWAP",  search_bitaswap,  0 },
-    { "PRNG_FLIP",   search_prngflip,   1 },
-    { "PLANE_PRNG",  search_planeprng,  1 }, /* slow: 65535-seed × 8 planes */
-    { "PLANE_DELTA", search_planedelta, 0 },
-    { "PRNG_XLOC",   search_prngxloc,   1 }, /* slow: 65535-seed × 4-masks × 255-amp */
+    { "VALUE_XOR",  search_valuexor,  1, 0 },
+    { "BIT_REV",    search_bitrev,    0, 0 },
+    { "BP_XOR",     search_bpxor,     0, 0 },
+    { "PRNG_ADD",   search_prngadd,   1, 1 },
+    { "NIBBLE_LUT", search_niblut,    0, 0 },
+    { "NIB_CXOR",   search_nibcxor,   0, 0 },
+    { "CRMB_CXOR",  search_crmbcxor,  0, 0 },
+    { "GRAY_CODE",  search_graycode,  0, 0 },
+    { "BIT_ASWAP",  search_bitaswap,  0, 0 },
+    { "PLANE_PRNG",  search_planeprng, 1, 1 },
+    { "PLANE_DELTA", search_planedelta,0, 0 },
+    { "PRNG_XLOC",   search_prngxloc,  1, 1 },
 };
 #define NREG ((int)(sizeof(REGISTRY)/sizeof(REGISTRY[0])))
 static const char *TYPE_NAME[NTYPES] = {
     "XOR_PHASE","ADD_NIBS","SPLIT_ADD","SPLIT_XOR",
     "STRIDE_ADD","PRNG_BIT","BYTE_ROT","BYTE_MUL",
     "VALUE_XOR","BIT_REV","BP_XOR","PRNG_ADD","NIBBLE_LUT","NIB_CXOR","CRMB_CXOR",
-    "GRAY_CODE","BIT_ASWAP","PRNG_FLIP","PLANE_PRNG","PLANE_DELTA",
+    "GRAY_CODE","BIT_ASWAP","PLANE_PRNG","PLANE_DELTA",
     "PRNG_XLOC","REFLECT"
 };
 
+
+/* 0=all types, 1=prng_first only (layers 0-2), 2=non-prng only (layer 3+) */
+static int g_search_mode = 0;
 
 /* best selectable instruction for the current data */
 static double best_instr(const u8 *d, int n, Instr *out) {
     double Sb = S_of(d, n);
     double best = -1e18; Instr bi = {0};
     for (int r = 0; r < NREG; r++) {
+        if (g_search_mode == 1 && !REGISTRY[r].prng_first) continue;
+        if (g_search_mode == 2 &&  REGISTRY[r].prng_first) continue;
         Instr cand;
         double net = REGISTRY[r].search(d, n, Sb, &cand);
         if (g_diag) printf("    [diag] %-12s net=%+.2f\n", REGISTRY[r].name, net);
@@ -1413,7 +1389,9 @@ static double greedy_run(u8 *d, int n, Instr *ilist, double *nets, int *ni, int 
     for (;;) {
         if (*ni >= MAXINSTR) break;
         Instr t;
+        g_search_mode = (*ni < 3) ? 1 : 2;  /* layers 0-2: PRNG only; layer 3+: non-PRNG only */
         double net = best_instr(d, n, &t);
+        g_search_mode = 0;
         if (net <= 0.0) break;
         double e0 = entropy_bits(d, n) / n;
         apply_instr(d, n, t);
@@ -1506,7 +1484,6 @@ static int selftest(void) {
         { T_CRMBCXOR, 3, 1, (0|(2<<2)) }, /* j=0 (bits[1:0]), k=2 (bits[5:4]) */
         { T_GRAYCODE,  3, 1, 0 },
         { T_BITASWAP,  3, 1, 0 },
-        { T_PRNGFLIP,   0, 0, 1234u },
         { T_PLANEPRNG,  0, 0, (1234u | (3u << 16)) },   /* seed=1234, plane k=3 */
         { T_PLANEDELTA, 4, 0, 2u },                        /* stride=4, plane k=2 */
         { T_PRNGXLOC,   0, 0, (1234u | (0x42u << 16) | (2u << 24)) }, /* seed=1234, xb=0x42, midx=2(mask=7) */
@@ -1554,7 +1531,6 @@ static double instr_oh(Instr t) {
         case T_CRMBCXOR:  return OH_SP(OH_CRMBCXOR_BASE,   t.stride);
         case T_GRAYCODE:  return OH_SP(OH_GRAYCODE_BASE,   t.stride);
         case T_BITASWAP:  return OH_SP(OH_BITASWAP_BASE,   t.stride);
-        case T_PRNGFLIP:   return OH_PRNGFLIP;
         case T_PLANEPRNG:  return OH_PLANEPRNG;
         case T_PLANEDELTA: return OH_PLANEDELTA_BASE;
         case T_PRNGXLOC:   return OH_PRNGXLOC;
@@ -1589,6 +1565,53 @@ int main(int argc, char **argv) {
     init_hlog();
 
     if (argc > 1 && strcmp(argv[1], "selftest") == 0) return selftest() ? 2 : 0;
+
+    /* ---- firstlayer mode: one best_instr call per block, type win histogram ---- */
+    if (argc > 1 && strcmp(argv[1], "firstlayer") == 0) {
+        int NB = (argc > 2) ? atoi(argv[2]) : 20;
+        if (NB < 1) NB = 1;
+        u8 *all = malloc((size_t)NB * BLOCK);
+        if (!all) { fprintf(stderr, "oom\n"); return 1; }
+        size_t need = (size_t)NB * BLOCK, got = 0;
+        FILE *fc = fopen("bcrypt.bin", "rb");
+        if (fc) { got = fread(all, 1, need, fc); fclose(fc); }
+        if (got < need) {
+            BCryptGenRandom(NULL, all + got, (ULONG)(need - got), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+            fc = fopen("bcrypt.bin", "wb");
+            if (fc) { fwrite(all, 1, need, fc); fclose(fc); }
+        }
+        printf("firstlayer: %d blocks\n", NB);
+        int wins[NTYPES] = {0};
+        double net_sum[NTYPES] = {0};
+        clock_t t0 = clock();
+        for (int b = 0; b < NB; b++) {
+            u8 *data = all + (size_t)b * BLOCK;
+            double Sb = S_of(data, BLOCK);
+            Instr best; double net = best_instr(data, BLOCK, &best);
+            if (net > 0.0) { wins[best.type]++; net_sum[best.type] += net; }
+            double ms = (double)(clock() - t0) / CLOCKS_PER_SEC * 1000.0;
+            printf("  block %3d: winner=%-12s  net=%+7.1f  (%.0f ms elapsed)\n",
+                   b, net > 0.0 ? TYPE_NAME[best.type] : "(none)", net, ms);
+            fflush(stdout);
+        }
+        double ms = (double)(clock() - t0) / CLOCKS_PER_SEC * 1000.0;
+        /* sort types by win count descending */
+        int order[NTYPES]; for (int i = 0; i < NTYPES; i++) order[i] = i;
+        for (int i = 0; i < NTYPES-1; i++)
+            for (int j = i+1; j < NTYPES; j++)
+                if (wins[order[j]] > wins[order[i]]) { int tmp=order[i]; order[i]=order[j]; order[j]=tmp; }
+        printf("\n=== first-layer wins across %d blocks (%.0f ms) ===\n", NB, ms);
+        printf("  %-14s  %5s  %8s\n", "type", "wins", "avg net");
+        printf("  %-14s  %5s  %8s\n", "----", "----", "-------");
+        for (int i = 0; i < NTYPES; i++) {
+            int t = order[i];
+            if (wins[t] == 0) continue;
+            printf("  %-14s  %5d  %+8.1f\n", TYPE_NAME[t], wins[t],
+                   net_sum[t] / wins[t]);
+        }
+        free(all);
+        return 0;
+    }
 
     /* ---- default: many BCrypt blocks, aggregate ---- */
     int NB = (argc > 1) ? atoi(argv[1]) : 1;
