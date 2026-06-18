@@ -51,6 +51,8 @@ enum {
     T_BITREV,    /* reverse bit order within each byte at (stride,phase) subset; self-inverse  */
     T_BPXOR,     /* per-byte: XOR bit k with bit j (j!=k); amp=j|(k<<3); self-inverse         */
     T_PRNGADD,   /* PRNG add: even/odd positions get xs16-streamed ADD constants; amp=s1|s2<<16 */
+    T_PRNGADD4,  /* 4-stream PRNG add: pos%4 selects stream, all derived from 1 master seed     */
+    T_PRNGADD8,  /* 8-stream PRNG add: pos%8 selects stream, aligns with Blowfish 8-byte blocks */
     T_NIBLUT,    /* low-nibble permutation LUT: lut[0..7] in amp (4 bits each), lut[8..15] in stride */
     T_NIBCXOR,   /* cross-nibble XOR: amp=0 → lo^=hi, amp=1 → hi^=lo; self-inverse; stride/phase */
     T_CRMBCXOR,  /* cross-crumb XOR: XOR 2-bit crumb k with crumb j; amp=j|(k<<2); self-inverse */
@@ -58,9 +60,8 @@ enum {
     T_BITASWAP,  /* swap adjacent bits: (v&0xAA)>>1 | (v&0x55)<<1; self-inverse; stride/phase */
     T_PLANEPRNG,  /* per-bit-plane PRNG XOR: XOR bit k with xs16 LSB; amp=seed|(k<<16)         */
     T_PLANEDELTA, /* bit-plane delta at stride: d[i] bit k ^= d[i-s] bit k; amp=k; RTL forward */
-    T_PRNGXLOC,   /* PRNG local XOR: walk pos+=(xs16&smask)+1, d[pos]^=xb; amp=seed|(xb<<16)|(midx<<24) */
     T_REFLECT,    /* Elias remap around mode M: r=(v-M) signed, out=r>=0?2r:(-2r-1); amp=M     */
-    NTYPES        /* = 21 */
+    NTYPES        /* = 22 */
 };
 
 typedef struct { u8 type; int stride, phase; u32 amp; } Instr;
@@ -131,6 +132,8 @@ static inline double oh_splitxor(int kidx, int s) {
 #define OH_BITREV_BASE    (TAGB + SB)           /* no amp — fixed bit reversal */
 #define OH_BPXOR          (TAGB + 6.0)          /* j(3 bits) + k(3 bits), no stride/phase */
 #define OH_PRNGADD        (TAGB + 32.0)         /* two 16-bit seeds, same as PRNG_DUAL */
+#define OH_PRNGADD4       (TAGB + 16.0)         /* one 16-bit master seed, 4 derived streams */
+#define OH_PRNGADD8       (TAGB + 16.0)         /* one 16-bit master seed, 8 derived streams */
 #define OH_NIBLUT         (TAGB + 64.0)         /* 16 × 4-bit LUT entries */
 #define OH_NIBCXOR_BASE   (TAGB + SB + 1.0)     /* 1 direction bit + stride/phase */
 #define OH_CRMBCXOR_BASE  (TAGB + SB + 4.0)     /* 2+2 bits for crumb indices j,k */
@@ -138,7 +141,6 @@ static inline double oh_splitxor(int kidx, int s) {
 #define OH_BITASWAP_BASE  (TAGB + SB)            /* swap adjacent bits — no amp */
 #define OH_PLANEPRNG       (TAGB + 19.0)          /* 16-bit seed + 3-bit plane index k */
 #define OH_PLANEDELTA_BASE (TAGB + SB + 3.0)      /* 6-bit stride + 3-bit plane index k, no phase */
-#define OH_PRNGXLOC        (TAGB + 27.0)           /* 16-bit seed + 8-bit XOR byte + 3-bit step-mask index */
 /* Stride-adaptive phase cost: log2(s) bits for phase in [0,s). Use in search loops. */
 static inline double pb_bits(int s) { return (s > 1) ? log2((double)s) : 0.0; }
 #define OH_SP(base, s)  ((base) + pb_bits(s))
@@ -366,6 +368,31 @@ static void inv_prngadd(u8 *d, int n, u32 amp) {
         d[i] = (u8)(d[i] - b);
     }
 }
+/* Derive N sub-seeds from master by successive xs16 steps, then interleave by pos%N. */
+static void ap_prngadd4(u8 *d, int n, u32 amp) {
+    u16 ms = (u16)(amp & 0xFFFF);
+    u16 s[4]; s[0]=ms; s[1]=xs16_next(&ms); s[2]=xs16_next(&ms); s[3]=xs16_next(&ms);
+    for (int i = 0; i < n; i++) d[i] = (u8)(d[i] + xs16_next(&s[i & 3]));
+}
+static void inv_prngadd4(u8 *d, int n, u32 amp) {
+    u16 ms = (u16)(amp & 0xFFFF);
+    u16 s[4]; s[0]=ms; s[1]=xs16_next(&ms); s[2]=xs16_next(&ms); s[3]=xs16_next(&ms);
+    for (int i = 0; i < n; i++) d[i] = (u8)(d[i] - xs16_next(&s[i & 3]));
+}
+static void ap_prngadd8(u8 *d, int n, u32 amp) {
+    u16 ms = (u16)(amp & 0xFFFF);
+    u16 s[8];
+    s[0]=ms;
+    for (int k=1;k<8;k++) s[k]=xs16_next(&ms);
+    for (int i = 0; i < n; i++) d[i] = (u8)(d[i] + xs16_next(&s[i & 7]));
+}
+static void inv_prngadd8(u8 *d, int n, u32 amp) {
+    u16 ms = (u16)(amp & 0xFFFF);
+    u16 s[8];
+    s[0]=ms;
+    for (int k=1;k<8;k++) s[k]=xs16_next(&ms);
+    for (int i = 0; i < n; i++) d[i] = (u8)(d[i] - xs16_next(&s[i & 7]));
+}
 
 /* BIT_PLANE_XOR: for each byte, XOR bit k with bit j (j!=k). Self-inverse because
  * only bit k changes; bit j is read but not modified, so applying twice restores. */
@@ -430,20 +457,6 @@ static void inv_planedelta(u8 *d, int n, int s, int k) {
         d[i] ^= (u8)(((d[i-s] >> k) & 1) << k);
 }
 
-/* PRNG_XLOC: local walk XOR. amp = seed(0-15) | xb(16-23) | midx(24-26).
- * midx selects step mask from {1,3,7,15,31,63,127,255} → step ranges {1-2..1-256}.
- * Self-inverse: same walk replayed from seed undoes all XORs. */
-static const int XLOC_MASKS[8] = {1, 3, 7, 15, 31, 63, 127, 255};
-static void ap_prngxloc(u8 *d, int n, u32 amp) {
-    u16 s = (u16)(amp & 0xFFFF);
-    u8 xb = (u8)(amp >> 16);
-    int smask = XLOC_MASKS[(amp >> 24) & 7];
-    int nm1 = n - 1, pos = 0;
-    for (int i = 0; i < n; i++) {
-        pos = (pos + (xs16_next(&s) & smask) + 1) & nm1;
-        d[pos] ^= xb;
-    }
-}
 
 /* REFLECT: Elias-style bijection centered on mode M.
  * r = (int8_t)(v - M); out = (r >= 0) ? 2*r : -2*r - 1
@@ -480,6 +493,8 @@ static void apply_instr(u8 *d, int n, Instr t) {
         case T_BITREV:    ap_bitrev(d, n, t.stride, t.phase); break;
         case T_BPXOR:     ap_bpxor(d, n, t.amp); break;
         case T_PRNGADD:   ap_prngadd(d, n, t.amp); break;
+        case T_PRNGADD4:  ap_prngadd4(d, n, t.amp); break;
+        case T_PRNGADD8:  ap_prngadd8(d, n, t.amp); break;
         case T_NIBLUT:    ap_niblut(d, n, t.amp, t.stride); break;
         case T_NIBCXOR:   ap_nibcxor(d, n, t.stride, t.phase, t.amp); break;
         case T_CRMBCXOR:  ap_crmbcxor(d, n, t.stride, t.phase, t.amp); break;
@@ -487,7 +502,6 @@ static void apply_instr(u8 *d, int n, Instr t) {
         case T_BITASWAP:  ap_bitaswap(d, n, t.stride, t.phase); break;
         case T_PLANEPRNG:  ap_planeprng(d, n, t.amp); break;
         case T_PLANEDELTA: ap_planedelta(d, n, t.stride, (int)t.amp); break;
-        case T_PRNGXLOC:   ap_prngxloc(d, n, t.amp); break;
         case T_REFLECT:    ap_reflect(d, n, (u8)t.amp); break;
     }
 }
@@ -508,6 +522,8 @@ static void invert_instr(u8 *d, int n, Instr t) {
         case T_BITREV:    ap_bitrev(d, n, t.stride, t.phase); break;            /* self-inv */
         case T_BPXOR:     ap_bpxor(d, n, t.amp); break;                        /* self-inv */
         case T_PRNGADD:   inv_prngadd(d, n, t.amp); break;
+        case T_PRNGADD4:  inv_prngadd4(d, n, t.amp); break;
+        case T_PRNGADD8:  inv_prngadd8(d, n, t.amp); break;
         case T_NIBLUT:    inv_niblut(d, n, t.amp, t.stride); break;
         case T_NIBCXOR:   ap_nibcxor(d, n, t.stride, t.phase, t.amp); break;  /* self-inv */
         case T_CRMBCXOR:  ap_crmbcxor(d, n, t.stride, t.phase, t.amp); break; /* self-inv */
@@ -515,7 +531,6 @@ static void invert_instr(u8 *d, int n, Instr t) {
         case T_BITASWAP:  ap_bitaswap(d, n, t.stride, t.phase); break;  /* self-inv */
         case T_PLANEPRNG:  ap_planeprng(d, n, t.amp); break;                      /* self-inv */
         case T_PLANEDELTA: inv_planedelta(d, n, t.stride, (int)t.amp); break;
-        case T_PRNGXLOC:   ap_prngxloc(d, n, t.amp); break;   /* self-inv */
         case T_REFLECT:    inv_reflect(d, n, (u8)t.amp); break;
     }
 }
@@ -1130,6 +1145,35 @@ static double search_prngadd(const u8 *d, int n, double Sb, Instr *out) {
     out->amp = (u32)best_s1 | ((u32)best_s2 << 16);
     return best;
 }
+/* N-stream PRNG_ADD variants: single master seed, N derived streams by pos%N.
+ * Lower OH than PRNG_ADD (16 bits vs 32) and single-pass search. */
+static double search_prngadd4(const u8 *d, int n, double Sb, Instr *out) {
+    double best = -1e18; u32 bseed = 1;
+    for (u32 seed = 1; seed < PRNG_SEEDS; seed++) {
+        u16 ms = (u16)seed;
+        u16 s[4]; s[0]=ms; s[1]=xs16_next(&ms); s[2]=xs16_next(&ms); s[3]=xs16_next(&ms);
+        int f[256] = {0};
+        for (int i = 0; i < n; i++) f[(u8)(d[i] + xs16_next(&s[i & 3]))]++;
+        double net = (S_from_freq(f) - Sb) - OH_PRNGADD4;
+        if (net > best) { best = net; bseed = seed; }
+    }
+    out->type = T_PRNGADD4; out->stride = 0; out->phase = 0; out->amp = bseed;
+    return best;
+}
+static double search_prngadd8(const u8 *d, int n, double Sb, Instr *out) {
+    double best = -1e18; u32 bseed = 1;
+    for (u32 seed = 1; seed < PRNG_SEEDS; seed++) {
+        u16 ms = (u16)seed;
+        u16 s[8]; s[0]=ms;
+        for (int k=1;k<8;k++) s[k]=xs16_next(&ms);
+        int f[256] = {0};
+        for (int i = 0; i < n; i++) f[(u8)(d[i] + xs16_next(&s[i & 7]))]++;
+        double net = (S_from_freq(f) - Sb) - OH_PRNGADD8;
+        if (net > best) { best = net; bseed = seed; }
+    }
+    out->type = T_PRNGADD8; out->stride = 0; out->phase = 0; out->amp = bseed;
+    return best;
+}
 
 /* BIT_REVERSE: fixed permutation — use freq-table trick (O(256) per stride/phase). */
 static double search_bitrev(const u8 *d, int n, double Sb, Instr *out) {
@@ -1179,51 +1223,6 @@ static double search_bpxor(const u8 *d, int n, double Sb, Instr *out) {
     return best;
 }
 
-/* Shared amp-finder: given a parity mask (1=position gets XOR'd), try all 255 XOR bytes.
- * f_bms[v] = base_freq[v] - count_s[v], so result freq = f_bms[v] + count_s[v^xb]. */
-static double find_best_xamp(const u8 *d, int n, const u8 *par,
-                               const int *base_freq, double Sb, int *xb_out) {
-    int count_s[256] = {0};
-    for (int i = 0; i < n; i++) if (par[i]) count_s[d[i]]++;
-    int f_bms[256];
-    for (int v = 0; v < 256; v++) f_bms[v] = base_freq[v] - count_s[v];
-    double best = -1e18; *xb_out = 1;
-    for (int xb = 1; xb < 256; xb++) {
-        double S = 0.0;
-        for (int v = 0; v < 256; v++) S += hlog[f_bms[v] + count_s[v ^ xb]];
-        double net = (S - Sb) - OH_PRNGXLOC;
-        if (net > best) { best = net; *xb_out = xb; }
-    }
-    return best;
-}
-
-/* Try all 4 step masks in parallel from the same xs16 stream per seed.
- * Parity arrays are 4×4096 bytes (16 KB) — fits in L1. */
-static double search_prngxloc(const u8 *d, int n, double Sb, Instr *out) {
-    int base_freq[256]; freq_of(d, n, base_freq);
-    double best = -1e18; u32 bseed = 1; int bxb = 1, bmidx = 2;
-    u8 par[8][BLOCK];
-    int nm1 = n - 1;
-    for (u32 seed = 1; seed < PRNG_SEEDS; seed++) {
-        u16 s = (u16)seed;
-        memset(par, 0, sizeof(par));
-        int pos[8] = {0,0,0,0,0,0,0,0};
-        for (int i = 0; i < n; i++) {
-            u16 r = xs16_next(&s);
-            for (int m = 0; m < 8; m++) {
-                pos[m] = (pos[m] + (r & XLOC_MASKS[m]) + 1) & nm1;
-                par[m][pos[m]] ^= 1;
-            }
-        }
-        for (int m = 0; m < 8; m++) {
-            int xb; double net = find_best_xamp(d, n, par[m], base_freq, Sb, &xb);
-            if (net > best) { best = net; bseed = seed; bxb = xb; bmidx = m; }
-        }
-    }
-    out->type = T_PRNGXLOC; out->stride = 0; out->phase = 0;
-    out->amp = (u32)bseed | ((u32)bxb << 16) | ((u32)(bmidx & 7) << 24);
-    return best;
-}
 
 /* PLANE_PRNG: for each xs16 seed, compute flip/noflip histograms once, then test all 8 planes. */
 static double search_planeprng(const u8 *d, int n, double Sb, Instr *out) {
@@ -1290,14 +1289,15 @@ static const InstrDesc REGISTRY[] = {
     { "BIT_REV",    search_bitrev,    0, 0 },
     { "BP_XOR",     search_bpxor,     0, 0 },
     { "PRNG_ADD",   search_prngadd,   1, 1 },
-    { "NIBBLE_LUT", search_niblut,    0, 0 },
-    { "NIB_CXOR",   search_nibcxor,   0, 0 },
+    { "PRNG_ADD4",  search_prngadd4,  1, 1 },
+    { "PRNG_ADD8",  search_prngadd8,  1, 1 },
+    { "NIBBLE_LUT", search_niblut,    0, 1 },
+    { "NIB_CXOR",   search_nibcxor,   0, 1 },
     { "CRMB_CXOR",  search_crmbcxor,  0, 0 },
     { "GRAY_CODE",  search_graycode,  0, 0 },
     { "BIT_ASWAP",  search_bitaswap,  0, 0 },
     { "PLANE_PRNG",  search_planeprng, 1, 1 },
     { "PLANE_DELTA", search_planedelta,0, 0 },
-    { "PRNG_XLOC",   search_prngxloc,  1, 1 },
 };
 #define NREG ((int)(sizeof(REGISTRY)/sizeof(REGISTRY[0])))
 static const char *TYPE_NAME[NTYPES] = {
@@ -1305,7 +1305,7 @@ static const char *TYPE_NAME[NTYPES] = {
     "STRIDE_ADD","PRNG_BIT","BYTE_ROT","BYTE_MUL",
     "VALUE_XOR","BIT_REV","BP_XOR","PRNG_ADD","NIBBLE_LUT","NIB_CXOR","CRMB_CXOR",
     "GRAY_CODE","BIT_ASWAP","PLANE_PRNG","PLANE_DELTA",
-    "PRNG_XLOC","REFLECT"
+    "PRNG_ADD4","PRNG_ADD8","REFLECT"
 };
 
 
@@ -1477,6 +1477,8 @@ static int selftest(void) {
         { T_BITREV,   3, 1, 0 },
         { T_BPXOR,    0, 0, (2u | (5u << 3)) },  /* j=2, k=5 */
         { T_PRNGADD,  0, 0, (1234u | (5678u << 16)) },
+        { T_PRNGADD4, 0, 0, 1234u },
+        { T_PRNGADD8, 0, 0, 5678u },
         /* NIBLUT: lut = {1,0,3,2,5,4,7,6,9,8,11,10,13,12,15,14} (swap nibble pairs) */
         { T_NIBLUT,  (int)(0x89ABCDEFu), 0, 0x01234567u },
         { T_NIBCXOR, 3, 1, 0 },  /* dir=0: lo ^= hi */
@@ -1486,7 +1488,6 @@ static int selftest(void) {
         { T_BITASWAP,  3, 1, 0 },
         { T_PLANEPRNG,  0, 0, (1234u | (3u << 16)) },   /* seed=1234, plane k=3 */
         { T_PLANEDELTA, 4, 0, 2u },                        /* stride=4, plane k=2 */
-        { T_PRNGXLOC,   0, 0, (1234u | (0x42u << 16) | (2u << 24)) }, /* seed=1234, xb=0x42, midx=2(mask=7) */
         { T_REFLECT,    0, 0, 0x40u },
     };
     int nt = (int)(sizeof(tv) / sizeof(tv[0])), fails = 0;
@@ -1526,6 +1527,8 @@ static double instr_oh(Instr t) {
         case T_BITREV:    return OH_SP(OH_BITREV_BASE,     t.stride);
         case T_BPXOR:     return OH_BPXOR;
         case T_PRNGADD:   return OH_PRNGADD;
+        case T_PRNGADD4:  return OH_PRNGADD4;
+        case T_PRNGADD8:  return OH_PRNGADD8;
         case T_NIBLUT:    return OH_NIBLUT;
         case T_NIBCXOR:   return OH_SP(OH_NIBCXOR_BASE,    t.stride);
         case T_CRMBCXOR:  return OH_SP(OH_CRMBCXOR_BASE,   t.stride);
@@ -1533,7 +1536,6 @@ static double instr_oh(Instr t) {
         case T_BITASWAP:  return OH_SP(OH_BITASWAP_BASE,   t.stride);
         case T_PLANEPRNG:  return OH_PLANEPRNG;
         case T_PLANEDELTA: return OH_PLANEDELTA_BASE;
-        case T_PRNGXLOC:   return OH_PRNGXLOC;
         default:           return 0.0;
     }
 }
