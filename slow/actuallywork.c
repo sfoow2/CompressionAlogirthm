@@ -61,7 +61,8 @@ enum {
     T_PLANEPRNG,  /* per-bit-plane PRNG XOR: XOR bit k with xs16 LSB; amp=seed|(k<<16)         */
     T_PLANEDELTA, /* bit-plane delta at stride: d[i] bit k ^= d[i-s] bit k; amp=k; RTL forward */
     T_REFLECT,    /* Elias remap around mode M: r=(v-M) signed, out=r>=0?2r:(-2r-1); amp=M     */
-    NTYPES        /* = 22 */
+    T_RANGEXOR,   /* XOR positions [start,end) at stride s with xor_val; phase=start, amp=xval|(end<<8) */
+    NTYPES        /* = 23 */
 };
 
 typedef struct { u8 type; int stride, phase; u32 amp; } Instr;
@@ -141,6 +142,8 @@ static inline double oh_splitxor(int kidx, int s) {
 #define OH_BITASWAP_BASE  (TAGB + SB)            /* swap adjacent bits — no amp */
 #define OH_PLANEPRNG       (TAGB + 19.0)          /* 16-bit seed + 3-bit plane index k */
 #define OH_PLANEDELTA_BASE (TAGB + SB + 3.0)      /* 6-bit stride + 3-bit plane index k, no phase */
+/* RANGE_XOR overhead: tag(5) + start(12) + end(13) + stride(5) + xor_val(8) = 43 bits */
+#define OH_RANGEXOR (TAGB + 12.0 + 13.0 + 5.0 + 8.0)
 /* Stride-adaptive phase cost: log2(s) bits for phase in [0,s). Use in search loops. */
 static inline double pb_bits(int s) { return (s > 1) ? log2((double)s) : 0.0; }
 #define OH_SP(base, s)  ((base) + pb_bits(s))
@@ -475,6 +478,15 @@ static void inv_reflect(u8 *d, int n, u8 M) {
     }
 }
 
+/* RANGE_XOR: XOR every s-th byte in [start, end) with xor_val. Self-inverse.
+ * phase = start, amp = xor_val | (end << 8). */
+static void ap_rangexor(u8 *d, int n, int s, int start, u32 amp) {
+    u8  xval = (u8)(amp & 0xFF);
+    int end  = (int)((amp >> 8) & 0x1FFF);
+    if (end > n) end = n;
+    for (int i = start; i < end; i += s) d[i] ^= xval;
+}
+
 /* dispatch: apply / invert any instruction in place */
 static void apply_instr(u8 *d, int n, Instr t) {
     switch (t.type) {
@@ -503,6 +515,7 @@ static void apply_instr(u8 *d, int n, Instr t) {
         case T_PLANEPRNG:  ap_planeprng(d, n, t.amp); break;
         case T_PLANEDELTA: ap_planedelta(d, n, t.stride, (int)t.amp); break;
         case T_REFLECT:    ap_reflect(d, n, (u8)t.amp); break;
+        case T_RANGEXOR:   ap_rangexor(d, n, t.stride, t.phase, t.amp); break;
     }
 }
 static void invert_instr(u8 *d, int n, Instr t) {
@@ -532,6 +545,7 @@ static void invert_instr(u8 *d, int n, Instr t) {
         case T_PLANEPRNG:  ap_planeprng(d, n, t.amp); break;                      /* self-inv */
         case T_PLANEDELTA: inv_planedelta(d, n, t.stride, (int)t.amp); break;
         case T_REFLECT:    inv_reflect(d, n, (u8)t.amp); break;
+        case T_RANGEXOR:   ap_rangexor(d, n, t.stride, t.phase, t.amp); break; /* self-inv */
     }
 }
 
@@ -1268,6 +1282,38 @@ static double search_planedelta(const u8 *d, int n, double Sb, Instr *out) {
     return best;
 }
 
+/* RANGE_XOR search: slide windows of several lengths across the block at strides 1..8.
+ * For each (stride, start, end), use WHT to find the best XOR amp in O(256 log 256).
+ * The quantised step (seglen/8) trades coverage for speed; large ranges easily clear
+ * the 43-bit overhead so we bias toward them. */
+static double search_rangexor(const u8 *d, int n, double Sb, Instr *out) {
+    int total[256]; freq_of(d, n, total);
+    double best = -1e18;
+    int bs = 1, bstart = 0; u32 bamp = 0;
+    double oh = OH_RANGEXOR;
+
+    for (int s = 1; s <= 8 && s <= g_stride_lim; s++) {
+        for (int seglen = 256; seglen <= n; seglen <<= 1) {
+            int step = seglen >> 3; if (step < 32) step = 32;
+            for (int start = 0; start + seglen <= n; start += step) {
+                int end = start + seglen;
+                int hit[256] = {0};
+                for (int i = start; i < end; i += s) hit[d[i]]++;
+                int base[256];
+                for (int v = 0; v < 256; v++) base[v] = total[v] - hit[v];
+                double Sg; int a = xor_best_wht(base, hit, &Sg);
+                double net = (Sg - Sb) - oh;
+                if (net > best) {
+                    best = net; bs = s; bstart = start;
+                    bamp = (u32)a | ((u32)end << 8);
+                }
+            }
+        }
+    }
+    out->type = T_RANGEXOR; out->stride = bs; out->phase = bstart; out->amp = bamp;
+    return best;
+}
+
 /* registry of selectable instructions */
 typedef double (*SearchFn)(const u8 *, int, double, Instr *);
 /* prng_first=1: always run on layer 0; other types skipped on layer 0 */
@@ -1298,6 +1344,7 @@ static const InstrDesc REGISTRY[] = {
     { "BIT_ASWAP",  search_bitaswap,  0, 0 },
     { "PLANE_PRNG",  search_planeprng, 1, 1 },
     { "PLANE_DELTA", search_planedelta,0, 0 },
+    { "RANGE_XOR",   search_rangexor,  0, 0 },
 };
 #define NREG ((int)(sizeof(REGISTRY)/sizeof(REGISTRY[0])))
 static const char *TYPE_NAME[NTYPES] = {
@@ -1305,7 +1352,7 @@ static const char *TYPE_NAME[NTYPES] = {
     "STRIDE_ADD","PRNG_BIT","BYTE_ROT","BYTE_MUL",
     "VALUE_XOR","BIT_REV","BP_XOR","PRNG_ADD","NIBBLE_LUT","NIB_CXOR","CRMB_CXOR",
     "GRAY_CODE","BIT_ASWAP","PLANE_PRNG","PLANE_DELTA",
-    "PRNG_ADD4","PRNG_ADD8","REFLECT"
+    "PRNG_ADD4","PRNG_ADD8","REFLECT","RANGE_XOR"
 };
 
 
@@ -1489,6 +1536,7 @@ static int selftest(void) {
         { T_PLANEPRNG,  0, 0, (1234u | (3u << 16)) },   /* seed=1234, plane k=3 */
         { T_PLANEDELTA, 4, 0, 2u },                        /* stride=4, plane k=2 */
         { T_REFLECT,    0, 0, 0x40u },
+        { T_RANGEXOR, 3, 200, (u32)(0x5A | (800 << 8)) },  /* stride=3, start=200, end=800, xor=0x5A */
     };
     int nt = (int)(sizeof(tv) / sizeof(tv[0])), fails = 0;
     for (int i = 0; i < nt; i++) {
@@ -1536,6 +1584,7 @@ static double instr_oh(Instr t) {
         case T_BITASWAP:  return OH_SP(OH_BITASWAP_BASE,   t.stride);
         case T_PLANEPRNG:  return OH_PLANEPRNG;
         case T_PLANEDELTA: return OH_PLANEDELTA_BASE;
+        case T_RANGEXOR:   return OH_RANGEXOR;
         default:           return 0.0;
     }
 }
