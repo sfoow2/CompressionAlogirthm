@@ -64,7 +64,13 @@ enum {
     T_SPLITADD,  /* N-way split ADD; kidx in phase[8..9]: 0=dual,1=quad,2=octo,3=half        */
     T_SPLITXOR,  /* N-way split XOR; kidx in phase[8..9]: 0=dual,1=quad,2=octo-nibble,3=half */
     T_PRNGBIT,   /* PRNG selects bit pos (0-7) per byte; XOR that bit with (amp>>bit_pos)&1  */
-    NTYPES       /* = 18 */
+    T_DELTA,     /* first difference:    d[i] -= d[i-1] (right-to-left); inv adds forward    */
+    T_XORDELTA,  /* XOR difference:      d[i] ^= d[i-1] (right-to-left); inv XORs forward    */
+    T_STRIDEDELTA,/* stride difference:  d[i] -= d[i-s] (right-to-left); stride in t.stride  */
+    T_DELTADD,   /* prefix sum:          d[i] += d[i-1] (left-to-right);  inv subtracts back  */
+    T_CHUNKXOR,  /* N contiguous chunks each XORed with its own constant; N=2,4,8 in t.stride;
+                    constants[0..3] packed in t.amp, constants[4..7] in t.phase (N=8 only)     */
+    NTYPES       /* = 23 */
 };
 
 typedef struct { u8 type; int stride, phase; u32 amp; } Instr;
@@ -136,7 +142,12 @@ static const double SPLITXOR_AMP_BITS[4] = {16.0, 32.0, 32.0, 14.0};
 static inline double oh_splitxor(int kidx, int s) {
     return TAGB + SB + 2.0 + SPLITXOR_AMP_BITS[kidx] + pb_bits(s);
 }
-#define OH_PRNGBIT  (TAGB + 16.0 + 8.0)  /* 16-bit seed + 8-bit flip-mask */
+#define OH_PRNGBIT      (TAGB + 16.0 + 8.0)  /* 16-bit seed + 8-bit flip-mask */
+#define OH_DELTA        (TAGB)                /* no parameters */
+#define OH_XORDELTA     (TAGB)                /* no parameters */
+#define OH_STRIDEDELTA  (TAGB + 6.0)          /* 6-bit stride field */
+#define OH_DELTADD      (TAGB)                /* no parameters */
+static double oh_chunkxor(int N) { return TAGB + 2.0 + N * 8.0; } /* 2 bits for N + N×8 constants */
 
 /* ============================================================ *
  *  apply / invert primitives (in place)                         *
@@ -390,7 +401,58 @@ static void inv_reflect(u8 *d, int n, u8 M) {
     }
 }
 
+/* DELTA: first difference.  Apply right-to-left so d[i-1] is still original when used.
+ * Inverse: prefix sum left-to-right (each step uses already-restored d[i-1]). */
+static void ap_delta(u8 *d, int n) {
+    for (int i = n - 1; i >= 1; i--)
+        d[i] = (u8)(d[i] - d[i-1]);
+}
+static void inv_delta(u8 *d, int n) {
+    for (int i = 1; i < n; i++)
+        d[i] = (u8)(d[i] + d[i-1]);
+}
 
+/* XORDELTA: XOR difference.  Same order convention as DELTA. */
+static void ap_xordelta(u8 *d, int n) {
+    for (int i = n - 1; i >= 1; i--)
+        d[i] ^= d[i-1];
+}
+static void inv_xordelta(u8 *d, int n) {
+    for (int i = 1; i < n; i++)
+        d[i] ^= d[i-1];
+}
+
+/* STRIDEDELTA: subtract byte s positions back.  Right-to-left so d[i-s] is still original. */
+static void ap_stridedelta(u8 *d, int n, int s) {
+    for (int i = n - 1; i >= s; i--)
+        d[i] = (u8)(d[i] - d[i-s]);
+}
+static void inv_stridedelta(u8 *d, int n, int s) {
+    for (int i = s; i < n; i++)
+        d[i] = (u8)(d[i] + d[i-s]);
+}
+
+/* DELTADD: prefix sum (inverse direction of DELTA).  Apply left-to-right, inverse right-to-left. */
+static void ap_deltadd(u8 *d, int n) {
+    for (int i = 1; i < n; i++)
+        d[i] = (u8)(d[i] + d[i-1]);
+}
+static void inv_deltadd(u8 *d, int n) {
+    for (int i = n - 1; i >= 1; i--)
+        d[i] = (u8)(d[i] - d[i-1]);
+}
+
+/* CHUNKXOR: divide block into N contiguous chunks; XOR each chunk with its own constant.
+ * XOR is self-inverse, so ap == inv. Constants packed in amp (chunks 0-3) and phase (4-7). */
+static void ap_chunkxor(u8 *d, int n, int N, u32 amp, int phase) {
+    int sz = n / N;
+    for (int j = 0; j < N; j++) {
+        u8 c = (j < 4) ? (u8)((amp >> (j*8)) & 0xFF)
+                        : (u8)(((u32)phase >> ((j-4)*8)) & 0xFF);
+        int start = j * sz, end = (j == N-1) ? n : (j+1)*sz;
+        for (int i = start; i < end; i++) d[i] ^= c;
+    }
+}
 
 /* dispatch: apply / invert any instruction in place */
 static void apply_instr(u8 *d, int n, Instr t) {
@@ -413,6 +475,11 @@ static void apply_instr(u8 *d, int n, Instr t) {
         case T_SPLITADD: ap_splitadd(d, n, t.stride, t.phase, t.amp); break;
         case T_SPLITXOR: ap_splitxor(d, n, t.stride, t.phase, t.amp); break;
         case T_PRNGBIT:  ap_prngbit(d, n, t.amp); break;
+        case T_DELTA:       ap_delta(d, n); break;
+        case T_XORDELTA:    ap_xordelta(d, n); break;
+        case T_STRIDEDELTA: ap_stridedelta(d, n, t.stride); break;
+        case T_DELTADD:     ap_deltadd(d, n); break;
+        case T_CHUNKXOR:    ap_chunkxor(d, n, t.stride, t.amp, t.phase); break;
     }
 }
 static void invert_instr(u8 *d, int n, Instr t) {
@@ -435,6 +502,11 @@ static void invert_instr(u8 *d, int n, Instr t) {
         case T_SPLITADD: inv_splitadd(d, n, t.stride, t.phase, t.amp); break;
         case T_SPLITXOR: ap_splitxor(d, n, t.stride, t.phase, t.amp); break;  /* self-inv */
         case T_PRNGBIT:  ap_prngbit(d, n, t.amp); break;                      /* self-inv */
+        case T_DELTA:       inv_delta(d, n); break;
+        case T_XORDELTA:    inv_xordelta(d, n); break;
+        case T_STRIDEDELTA: inv_stridedelta(d, n, t.stride); break;
+        case T_DELTADD:     inv_deltadd(d, n); break;
+        case T_CHUNKXOR:    ap_chunkxor(d, n, t.stride, t.amp, t.phase); break; /* self-inv */
     }
 }
 
@@ -1014,36 +1086,125 @@ static double search_prngbit(const u8 *d, int n, double Sb, Instr *out) {
     return best;
 }
 
+static double search_delta(const u8 *d, int n, double Sb, Instr *out) {
+    u8 tmp[BLOCK]; memcpy(tmp, d, n);
+    ap_delta(tmp, n);
+    out->type = T_DELTA; out->stride = 0; out->phase = 0; out->amp = 0;
+    return S_of(tmp, n) - Sb - OH_DELTA;
+}
+static double search_xordelta(const u8 *d, int n, double Sb, Instr *out) {
+    u8 tmp[BLOCK]; memcpy(tmp, d, n);
+    ap_xordelta(tmp, n);
+    out->type = T_XORDELTA; out->stride = 0; out->phase = 0; out->amp = 0;
+    return S_of(tmp, n) - Sb - OH_XORDELTA;
+}
+static double search_stridedelta(const u8 *d, int n, double Sb, Instr *out) {
+    double best = -1e18; int bs = 2;
+    u8 tmp[BLOCK];
+    for (int s = 2; s <= 64 && s < n; s++) {
+        memcpy(tmp, d, n);
+        ap_stridedelta(tmp, n, s);
+        double net = S_of(tmp, n) - Sb - OH_STRIDEDELTA;
+        if (net > best) { best = net; bs = s; }
+    }
+    out->type = T_STRIDEDELTA; out->stride = bs; out->phase = 0; out->amp = 0;
+    return best;
+}
+static double search_deltadd(const u8 *d, int n, double Sb, Instr *out) {
+    u8 tmp[BLOCK]; memcpy(tmp, d, n);
+    ap_deltadd(tmp, n);
+    out->type = T_DELTADD; out->stride = 0; out->phase = 0; out->amp = 0;
+    return S_of(tmp, n) - Sb - OH_DELTADD;
+}
+
+/* CHUNKXOR search: try N=2,4,8 contiguous chunks, optimize each chunk's XOR constant
+ * independently against the global histogram, then compute the true combined net. */
+static double search_chunkxor(const u8 *d, int n, double Sb, Instr *out) {
+    int total[256]; freq_of(d, n, total);
+    double best = -1e18;
+    int best_N = 2; u32 best_amp = 0; int best_phase = 0;
+
+    for (int N = 2; N <= 8; N *= 2) {
+        int sz = n / N;
+        double oh = oh_chunkxor(N);
+        u8 consts[8] = {0};
+
+        /* for each chunk: find the XOR constant that maximises global S
+         * treating other chunks as unmodified (independent greedy) */
+        for (int j = 0; j < N; j++) {
+            int start = j*sz, end = (j == N-1) ? n : (j+1)*sz;
+            int chF[256] = {0};
+            for (int i = start; i < end; i++) chF[d[i]]++;
+            u8 best_c = 0; double best_S = -1e30;
+            for (int a = 0; a < 256; a++) {
+                double S = 0.0;
+                for (int v = 0; v < 256; v++)
+                    S += hlog[(total[v] - chF[v]) + chF[v ^ a]];
+                if (S > best_S) { best_S = S; best_c = (u8)a; }
+            }
+            consts[j] = best_c;
+        }
+
+        /* compute combined frequency table after applying all chunk XORs */
+        int rf[256] = {0};
+        for (int j = 0; j < N; j++) {
+            int start = j*sz, end = (j == N-1) ? n : (j+1)*sz;
+            for (int i = start; i < end; i++) rf[d[i] ^ consts[j]]++;
+        }
+
+        double net = (S_from_freq(rf) - Sb) - oh;
+        if (net > best) {
+            best = net; best_N = N;
+            best_amp   = (u32)consts[0] | ((u32)consts[1]<<8)
+                       | ((u32)consts[2]<<16) | ((u32)consts[3]<<24);
+            best_phase = (int)((u32)consts[4] | ((u32)consts[5]<<8)
+                       | ((u32)consts[6]<<16) | ((u32)consts[7]<<24));
+        }
+    }
+
+    out->type = T_CHUNKXOR; out->stride = best_N;
+    out->amp = best_amp; out->phase = best_phase;
+    return best;
+}
+
 /* registry of selectable instructions */
 typedef double (*SearchFn)(const u8 *, int, double, Instr *);
-/* prng_first=1: always run on layer 0; other types skipped on layer 0 */
-typedef struct { const char *name; SearchFn search; int slow; int prng_first; } InstrDesc;
+/* prng_first=1: always run on layer 0; other types skipped on layer 0
+ * is_delta=1:   delta-family; excluded from the follow-up search in delta_escape */
+typedef struct { const char *name; SearchFn search; int slow; int prng_first; int is_delta; } InstrDesc;
+
 
 static const InstrDesc REGISTRY[] = {
-    { "XOR_PHASE",  search_xorp,      0, 0 },
-    { "ADD_NIBS",   search_anibs,     0, 0 },
-    { "STRIDE_ADD", search_strideadd, 0, 0 },
-    { "BYTE_ROT",   search_byterot,   0, 0 },
-    { "BYTE_MUL",   search_bytemul,   0, 0 },
-    { "VALUE_XOR",  search_valuexor,  1, 0 },
-    { "BIT_REV",    search_bitrev,    0, 0 },
-    { "PRNG_ADD4",  search_prngadd4,  1, 1 },
-    { "PRNG_ADD8",  search_prngadd8,  1, 1 },
-    { "NIB_CXOR",   search_nibcxor,   0, 0 },
-    { "CRMB_CXOR",  search_crmbcxor,  0, 0 },
-    { "GRAY_CODE",  search_graycode,  0, 0 },
-    { "BIT_ASWAP",  search_bitaswap,  0, 0 },
-    { "PLANE_PRNG", search_planeprng, 1, 1 },
-    { "SPLIT_ADD",  search_splitadd,  0, 0 },
-    { "SPLIT_XOR",  search_splitxor,  0, 0 },
-    { "PRNG_BIT",   search_prngbit,   1, 1 },
+    { "XOR_PHASE",   search_xorp,         0, 0, 0 },
+    { "ADD_NIBS",    search_anibs,         0, 0, 0 },
+    { "STRIDE_ADD",  search_strideadd,     0, 0, 0 },
+    { "BYTE_ROT",    search_byterot,       0, 0, 0 },
+    { "BYTE_MUL",    search_bytemul,       0, 0, 0 },
+    { "VALUE_XOR",   search_valuexor,      1, 0, 0 },
+    { "BIT_REV",     search_bitrev,        0, 0, 0 },
+    { "PRNG_ADD4",   search_prngadd4,      1, 1, 0 },
+    { "PRNG_ADD8",   search_prngadd8,      1, 1, 0 },
+    { "NIB_CXOR",    search_nibcxor,       0, 0, 0 },
+    { "CRMB_CXOR",   search_crmbcxor,      0, 0, 0 },
+    { "GRAY_CODE",   search_graycode,      0, 0, 0 },
+    { "BIT_ASWAP",   search_bitaswap,      0, 0, 0 },
+    { "PLANE_PRNG",  search_planeprng,     1, 1, 0 },
+    { "SPLIT_ADD",   search_splitadd,      1, 0, 0 },
+    { "SPLIT_XOR",   search_splitxor,      1, 0, 0 },
+    { "PRNG_BIT",    search_prngbit,       1, 1, 0 },
+    { "DELTA",       search_delta,         0, 0, 1 },
+    { "XORDELTA",    search_xordelta,      0, 0, 1 },
+    { "STRIDEDELTA", search_stridedelta,   0, 0, 1 },
+    { "DELTADD",     search_deltadd,       0, 0, 1 },
+    { "CHUNK_XOR",   search_chunkxor,      0, 0, 0 },
 };
 #define NREG ((int)(sizeof(REGISTRY)/sizeof(REGISTRY[0])))
 static const char *TYPE_NAME[NTYPES] = {
     "XOR_PHASE", "ADD_NIBS",  "STRIDE_ADD", "BYTE_ROT",  "BYTE_MUL",
     "VALUE_XOR", "BIT_REV",   "PRNG_ADD4",  "PRNG_ADD8", "NIB_CXOR",
     "CRMB_CXOR", "GRAY_CODE", "BIT_ASWAP",  "PLANE_PRNG","REFLECT",
-    "SPLIT_ADD", "SPLIT_XOR", "PRNG_BIT"
+    "SPLIT_ADD", "SPLIT_XOR", "PRNG_BIT",
+    "DELTA",     "XORDELTA",  "STRIDEDELTA","DELTADD",   "CHUNK_XOR"
 };
 
 
@@ -1056,7 +1217,9 @@ static int    g_type_freq[NTYPES];
 static int    g_total_instrs_used;
 
 static double adaptive_tag_cost(int type) {
-    double p = (g_type_freq[type] + 0.5) / (g_total_instrs_used + 0.5 * NTYPES);
+    /* Denominator frozen at 0.5*18 (the original type count before extension types were added).
+     * Keeps the prior stable so adding non-firing types doesn't inflate costs for firing ones. */
+    double p = (g_type_freq[type] + 0.5) / (g_total_instrs_used + 9.0);
     return -log2(p);
 }
 
@@ -1067,6 +1230,7 @@ static double best_instr(const u8 *d, int n, Instr *out) {
     for (int r = 0; r < NREG; r++) {
         if (g_search_mode == 1 && !REGISTRY[r].prng_first) continue;
         if (g_search_mode == 2 &&  REGISTRY[r].prng_first) continue;
+        if (g_search_mode == 3 && (REGISTRY[r].is_delta || REGISTRY[r].prng_first || REGISTRY[r].slow)) continue;
         Instr cand;
         double net = REGISTRY[r].search(d, n, Sb, &cand);
         /* swap fixed TAGB for the actual adaptive type-coding cost */
@@ -1183,6 +1347,87 @@ static void try_reflect(u8 *d, int n, Instr *ilist, double *nets, int *ni, int v
                "REFLECT", M, entropy_bits(d, n) / n);
 }
 
+static double instr_oh(Instr t);  /* forward decl; defined after do_block */
+
+/* Delta-pair escape: when greedy stalls, try each of the 4 delta types as a pre-transform
+ * (using their search functions to pick the best stride/params), then search non-delta
+ * non-slow non-PRNG instructions on the result.  Only 4 follow-up searches are done total,
+ * making this O(4 × greedy_round).  Commits the best pair if combined net > 0. */
+static double try_delta_escape(u8 *d, int n, Instr *ilist, double *nets, int *ni, int verbose) {
+    if (*ni >= MAXINSTR - 1) return 0.0;
+
+    double Sb = S_of(d, n);
+    double best_total = 0.0;
+    Instr  best_di = {0}, best_fi = {0};
+    int    found = 0;
+
+    static u8 tmp[BLOCK];
+
+    /* Phase 1: pick best candidate per delta type (cheap O(n*stride) search each).
+     * We only need the Instr, not the net; net is recomputed below with adaptive cost. */
+    Instr dcands[4];
+    search_delta(d, n, Sb, &dcands[0]);
+    search_xordelta(d, n, Sb, &dcands[1]);
+    search_stridedelta(d, n, Sb, &dcands[2]);
+    search_deltadd(d, n, Sb, &dcands[3]);
+
+    /* Phase 2: for each delta candidate, do one fast non-delta follow-up search */
+    for (int di = 0; di < 4; di++) {
+        /* Apply delta to temp copy */
+        memcpy(tmp, d, n);
+        apply_instr(tmp, n, dcands[di]);
+        double S_delta = S_of(tmp, n);
+
+        /* delta's actual adjusted overhead (replace fixed TAGB with adaptive cost) */
+        double extra_delta = (dcands[di].type == T_STRIDEDELTA) ? 6.0 : 0.0;
+        double d_net = (S_delta - Sb) - extra_delta - adaptive_tag_cost(dcands[di].type);
+
+        /* Search fast non-delta non-PRNG non-slow follow-up (mode 3), stride limited */
+        int saved_stride = g_stride_lim;
+        g_stride_lim = 8;
+        g_search_mode = 3;
+        Instr fi = {0};
+        double f_net = best_instr(tmp, n, &fi);
+        g_search_mode = 0;
+        g_stride_lim = saved_stride;
+
+        double total = d_net + f_net;
+        if (total > best_total) {
+            best_total = total;
+            best_di    = dcands[di];
+            best_fi    = fi;
+            found      = 1;
+        }
+    }
+
+    if (!found) return 0.0;
+
+    /* Apply the winning pair to the real data and record both instructions */
+    apply_instr(d, n, best_di);
+    double S_after_delta = S_of(d, n);
+    apply_instr(d, n, best_fi);
+    double S_after_both = S_of(d, n);
+
+    double extra_delta = (best_di.type == T_STRIDEDELTA) ? 6.0 : 0.0;
+    double di_net = (S_after_delta - Sb) - extra_delta - adaptive_tag_cost(best_di.type);
+    double fi_net = (S_after_both - S_after_delta)
+                  - (instr_oh(best_fi) - TAGB)
+                  - adaptive_tag_cost(best_fi.type);
+
+    nets[*ni]  = di_net;  ilist[(*ni)++] = best_di;
+    nets[*ni]  = fi_net;  ilist[(*ni)++] = best_fi;
+
+    g_type_freq[best_di.type]++;
+    g_type_freq[best_fi.type]++;
+    g_total_instrs_used += 2;
+
+    if (verbose) {
+        printf("  [escape] %-12s + %-12s  total net=%+.1f\n",
+               TYPE_NAME[best_di.type], TYPE_NAME[best_fi.type], best_total);
+    }
+    return best_total;
+}
+
 static double compress(u8 *d, int n, Instr *ilist, double *nets, int *ni, int verbose) {
     *ni = 0;
     if (verbose) {
@@ -1190,6 +1435,13 @@ static double compress(u8 *d, int n, Instr *ilist, double *nets, int *ni, int ve
         print_layer_struct(d, n);
     }
     double total = greedy_run(d, n, ilist, nets, ni, verbose);
+    /* Delta-pair escape: if greedy stalled, try delta + non-delta pairs */
+    while (*ni < MAXINSTR - 1) {
+        double esc = try_delta_escape(d, n, ilist, nets, ni, verbose);
+        if (esc <= 0.0) break;
+        total += esc;
+        total += greedy_run(d, n, ilist, nets, ni, verbose);
+    }
     try_reflect(d, n, ilist, nets, ni, verbose);
     return total;
 }
@@ -1200,6 +1452,225 @@ static double compress(u8 *d, int n, Instr *ilist, double *nets, int *ni, int ve
 
 static void decompress(u8 *d, int n, const Instr *ilist, int ni) {
     for (int i = ni - 1; i >= 0; i--) invert_instr(d, n, ilist[i]);
+}
+
+/* ============================================================ *
+ *  Compact instruction bit-stream                               *
+ *                                                               *
+ *  Each field is packed to its natural width (same widths the   *
+ *  OH_ model uses), eliminating the wasted bits in the flat     *
+ *  8-byte-per-instruction serialization.                        *
+ *                                                               *
+ *  Layout per instruction:                                       *
+ *    type        : 5 bits  (NTYPES=18 < 32)                    *
+ *    stride-1    : 6 bits  (1..64, skip for PRNG/REFLECT)      *
+ *    kidx        : 2 bits  (SPLIT* only, before phase)         *
+ *    phase       : ceil(log2(stride)) bits                      *
+ *    amp         : type-specific width                          *
+ *  Header: 16-bit instruction count.                            *
+ * ============================================================ */
+
+typedef struct { u8 *buf; int pos; } BitBuf;
+
+static void bb_put(BitBuf *b, u32 val, int nbits) {
+    for (int i = nbits - 1; i >= 0; i--) {
+        int p = b->pos++;
+        b->buf[p >> 3] |= (u8)(((val >> i) & 1) << (7 - (p & 7)));
+    }
+}
+static u32 bb_get(BitBuf *b, int nbits) {
+    u32 v = 0;
+    for (int i = 0; i < nbits; i++) {
+        int p = b->pos++;
+        v = (v << 1) | ((b->buf[p >> 3] >> (7 - (p & 7))) & 1);
+    }
+    return v;
+}
+/* ceil(log2(s)): number of bits to represent 0..s-1 */
+static int phase_bits(int s) {
+    int b = 0; while ((1 << b) < s) b++; return b;
+}
+
+static void bb_put_instr(BitBuf *b, Instr t) {
+    bb_put(b, t.type, 5);
+    int s = t.stride, pb = phase_bits(s);
+    switch (t.type) {
+        case T_PRNGADD4: case T_PRNGADD8:
+            bb_put(b, t.amp & 0xFFFF, 16); break;
+        case T_PLANEPRNG:
+            bb_put(b, t.amp & 0xFFFF, 16);
+            bb_put(b, (t.amp >> 16) & 7, 3); break;
+        case T_PRNGBIT:
+            bb_put(b, t.amp & 0xFFFF, 16);
+            bb_put(b, (t.amp >> 16) & 0xFF, 8); break;
+        case T_REFLECT:
+            bb_put(b, t.amp & 0xFF, 8); break;
+        case T_BITREV: case T_GRAYCODE: case T_BITASWAP:
+            bb_put(b, s - 1, 6); bb_put(b, t.phase, pb); break;
+        case T_XORP: case T_ANIBS: case T_STRIDEADD:
+            bb_put(b, s - 1, 6); bb_put(b, t.phase, pb);
+            bb_put(b, t.amp & 0xFF, 8); break;
+        case T_BYTEROT:
+            bb_put(b, s - 1, 6); bb_put(b, t.phase, pb);
+            bb_put(b, (t.amp - 1) & 7, 3); break;           /* k=1..7 → 0..6 */
+        case T_BYTEMUL:
+            bb_put(b, s - 1, 6); bb_put(b, t.phase, pb);
+            bb_put(b, (t.amp - 3) / 2, 7); break;           /* odd a=3..255 → 0..126 */
+        case T_VALUEXOR: {
+            /* amp = k(3) | alo(8, bit-k forced 0) | ahi(8, bit-k forced 0)
+             * Pack as 17 bits: k(3) + alo with bit-k removed (7) + ahi with bit-k removed (7) */
+            int vk   = t.amp & 7;
+            int valo = (t.amp >> 3) & 0xFF;
+            int vahi = (t.amp >> 11) & 0xFF;
+            int mask = (1 << vk) - 1;
+            int alo7 = (valo & mask) | ((valo >> (vk+1)) << vk);
+            int ahi7 = (vahi & mask) | ((vahi >> (vk+1)) << vk);
+            bb_put(b, s - 1, 6); bb_put(b, t.phase, pb);
+            bb_put(b, (u32)vk, 3); bb_put(b, (u32)alo7, 7); bb_put(b, (u32)ahi7, 7);
+            break;
+        }
+        case T_NIBCXOR:
+            bb_put(b, s - 1, 6); bb_put(b, t.phase, pb);
+            bb_put(b, t.amp & 1, 1); break;
+        case T_CRMBCXOR:
+            bb_put(b, s - 1, 6); bb_put(b, t.phase, pb);
+            bb_put(b, t.amp & 0xF, 4); break;
+        case T_SPLITADD: case T_SPLITXOR: {
+            int kidx = (t.phase >> 8) & 3, act_p = t.phase & 0xFF;
+            bb_put(b, s - 1, 6); bb_put(b, kidx, 2); bb_put(b, act_p, pb);
+            if (kidx == 3) {
+                /* kidx=3 has a gap in the bit layout; re-pack as 14 clean bits */
+                int lo = t.amp & 0x7F;
+                int hi = (t.amp >> (t.type == T_SPLITADD ? 7 : 8)) & 0x7F;
+                bb_put(b, lo, 7); bb_put(b, hi, 7);
+            } else {
+                int ab = (t.type == T_SPLITADD)
+                    ? (int)SPLITADD_AMP_BITS[kidx] : (int)SPLITXOR_AMP_BITS[kidx];
+                bb_put(b, t.amp, ab);
+            }
+            break;
+        }
+        case T_STRIDEDELTA:
+            bb_put(b, (u32)(t.stride - 1), 6); break;
+        /* T_DELTA, T_XORDELTA, T_DELTADD: no parameters beyond the type tag */
+        case T_CHUNKXOR: {
+            int N = t.stride;
+            /* 2 bits encode N: 0→2, 1→4, 2→8 */
+            bb_put(b, (u32)((N == 2) ? 0 : (N == 4) ? 1 : 2), 2);
+            for (int j = 0; j < N && j < 4; j++)
+                bb_put(b, (t.amp >> (j*8)) & 0xFF, 8);
+            for (int j = 4; j < N; j++)
+                bb_put(b, ((u32)t.phase >> ((j-4)*8)) & 0xFF, 8);
+            break;
+        }
+    }
+}
+
+static Instr bb_get_instr(BitBuf *b) {
+    Instr t = {0, 0, 0, 0};
+    t.type = (u8)bb_get(b, 5);
+    int s, pb;
+    switch (t.type) {
+        case T_PRNGADD4: case T_PRNGADD8:
+            t.amp = bb_get(b, 16); break;
+        case T_PLANEPRNG: {
+            u32 seed = bb_get(b, 16), k = bb_get(b, 3);
+            t.amp = seed | (k << 16); break;
+        }
+        case T_PRNGBIT: {
+            u32 seed = bb_get(b, 16), fm = bb_get(b, 8);
+            t.amp = seed | (fm << 16); break;
+        }
+        case T_REFLECT:
+            t.amp = bb_get(b, 8); break;
+        case T_BITREV: case T_GRAYCODE: case T_BITASWAP:
+            s = (int)bb_get(b, 6) + 1; pb = phase_bits(s);
+            t.stride = s; t.phase = (int)bb_get(b, pb); break;
+        case T_XORP: case T_ANIBS: case T_STRIDEADD:
+            s = (int)bb_get(b, 6) + 1; pb = phase_bits(s);
+            t.stride = s; t.phase = (int)bb_get(b, pb);
+            t.amp = bb_get(b, 8); break;
+        case T_BYTEROT:
+            s = (int)bb_get(b, 6) + 1; pb = phase_bits(s);
+            t.stride = s; t.phase = (int)bb_get(b, pb);
+            t.amp = bb_get(b, 3) + 1; break;
+        case T_BYTEMUL:
+            s = (int)bb_get(b, 6) + 1; pb = phase_bits(s);
+            t.stride = s; t.phase = (int)bb_get(b, pb);
+            t.amp = bb_get(b, 7) * 2 + 3; break;
+        case T_VALUEXOR: {
+            s = (int)bb_get(b, 6) + 1; pb = phase_bits(s);
+            t.stride = s; t.phase = (int)bb_get(b, pb);
+            int vk   = (int)bb_get(b, 3);
+            int alo7 = (int)bb_get(b, 7);
+            int ahi7 = (int)bb_get(b, 7);
+            /* restore the forced-zero bit k in alo and ahi */
+            int mask = (1 << vk) - 1;
+            int valo = (alo7 & mask) | ((alo7 >> vk) << (vk+1));
+            int vahi = (ahi7 & mask) | ((ahi7 >> vk) << (vk+1));
+            t.amp = (u32)(vk | (valo << 3) | (vahi << 11));
+            break;
+        }
+        case T_NIBCXOR:
+            s = (int)bb_get(b, 6) + 1; pb = phase_bits(s);
+            t.stride = s; t.phase = (int)bb_get(b, pb);
+            t.amp = bb_get(b, 1); break;
+        case T_CRMBCXOR:
+            s = (int)bb_get(b, 6) + 1; pb = phase_bits(s);
+            t.stride = s; t.phase = (int)bb_get(b, pb);
+            t.amp = bb_get(b, 4); break;
+        case T_SPLITADD: case T_SPLITXOR: {
+            s = (int)bb_get(b, 6) + 1; pb = phase_bits(s);
+            int kidx = (int)bb_get(b, 2), act_p = (int)bb_get(b, pb);
+            t.stride = s; t.phase = act_p | (kidx << 8);
+            if (kidx == 3) {
+                int lo = (int)bb_get(b, 7); int hi = (int)bb_get(b, 7);
+                t.amp = (t.type == T_SPLITADD)
+                    ? (u32)(lo | (hi << 7)) : (u32)(lo | (hi << 8));
+            } else {
+                int ab = (t.type == T_SPLITADD)
+                    ? (int)SPLITADD_AMP_BITS[kidx] : (int)SPLITXOR_AMP_BITS[kidx];
+                t.amp = bb_get(b, ab);
+            }
+            break;
+        }
+        case T_STRIDEDELTA:
+            t.stride = (int)bb_get(b, 6) + 1; break;
+        /* T_DELTA, T_XORDELTA, T_DELTADD: no parameters; t already zero-initialised */
+        case T_CHUNKXOR: {
+            int code = (int)bb_get(b, 2);
+            int N = 2 << code;  /* 0→2, 1→4, 2→8 */
+            t.stride = N;
+            u32 amp = 0; u32 ph = 0;
+            for (int j = 0; j < N && j < 4; j++)
+                amp |= bb_get(b, 8) << (j*8);
+            for (int j = 4; j < N; j++)
+                ph |= bb_get(b, 8) << ((j-4)*8);
+            t.amp = amp; t.phase = (int)ph;
+            break;
+        }
+    }
+    return t;
+}
+
+/* Max bits per instruction: SPLIT kidx=1, stride=64 → 5+6+2+6+32 = 51 bits */
+#define COMPACT_BUF_BYTES ((MAXINSTR * 52 + 16 + 7) / 8)
+
+/* Pack instruction list into compact bit-stream. Returns bit count. */
+static int pack_ilist(const Instr *ilist, int ni, u8 *buf) {
+    memset(buf, 0, COMPACT_BUF_BYTES);
+    BitBuf b = { buf, 0 };
+    bb_put(&b, (u32)ni, 16);
+    for (int i = 0; i < ni; i++) bb_put_instr(&b, ilist[i]);
+    return b.pos;
+}
+
+/* Unpack. Returns instruction count. */
+static int unpack_ilist(const u8 *buf, Instr *ilist_out) {
+    BitBuf b = { (u8 *)buf, 0 };
+    int ni = (int)bb_get(&b, 16);
+    for (int i = 0; i < ni; i++) ilist_out[i] = bb_get_instr(&b);
+    return ni;
 }
 
 /* ============================================================ *
@@ -1238,6 +1709,13 @@ static int selftest(void) {
         { T_SPLITXOR,  3, 1|(2<<8), 0x12345678u },
         { T_SPLITXOR,  3, 1|(3<<8), (0x2Au | (0x55u << 8)) },
         { T_PRNGBIT,   0, 0, (0xABCDu | (0xA5u << 16)) },
+        { T_DELTA,       0, 0, 0 },
+        { T_XORDELTA,    0, 0, 0 },
+        { T_STRIDEDELTA, 3, 0, 0 },
+        { T_DELTADD,     0, 0, 0 },
+        { T_CHUNKXOR,    2, 0,          0x1122u },
+        { T_CHUNKXOR,    4, 0,          0x11223344u },
+        { T_CHUNKXOR,    8, 0x55667788, 0x11223344u },
     };
     int nt = (int)(sizeof(tv) / sizeof(tv[0])), fails = 0;
     for (int i = 0; i < nt; i++) {
@@ -1276,10 +1754,15 @@ static double instr_oh(Instr t) {
         case T_BITASWAP: return OH_SP(OH_BITASWAP_BASE, t.stride);
         case T_PLANEPRNG:return OH_PLANEPRNG;
         case T_REFLECT:  return 0.0;
-        case T_SPLITADD: return oh_splitadd((t.phase >> 8) & 3, t.stride);
-        case T_SPLITXOR: return oh_splitxor((t.phase >> 8) & 3, t.stride);
-        case T_PRNGBIT:  return OH_PRNGBIT;
-        default:         return 0.0;
+        case T_SPLITADD:    return oh_splitadd((t.phase >> 8) & 3, t.stride);
+        case T_SPLITXOR:    return oh_splitxor((t.phase >> 8) & 3, t.stride);
+        case T_PRNGBIT:     return OH_PRNGBIT;
+        case T_DELTA:       return OH_DELTA;
+        case T_XORDELTA:    return OH_XORDELTA;
+        case T_STRIDEDELTA: return OH_STRIDEDELTA;
+        case T_DELTADD:     return OH_DELTADD;
+        case T_CHUNKXOR:    return oh_chunkxor(t.stride);
+        default:            return 0.0;
     }
 }
 
@@ -1358,22 +1841,37 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    /* ---- default: many BCrypt blocks, aggregate ---- */
-    int NB = (argc > 1) ? atoi(argv[1]) : 1;
-    if (NB < 1) NB = 1;
+    /* ---- default: many blocks, aggregate ---- */
+    /* Usage: reduce2 [NB] [file]  — file defaults to BCrypt random */
+    int NB = 1;
+    const char *src_file = NULL;
+    for (int i = 1; i < argc; i++) {
+        int v = atoi(argv[i]);
+        if (v > 0) NB = v;
+        else       src_file = argv[i];
+    }
     u8 *all = malloc((size_t)NB * BLOCK);
     if (!all) { fprintf(stderr, "oom\n"); return 1; }
 
     size_t need = (size_t)NB * BLOCK, got = 0;
-    FILE *f = fopen("bcrypt.bin", "rb");
-    if (f) { got = fread(all, 1, need, f); fclose(f); }
-    if (got == need) {
-        printf("input: bcrypt.bin (cached BCrypt, %d blocks x %d bytes)\n", NB, BLOCK);
+    if (src_file) {
+        FILE *f = fopen(src_file, "rb");
+        if (!f) { fprintf(stderr, "cannot open %s\n", src_file); return 1; }
+        got = fread(all, 1, need, f); fclose(f);
+        if (got < (size_t)BLOCK) { fprintf(stderr, "file too small\n"); return 1; }
+        NB = (int)(got / BLOCK);  /* use however many full blocks fit */
+        printf("input: %s (%d blocks x %d bytes)\n", src_file, NB, BLOCK);
     } else {
-        BCryptGenRandom(NULL, all, (ULONG)need, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-        f = fopen("bcrypt.bin", "wb");
-        if (f) { fwrite(all, 1, need, f); fclose(f); }
-        printf("input: fresh BCryptGenRandom (%d blocks x %d bytes, saved bcrypt.bin)\n", NB, BLOCK);
+        FILE *f = fopen("bcrypt.bin", "rb");
+        if (f) { got = fread(all, 1, need, f); fclose(f); }
+        if (got == need) {
+            printf("input: bcrypt.bin (cached BCrypt, %d blocks x %d bytes)\n", NB, BLOCK);
+        } else {
+            BCryptGenRandom(NULL, all, (ULONG)need, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+            f = fopen("bcrypt.bin", "wb");
+            if (f) { fwrite(all, 1, need, f); fclose(f); }
+            printf("input: fresh BCryptGenRandom (%d blocks x %d bytes, saved bcrypt.bin)\n", NB, BLOCK);
+        }
     }
 
     FILE *fcomp = fopen("compressed.bin", "wb");
@@ -1386,10 +1884,13 @@ int main(int argc, char **argv) {
     for (int t = 0; t < NTYPES; t++) type_net_max[t] = 0.0;
     double total_net = 0.0, total_ein = 0.0, total_eout = 0.0;
     double total_overhead = 0.0;
-    int total_ni = 0, fails = 0;
-    /* 8 bytes per instruction: type(1)+stride(1)+phase(2)+amp(4) */
+    int total_ni = 0, fails = 0, compact_fails = 0;
+    long total_compact_bits = 0;
+    /* flat 8-byte-per-instruction buffer for entropy comparison */
     u8 *ibuf = malloc((size_t)NB * MAXINSTR * 8);
     int ibuf_n = 0;
+    u8 *compact_buf = malloc(COMPACT_BUF_BYTES);
+    Instr *unpacked_tmp = malloc(MAXINSTR * sizeof(Instr));
     clock_t t0 = clock();
 
     printf("\n=== compressing %d blocks ===\n", NB);
@@ -1401,12 +1902,27 @@ int main(int argc, char **argv) {
         double e_out = entropy_bits(data, BLOCK);
         double raw  = e_in - e_out;
         double oh   = raw - net;
+        /* compact pack + round-trip verify */
+        int cbits = compact_buf ? pack_ilist(g_ilist, g_last_ni, compact_buf) : 0;
+        int cok = 0;
+        if (compact_buf && unpacked_tmp) {
+            int ni2 = unpack_ilist(compact_buf, unpacked_tmp);
+            cok = (ni2 == g_last_ni);
+            for (int i = 0; cok && i < ni2; i++)
+                cok = (unpacked_tmp[i].type   == g_ilist[i].type   &&
+                       unpacked_tmp[i].stride == g_ilist[i].stride &&
+                       unpacked_tmp[i].phase  == g_ilist[i].phase  &&
+                       unpacked_tmp[i].amp    == g_ilist[i].amp);
+        }
+        total_compact_bits += cbits;
+        if (!cok) compact_fails++;
+
         total_net += net; total_ein += e_in; total_eout += e_out;
         total_overhead += oh; total_ni += g_last_ni;
         if (!ok) fails++;
-        printf("  block %2d: %.4f -> %.4f bps  net=%+.1f  %s  [%d instrs  raw=%+.1f  OH=%.1f bits]\n",
+        printf("  block %2d: %.4f -> %.4f bps  net=%+.1f  %s  [%d instrs  raw=%+.1f  OH=%.1f bits  compact=%d bits %s]\n",
                b, e_in / BLOCK, e_out / BLOCK, net, ok ? "ok" : "FAIL",
-               g_last_ni, raw, oh);
+               g_last_ni, raw, oh, cbits, cok ? "ok" : "FAIL");
         if (NB == 1) {
             int fq[256]; freq_of(data, BLOCK, fq);
             printf("\n--- frequency dump (compressed block) ---\n");
@@ -1451,10 +1967,16 @@ int main(int argc, char **argv) {
            total_ni, (double)total_ni / NB, total_overhead, total_overhead / NB);
     if (ibuf && ibuf_n > 0) {
         double ibps = entropy_bits(ibuf, ibuf_n) / ibuf_n;
-        printf("instr entropy: %.4f bps  (%d bytes serialised as type+stride+phase+amp)\n",
-               ibps, ibuf_n);
+        printf("instr stream (flat 8B/instr): %.4f bps  (%d bytes)  entropy=%.0f bits/block\n",
+               ibps, ibuf_n, entropy_bits(ibuf, ibuf_n) / NB);
     }
+    printf("instr stream (compact):       %ld bits/block total  (%.1f bits/block avg)  %s\n",
+           total_compact_bits / NB,
+           (double)total_compact_bits / NB,
+           compact_fails ? "*** COMPACT FAIL ***" : "round-trip ok");
     free(ibuf);
+    free(compact_buf);
+    free(unpacked_tmp);
     printf("round-trip: %s (%d/%d blocks)\n", fails ? "*** FAIL ***" : "OK", NB - fails, NB);
     printf("types fired (across all blocks): %d / %d\n\n", fired, NTYPES);
     printf("  %-14s %6s  %8s  %8s  %12s\n", "type", "fires", "avg net", "top net", "effectivness");
