@@ -53,13 +53,23 @@ static inline u8 xs32_step(u32 *s) {
     return (u8)(x ^ (x>>8) ^ (x>>16) ^ (x>>24));
 }
 
+/* log2 lookup table: g_xl2x[c] = c * log2(c), g_xl2x[0] = 0.
+ * Entropy: S = log2(N) - (1/N) * sum_v(g_xl2x[freq[v]])  */
+static double g_xl2x[N + 1];
+static double g_log2N;
+
+static void init_lut(void) {
+    g_log2N = log2((double)N);
+    g_xl2x[0] = 0.0;
+    for (int c = 1; c <= N; c++) g_xl2x[c] = c * log2((double)c);
+}
+
 static double entropy_of(const u8 *buf, int n) {
     int f[256] = {0};
     for (int i = 0; i < n; i++) f[buf[i]]++;
-    double S = 0.0;
-    for (int v = 0; v < 256; v++)
-        if (f[v]) { double p = (double)f[v]/n; S -= p*log2(p); }
-    return S;
+    double xsum = 0.0;
+    for (int v = 0; v < 256; v++) xsum += g_xl2x[f[v]];
+    return g_log2N - xsum / n;
 }
 
 static int bit_length(int n) { int b=0; while(n>0){b++;n>>=1;} return b; }
@@ -243,39 +253,45 @@ static int s_bitlen(int n) { int b = 0; while (n > 0) { b++; n >>= 1; } return b
 /* overhead = 5 (B field, covers 2..32) + B (pattern bits) + 2 (op) + 8 (amp) */
 static double split_oh(int B) { return (double)(5 + B + 2 + 8); }
 
-/* 4 genuinely distinct ops under exhaustive amp search:
- * ADD covers SUB (ADD(b,256-a)=SUB(b,a)), XOR covers XNOR (XOR(b,a^0xFF)),
- * NADD covers RSUB (NADD(b,a+1)=RSUB(b,a)), ROTL covers ROTR (ROTL(b,8-r)) */
-/* op codes: 0=ADD 1=XOR 2=NADD 3=ROTL */
-static const char *SPLIT_OP_NAME[4] = {"ADD","XOR","NADD","ROTL"};
+/* split layer uses ops 0-3 (ADD/XOR/NADD/ROTL) — 2 op bits */
 
 typedef struct { int B; u32 pat; u8 amp; int op; } SplitInstr;
 
 static inline u8 rotl8(u8 b, int r) { r &= 7; return r ? (u8)((b<<r)|(b>>(8-r))) : b; }
 static inline u8 rotr8(u8 b, int r) { r &= 7; return r ? (u8)((b>>r)|(b<<(8-r))) : b; }
 
-/* Apply op to a single byte */
-static inline u8 split_op(u8 b, u8 amp, int op) {
+/* 8-op set (ops 0-3 used by split layer, 0-7 used by strided layer):
+ * 0=ADD 1=XOR 2=NADD 3=ROTL 4=SUB 5=XNOR 6=RSUB 7=ROTR */
+static const char *OP8_NAME[8] = {"ADD","XOR","NADD","ROTL","SUB","XNOR","RSUB","ROTR"};
+
+static inline u8 byte_op(u8 b, u8 amp, int op) {
     switch (op) {
         case 0: return (u8)(b + amp);           /* ADD  */
         case 1: return (u8)(b ^ amp);           /* XOR  */
         case 2: return (u8)(~b + amp);          /* NADD (self-inverse) */
-        default:return rotl8(b, amp);           /* ROTL */
+        case 3: return rotl8(b, amp);           /* ROTL */
+        case 4: return (u8)(b - amp);           /* SUB  */
+        case 5: return (u8)(~(b ^ amp));        /* XNOR (self-inverse) */
+        case 6: return (u8)(amp - b);           /* RSUB (self-inverse) */
+        default:return rotr8(b, amp);           /* ROTR */
     }
 }
 
-/* Inverse op */
-static inline u8 split_op_inv(u8 b, u8 amp, int op) {
+static inline u8 byte_op_inv(u8 b, u8 amp, int op) {
     switch (op) {
         case 0: return (u8)(b - amp);           /* ADD^-1 = SUB */
         case 1: return (u8)(b ^ amp);           /* XOR self-inverse */
         case 2: return (u8)(~b + amp);          /* NADD self-inverse */
-        default:return rotr8(b, amp);           /* ROTL^-1 = ROTR */
+        case 3: return rotr8(b, amp);           /* ROTL^-1 = ROTR */
+        case 4: return (u8)(b + amp);           /* SUB^-1 = ADD */
+        case 5: return (u8)(~(b ^ amp));        /* XNOR self-inverse */
+        case 6: return (u8)(amp - b);           /* RSUB self-inverse */
+        default:return rotl8(b, amp);           /* ROTR^-1 = ROTL */
     }
 }
 
 static double split_best(const u8 *buf, double S_cur, SplitInstr *out) {
-    double best_net = -1e18;
+    double best_val = -1e18;
     out->B = SPLIT_MIN_B; out->pat = 0; out->amp = 0; out->op = 0;
 
     for (int B = SPLIT_MIN_B; B <= SPLIT_MAX_B; B++) {
@@ -310,34 +326,33 @@ static double split_best(const u8 *buf, double S_cur, SplitInstr *out) {
              * rf[w] = f0[w] + f1[op_inv(w, amp)]  (avoids per-byte scatter) */
             for (int amp = 0; amp < 256; amp++) {
                 for (int op = 0; op < 4; op++) {
-                    int rf[256];
+                    double xsum = 0.0;
                     for (int w = 0; w < 256; w++)
-                        rf[w] = f0[w] + f1[split_op_inv((u8)w, (u8)amp, op)];
-                    double S_new = 0.0;
-                    for (int v = 0; v < 256; v++)
-                        if (rf[v]) { double p = (double)rf[v] / N; S_new -= p * log2(p); }
+                        xsum += g_xl2x[f0[w] + f1[byte_op_inv((u8)w, (u8)amp, op)]];
+                    double S_new = g_log2N - xsum * (1.0 / N);
                     double net = (S_cur - S_new) * N - oh;
-                    if (net > best_net) {
-                        best_net = net; out->B = B; out->pat = pat;
+                    double val = net / oh;
+                    if (val > best_val) {
+                        best_val = val; out->B = B; out->pat = pat;
                         out->amp = (u8)amp; out->op = op;
                     }
                 }
             }
         }
     }
-    return best_net;
+    return best_val;
 }
 
 static void split_apply(u8 *buf, SplitInstr t) {
     for (int i = 0; i < N; i++)
         if ((t.pat >> (i % t.B)) & 1)
-            buf[i] = split_op(buf[i], t.amp, t.op);
+            buf[i] = byte_op(buf[i], t.amp, t.op);
 }
 
 static void split_invert(u8 *buf, SplitInstr t) {
     for (int i = 0; i < N; i++)
         if ((t.pat >> (i % t.B)) & 1)
-            buf[i] = split_op_inv(buf[i], t.amp, t.op);
+            buf[i] = byte_op_inv(buf[i], t.amp, t.op);
 }
 
 typedef struct { int rounds; double S_out, total_oh; } SplitResult;
@@ -346,23 +361,25 @@ static SplitResult run_split_layer(u8 *work, double S_in, int verbose) {
     double total_oh = 0.0, S_cur = S_in;
     int round = 0;
     if (verbose) {
-        printf("\n--- split layer (11-bit OH/instr) ---\n");
-        printf("  rnd   B  pat         op   amp  H_before    H_after     net     OH\n");
-        printf("  ---  --  ----------  ---  ---  --------    -------     ---     --\n");
+        printf("\n--- split layer ---\n");
+        printf("  rnd   B  pat         op   amp  H_before    H_after     net     OH    value\n");
+        printf("  ---  --  ----------  ---  ---  --------    -------     ---     --    -----\n");
     }
     for (;;) {
         SplitInstr best;
-        double net = split_best(work, S_cur, &best);
-        if (net <= 0.0) {
-            if (verbose) printf("  (best net=%.1f -- stopping)\n", net);
+        double val = split_best(work, S_cur, &best);
+        if (val <= 0.0) {
+            if (verbose) printf("  (best value=%.4f -- stopping)\n", val);
             break;
         }
+        double oh = split_oh(best.B);
         split_apply(work, best);
         double S_new = entropy_of(work, N);
+        double net = (S_cur - S_new) * N - oh;
         if (verbose)
-            printf("  %3d  %2d  0x%08X  %-4s  %3u  %.6f   %.6f    %+.1f   %.0f\n",
-                   round + 1, best.B, best.pat, SPLIT_OP_NAME[best.op], best.amp,
-                   S_cur, S_new, net, split_oh(best.B));
+            printf("  %3d  %2d  0x%08X  %-4s  %3u  %.6f   %.6f    %+.4f   %.0f   %+.4f\n",
+                   round + 1, best.B, best.pat, OP8_NAME[best.op], best.amp,
+                   S_cur, S_new, net, oh, val);
         S_cur = S_new;
         total_oh += split_oh(best.B);
         round++;
@@ -370,10 +387,103 @@ static SplitResult run_split_layer(u8 *work, double S_in, int verbose) {
     return (SplitResult){ round, S_cur, total_oh };
 }
 
+/* =====================================================================
+ * Strided-add layer: every stride-th byte (phase=0), op(byte, amp)
+ * stride width W: 1..6 bits, covering strides 1..2^W
+ * overhead = 3 (W field, W in 1..6) + W (stride value) + 3 (op) + 8 (amp)
+ *          = W + 14  (ranges 15..20)
+ * ===================================================================== */
+
+#define STRIDED_MAX 64   /* max stride = 2^6 */
+
+/* minimum bits needed to store stride s */
+static int stride_bits(int s) { int w = 1; while ((1 << w) < s) w++; return w; }
+static double strided_oh(int s) { return (double)(stride_bits(s) + 3 + 8); }
+
+typedef struct { int stride; u8 amp; int op; } StridedInstr;
+
+static double strided_best(const u8 *buf, double S_cur, StridedInstr *out) {
+    double best_val = -1e18;
+    out->stride = 1; out->amp = 0; out->op = 0;
+
+    /* precompute full histogram once */
+    int ftotal[256] = {0};
+    for (int i = 0; i < N; i++) ftotal[buf[i]]++;
+
+    for (int s = 1; s <= STRIDED_MAX; s++) {
+        /* histogram of selected bytes (phase=0: positions 0,s,2s,...) */
+        int fsel[256] = {0};
+        for (int i = 0; i < N; i += s) fsel[buf[i]]++;
+
+        /* unselected = total - selected */
+        int funsel[256];
+        for (int v = 0; v < 256; v++) funsel[v] = ftotal[v] - fsel[v];
+
+        double oh = strided_oh(s);
+        /* merged[v] = funsel[v] + fsel[byte_op_inv(v, amp, op)] */
+        for (int amp = 0; amp < 256; amp++) {
+            for (int op = 0; op < 8; op++) {
+                double xsum = 0.0;
+                for (int v = 0; v < 256; v++)
+                    xsum += g_xl2x[funsel[v] + fsel[byte_op_inv((u8)v, (u8)amp, op)]];
+                double S_new = g_log2N - xsum * (1.0 / N);
+                double net = (S_cur - S_new) * N - oh;
+                double val = net / oh;
+                if (val > best_val) {
+                    best_val = val; out->stride = s; out->amp = (u8)amp; out->op = op;
+                }
+            }
+        }
+    }
+    return best_val;
+}
+
+static void strided_apply(u8 *buf, StridedInstr t) {
+    for (int i = 0; i < N; i += t.stride)
+        buf[i] = byte_op(buf[i], t.amp, t.op);
+}
+
+static void strided_invert(u8 *buf, StridedInstr t) {
+    for (int i = 0; i < N; i += t.stride)
+        buf[i] = byte_op_inv(buf[i], t.amp, t.op);
+}
+
+typedef struct { int rounds; double S_out, total_oh; } StridedResult;
+
+static StridedResult run_strided_layer(u8 *work, double S_in, int verbose) {
+    double total_oh = 0.0, S_cur = S_in;
+    int round = 0;
+    if (verbose) {
+        printf("\n--- strided layer (W+14 OH/instr) ---\n");
+        printf("  rnd  stride  op    amp  H_before    H_after     net     OH    value\n");
+        printf("  ---  ------  ----  ---  --------    -------     ---     --    -----\n");
+    }
+    for (;;) {
+        StridedInstr best;
+        double val = strided_best(work, S_cur, &best);
+        if (val <= 0.0) {
+            if (verbose) printf("  (best value=%.4f -- stopping)\n", val);
+            break;
+        }
+        strided_apply(work, best);
+        double S_new = entropy_of(work, N);
+        double oh  = strided_oh(best.stride);
+        double net = (S_cur - S_new) * N - oh;
+        if (verbose)
+            printf("  %3d  %6d  %-4s  %3u  %.6f   %.6f    %+.4f   %.0f   %+.4f\n",
+                   round + 1, best.stride, OP8_NAME[best.op], best.amp,
+                   S_cur, S_new, net, oh, val);
+        S_cur = S_new;
+        total_oh += oh;
+        round++;
+    }
+    return (StridedResult){ round, S_cur, total_oh };
+}
+
 typedef struct {
-    int prng_rounds, split_rounds;
-    double S_init, S_after_prng, S_final;
-    double prng_oh, split_oh;
+    int prng_rounds, split_rounds, strided_rounds;
+    double S_init, S_after_prng, S_after_split, S_final;
+    double prng_oh, split_oh, strided_oh;
 } BlockResult;
 
 static BlockResult run_block(const u8 *input, u8 *transformed, int verbose) {
@@ -405,7 +515,7 @@ static BlockResult run_block(const u8 *input, u8 *transformed, int verbose) {
 
         prng_rounds++;
         if (verbose)
-            printf("  %3d  %d  %2d   %2.0f   %-4s   %10u   %.6f   %.6f    %+.1f   %+.4f\n",
+            printf("  %3d  %d  %2d   %2.0f   %-4s   %10u   %.6f   %.6f    %+.4f   %+.4f\n",
                    prng_rounds, bK, bB, oh, OP_NAME[bop], bseed,
                    S_cur, bS, net, bval);
 
@@ -415,13 +525,17 @@ static BlockResult run_block(const u8 *input, u8 *transformed, int verbose) {
     }
 
     double S_after_prng = entropy_of(work, N);
-    SplitResult sr = run_split_layer(work, S_after_prng, verbose);
+    SplitResult    sr = run_split_layer(work, S_after_prng, verbose);
+    StridedResult  tr = run_strided_layer(work, sr.S_out, verbose);
 
     if (transformed) memcpy(transformed, work, N);
-    return (BlockResult){ prng_rounds, sr.rounds, S_initial, S_after_prng, sr.S_out, prng_oh, sr.total_oh };
+    return (BlockResult){ prng_rounds, sr.rounds, tr.rounds,
+                          S_initial, S_after_prng, sr.S_out, tr.S_out,
+                          prng_oh, sr.total_oh, tr.total_oh };
 }
 
 int main(int argc, char **argv) {
+    init_lut();
     /* gen mode: prng_inspect gen <N> [file]  — write N random 4096-byte blocks */
     if (argc >= 2 && strcmp(argv[1], "gen") == 0) {
         int NB = (argc >= 3) ? atoi(argv[2]) : 20;
@@ -468,28 +582,32 @@ int main(int argc, char **argv) {
 
     for (int b = 0; b < NB; b++) {
         BlockResult r = run_block(all + (size_t)b * N, verbose ? transformed : NULL, verbose);
-        double prng_red  = (r.S_init       - r.S_after_prng) * N;
-        double split_red = (r.S_after_prng - r.S_final)      * N;
-        double total_red = prng_red + split_red;
-        double net       = total_red - r.prng_oh - r.split_oh;
+        double prng_red    = (r.S_init        - r.S_after_prng)  * N;
+        double split_red   = (r.S_after_prng  - r.S_after_split) * N;
+        double strided_red = (r.S_after_split - r.S_final)       * N;
+        double total_red   = prng_red + split_red + strided_red;
+        double net         = total_red - r.prng_oh - r.split_oh - r.strided_oh;
         total_net += net;
 
         if (verbose) {
-            printf("\nPRNG:  %2d instrs | OH: %5.0f bits | reduction: %6.1f bits | net: %+.1f\n",
-                   r.prng_rounds,  r.prng_oh,  prng_red,  prng_red  - r.prng_oh);
-            printf("SPLIT: %2d instrs | OH: %5.0f bits | reduction: %6.1f bits | net: %+.1f\n",
-                   r.split_rounds, r.split_oh, split_red, split_red - r.split_oh);
-            printf("TOTAL:            | OH: %5.0f bits | reduction: %6.1f bits | net: %+.1f\n",
-                   r.prng_oh + r.split_oh, total_red, net);
-            printf("H: %.6f -> %.6f -> %.6f bps\n", r.S_init, r.S_after_prng, r.S_final);
+            printf("\nPRNG:    %2d instrs | OH: %5.0f bits | reduction: %6.1f bits | net: %+.1f\n",
+                   r.prng_rounds,    r.prng_oh,    prng_red,    prng_red    - r.prng_oh);
+            printf("SPLIT:   %2d instrs | OH: %5.0f bits | reduction: %6.1f bits | net: %+.1f\n",
+                   r.split_rounds,   r.split_oh,   split_red,   split_red   - r.split_oh);
+            printf("STRIDED: %2d instrs | OH: %5.0f bits | reduction: %6.1f bits | net: %+.1f\n",
+                   r.strided_rounds, r.strided_oh, strided_red, strided_red - r.strided_oh);
+            printf("TOTAL:              | OH: %5.0f bits | reduction: %6.1f bits | net: %+.1f\n",
+                   r.prng_oh + r.split_oh + r.strided_oh, total_red, net);
+            printf("H: %.6f -> %.6f -> %.6f -> %.6f bps\n",
+                   r.S_init, r.S_after_prng, r.S_after_split, r.S_final);
             FILE *f;
             f = fopen("original.bin",    "wb"); fwrite(all, 1, N, f); fclose(f);
             f = fopen("transformed.bin", "wb"); fwrite(transformed, 1, N, f); fclose(f);
             printf("wrote original.bin and transformed.bin\n");
         } else {
-            printf("  block %3d: %.6f->%.6f->%.6f  p=%d s=%d  net=%+7.1f\n",
-                   b, r.S_init, r.S_after_prng, r.S_final,
-                   r.prng_rounds, r.split_rounds, net);
+            printf("  block %3d: %.6f->%.6f->%.6f->%.6f  p=%d s=%d t=%d  net=%+7.1f\n",
+                   b, r.S_init, r.S_after_prng, r.S_after_split, r.S_final,
+                   r.prng_rounds, r.split_rounds, r.strided_rounds, net);
             fflush(stdout);
         }
     }
