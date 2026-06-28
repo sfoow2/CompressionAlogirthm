@@ -26,7 +26,7 @@ typedef uint8_t u8;
 /* Overhead model: instructions with stride+phase cost INSTR_BASE + amp bits.
  * Instructions without stride/phase (LAG_XOR, SCRAMBLE) cost INSTR_BASE_NOPHASE + amp bits.
  * INSTR_BASE covers type+stride+phase; INSTR_BASE_NOPHASE covers type only (~5 bits).
- * Amp bits by type: xor/add_phase(8), cond_*(8), value_xor(17), dual(16), dual_mul(14),
+ * Amp bits by type: xor/add_phase(8), cond_*(8), value_xor(19), dual(16), dual_mul(14),
  *   nib_swap/pack_xor(0), bit_rotate(3), lag_xor(8), scramble(4), triple(24/21), quad(32/28). */
 #define INSTR_BASE          12
 #define INSTR_BASE_NOPHASE   5   /* type only: log2(24)~4.6 bits, no stride/phase */
@@ -143,7 +143,7 @@ typedef enum {
     NIB_SWAP,       /* data[i] = (data[i]<<4)|(data[i]>>4), self-inverse       */
     /* 15-bit overhead (12 base + 3-bit k) */
     BIT_ROTATE,     /* data[i] = rotl(data[i], k); inverse is rotl(_, 8-k)    */
-    /* 29-bit overhead (12 base + 17-bit amp); k=amp&7, alo=amp>>3 (7 eff), ahi=amp>>11 (7 eff) */
+    /* 31-bit overhead (12 base + 19-bit amp); k=amp&7 (3b), alo=amp>>3 (8b), ahi=amp>>11 (8b) */
     VALUE_XOR,      /* (data[i]>>k)&1 ? ^ahi : ^alo; amps have bit k=0, self-inv */
     /* 28-bit overhead (12 base + 16-bit amp: lo|hi<<8) */
     DUAL_XOR,       /* even ^= (amp&0xFF), odd ^= ((amp>>8)&0xFF)              */
@@ -158,10 +158,10 @@ typedef enum {
     POLY_DELTA_XOR, /* data[i] ^= data[i-s1]^data[i-s2] for i>=s2             */
     /* 9-bit overhead (5-bit type-only base + 4-bit index; no stride/phase) */
     SCRAMBLE,       /* position rearrangement; amp encodes scramble type        */
-    /* 33-bit overhead (9 base + 3Ã—8 amp) */
+    /* 36-bit overhead (12 base + 3×8 amp) */
     TRIPLE_XOR,     /* group0 ^= a0, group1 ^= a1, group2 ^= a2 (pos mod 3)   */
     TRIPLE_ADD,     /* group0 += a0, group1 += a1, group2 += a2 (pos mod 3)   */
-    /* 30-bit overhead (9 base + 3Ã—7 amp) */
+    /* 33-bit overhead (12 base + 3×7 amp) */
     TRIPLE_MUL,     /* group0 *= m0, group1 *= m1, group2 *= m2; idx per 7b   */
     /* 44-bit overhead (12 base + 4x8 amp packed as uint32) */
     QUAD_XOR,       /* group0^a0, group1^a1, group2^a2, group3^a3 (pos mod 4) */
@@ -740,7 +740,7 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
                     int vx = v ^ ((v & mask) ? bahi : balo);
                     Svx += hlog[dv[v] + phF[vx]];
                 }
-                double nvx = (Svx - Sbase) - INSTR_OHD(17);
+                double nvx = (Svx - Sbase) - INSTR_OHD(19);
                 if (nvx > bestNet) {
                     bestNet = nvx;
                     best = (Instr){VALUE_XOR, stride, phase, (unsigned)(k | (balo << 3) | (bahi << 11))};
@@ -879,8 +879,8 @@ static Instr findBest(const u8 *data, int n, double *netOut, int max_stride) {
 
             /* â”€â”€ TRIPLE_XOR / TRIPLE_ADD / TRIPLE_MUL: 3-way position split â”€â”€â”€â”€â”€â”€
              * Splits the (stride, phase) sequence into 3 groups by pos mod 3.
-             * Overhead: 9+24=33 bits (XOR/ADD), 9+21=30 bits (MUL).
-             * Replaces up to 3 individual instructions at 3Ã—17=51 or 3Ã—17=51 bits. */
+             * Overhead: 12+24=36 bits (XOR/ADD), 12+21=33 bits (MUL).
+             * Replaces up to 3 individual instructions at 3×20=60 or 3×20=60 bits. */
             {
                 int phF0[256]={0}, phF1[256]={0}, phF2[256]={0};
                 { int k=0; for (int i=phase; i<n; i+=stride, k++) {
@@ -1340,30 +1340,9 @@ int main(void) {
     int counts[NUM_INSTR_TYPES] = {0};
     double sum = 0.0;
 
-    /* load or generate seed data â€” seed.bin ensures reproducible runs */
     static u8 alldata[NUM_BLOCKS * BLOCK_SIZE];
-    {
-        FILE *sf = fopen("seed.bin", "rb");
-        int loaded = 0;
-        if (sf) {
-            size_t got = fread(alldata, 1, sizeof alldata, sf);
-            fclose(sf);
-            if (got == sizeof alldata) {
-                printf("loaded seed.bin (%d bytes)\n", (int)sizeof alldata);
-                loaded = 1;
-            } else {
-                printf("seed.bin wrong size (%d/%d bytes), regenerating\n",
-                       (int)got, (int)sizeof alldata);
-            }
-        }
-        if (!loaded) {
-            for (int b = 0; b < NUM_BLOCKS; b++)
-                fill_random(alldata + b * BLOCK_SIZE, BLOCK_SIZE);
-            sf = fopen("seed.bin", "wb");
-            if (sf) { fwrite(alldata, 1, sizeof alldata, sf); fclose(sf); }
-            printf("generated and saved seed.bin (%d bytes)\n", (int)sizeof alldata);
-        }
-    }
+    for (int b = 0; b < NUM_BLOCKS; b++)
+        fill_random(alldata + b * BLOCK_SIZE, BLOCK_SIZE);
 
     int decomp_fails = 0;
     for (int b = 0; b < NUM_BLOCKS; b++) {
