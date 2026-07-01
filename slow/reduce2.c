@@ -53,14 +53,18 @@ enum {
     T_BYTEMUL,   /* multiply each byte by odd constant a mod 256; amp=a (odd, 3..255)       */
     T_VALUEXOR,  /* bit-k conditional XOR: amp=k|(alo<<3)|(ahi<<11); preserves bit k        */
     T_BITREV,    /* reverse bit order within each byte; self-inverse; stride/phase           */
+    T_PRNGADD4,  /* 4-stream PRNG add: pos%4 selects stream, all derived from 1 master seed */
+    T_PRNGADD8,  /* 8-stream PRNG add: pos%8 selects stream, aligns with 8-byte Blowfish    */
     T_NIBCXOR,   /* cross-nibble XOR: amp=0→lo^=hi, amp=1→hi^=lo; self-inverse; stride/phase */
     T_CRMBCXOR,  /* cross-crumb XOR: XOR 2-bit crumb k with crumb j; amp=j|(k<<2); self-inv  */
     T_GRAYCODE,  /* Gray code: v→v^(v>>1); stride/phase                                     */
     T_BITASWAP,  /* swap adjacent bits (v&0xAA)>>1|(v&0x55)<<1; self-inverse; stride/phase  */
+    T_PLANEPRNG, /* PRNG XOR bit plane k with xs16 LSB; amp=seed|(k<<16); self-inverse       */
     T_REFLECT,   /* Elias remap around mode M: r=(v-M) signed, out=r>=0?2r:(-2r-1); amp=M   */
     T_SPLITADD,  /* N-way split ADD; kidx in phase[8..9]: 0=dual,1=quad,2=octo,3=half        */
     T_SPLITXOR,  /* N-way split XOR; kidx in phase[8..9]: 0=dual,1=quad,2=octo-nibble,3=half */
     T_PRNGBIT,   /* PRNG selects bit pos (0-7) per byte; XOR that bit with (amp>>bit_pos)&1  */
+    T_PRNGXOR8,  /* 8-stream PRNG XOR; pos%8 selects stream; self-inverse; amp=seed           */
     T_VALUEMAP4, /* 4-quartile value-conditional lo6 XOR; top-2 bits preserved -> self-inverse */
     T_SPLITBYTEMUL, /* N-way stride-split multiply by odd constants; kidx in phase[8]         */
     T_ROTXOR,    /* compound rotate-left-k then XOR-c; amp=(k-1)|(c<<3); inv=xor-then-rotright */
@@ -69,7 +73,8 @@ enum {
     T_DELTA,     /* delta: d[i] -= d[i-stride] (backwards pass); inv: cumsum forward               */
     T_DELTA2,    /* 2nd-order delta (Laplacian): d[i] -= 2*d[i-s] - d[i-2s]; inv: cumsum×2       */
     T_MTF,       /* Move-to-Front remap; inv: MTF decode; no params — overhead = TAGB only        */
-    NTYPES       /* = 23 */
+    T_PRNGBIT3,  /* 3 PRNG_BIT passes batched; fmask=0xFF; amp=seed1|(seed2<<16), stride=seed3  */
+    NTYPES       /* = 28 */
 };
 
 typedef struct { u8 type; int stride, phase; u32 amp; u8 consts[256]; } Instr;
@@ -124,10 +129,13 @@ static inline double pb_bits(int s) { return (s > 1) ? log2((double)s) : 0.0; }
 #define OH_BYTEMUL_BASE (TAGB + SB + 7.0)
 #define OH_VALUEXOR_BASE  (TAGB + SB + 17.0)
 #define OH_BITREV_BASE    (TAGB + SB)
+#define OH_PRNGADD4       (TAGB + 16.0)
+#define OH_PRNGADD8       (TAGB + 16.0)
 #define OH_NIBCXOR_BASE   (TAGB + SB + 1.0)
 #define OH_CRMBCXOR_BASE  (TAGB + SB + 4.0)
 #define OH_GRAYCODE_BASE  (TAGB + SB)
 #define OH_BITASWAP_BASE  (TAGB + SB)
+#define OH_PLANEPRNG      (TAGB + 19.0)  /* 16-bit seed + 3-bit plane index k */
 /* SPLIT_ADD: TAGB + SB + 2(kidx) + amp_bits(kidx) + pb_bits(s)
  * kidx=0 dual:2×8=16  kidx=1 quad:4×8=32  kidx=2 octo:8×4=32  kidx=3 half:2×7=14 */
 static const double SPLITADD_AMP_BITS[4] = {16.0, 32.0, 32.0, 14.0};
@@ -139,6 +147,7 @@ static inline double oh_splitxor(int kidx, int s) {
     return TAGB + SB + 2.0 + SPLITXOR_AMP_BITS[kidx] + pb_bits(s);
 }
 #define OH_PRNGBIT      (TAGB + 16.0 + 8.0)  /* 16-bit seed + 8-bit flip-mask */
+#define OH_PRNGXOR8    (TAGB + 16.0)
 #define OH_NIBSWAP_BASE (TAGB + SB)
 static double oh_splitbytemul(int kidx, int s) {
     return TAGB + SB + 1.0 + pb_bits(s) + (kidx == 0 ? 14.0 : 28.0);
@@ -147,6 +156,7 @@ static double oh_rotxor(int s)      { return TAGB + SB + pb_bits(s) + 11.0; } /*
 #define OH_DELTA_BASE  (TAGB + SB)  /* type tag + stride only, no phase or amp */
 #define OH_DELTA2_BASE (TAGB + SB)  /* same encoding as T_DELTA */
 #define OH_MTF_BASE    (TAGB)        /* no parameters at all */
+#define OH_PRNGBIT3    (TAGB + 3*(16.0+8.0))  /* 1 type tag + 3×(seed16 + fmask8) */
 static double oh_valuemap4(int s)   { return TAGB + SB + pb_bits(s) + 24.0; } /* 4×6-bit constants */
 
 /* ============================================================ *
@@ -316,6 +326,32 @@ static void ap_crmbcxor(u8 *d, int n, int s, int p, u32 amp) {
         d[i] ^= (u8)(((d[i] >> (2*j)) & 3) << (2*k));
 }
 
+/* Derive N sub-seeds from master by successive xs16 steps, then interleave by pos%N. */
+static void ap_prngadd4(u8 *d, int n, u32 amp) {
+    u16 ms = (u16)(amp & 0xFFFF);
+    u16 s[4]; s[0]=ms; s[1]=xs16_next(&ms); s[2]=xs16_next(&ms); s[3]=xs16_next(&ms);
+    for (int i = 0; i < n; i++) d[i] = (u8)(d[i] + xs16_next(&s[i & 3]));
+}
+static void inv_prngadd4(u8 *d, int n, u32 amp) {
+    u16 ms = (u16)(amp & 0xFFFF);
+    u16 s[4]; s[0]=ms; s[1]=xs16_next(&ms); s[2]=xs16_next(&ms); s[3]=xs16_next(&ms);
+    for (int i = 0; i < n; i++) d[i] = (u8)(d[i] - xs16_next(&s[i & 3]));
+}
+static void ap_prngadd8(u8 *d, int n, u32 amp) {
+    u16 ms = (u16)(amp & 0xFFFF);
+    u16 s[8];
+    s[0]=ms;
+    for (int k=1;k<8;k++) s[k]=xs16_next(&ms);
+    for (int i = 0; i < n; i++) d[i] = (u8)(d[i] + xs16_next(&s[i & 7]));
+}
+static void inv_prngadd8(u8 *d, int n, u32 amp) {
+    u16 ms = (u16)(amp & 0xFFFF);
+    u16 s[8];
+    s[0]=ms;
+    for (int k=1;k<8;k++) s[k]=xs16_next(&ms);
+    for (int i = 0; i < n; i++) d[i] = (u8)(d[i] - xs16_next(&s[i & 7]));
+}
+
 /* BIT_REVERSE: reverse bit order within each byte. Self-inverse. */
 static inline u8 bitrev8(u8 v) {
     v = (u8)((v & 0xF0) >> 4 | (v & 0x0F) << 4);
@@ -348,6 +384,16 @@ static void ap_bitaswap(u8 *d, int n, int s, int p) {
 }
 
 
+/* PLANE_PRNG: for bit plane k, XOR each byte's bit k with xs16 LSB. Self-inverse. */
+static void ap_planeprng(u8 *d, int n, u32 amp) {
+    u16 s = (u16)(amp & 0xFFFF);
+    u8 kmask = (u8)(1u << ((amp >> 16) & 7));
+    for (int i = 0; i < n; i++) {
+        u16 r = xs16_next(&s);
+        if (r & 1) d[i] ^= kmask;
+    }
+}
+
 /* REFLECT: Elias-style bijection centered on mode M.
  * r = (int8_t)(v - M); out = (r >= 0) ? 2*r : -2*r - 1
  * Maps: M→0, M±1→2/1, M±2→4/3, ..., M+127→254, M-128→255. Bijective on 0..255. */
@@ -363,6 +409,15 @@ static void inv_reflect(u8 *d, int n, u8 M) {
         int r = (u & 1) ? -((u + 1) / 2) : (u / 2);
         d[i] = (u8)((M + r) & 0xFF);
     }
+}
+
+
+/* PRNGXOR8: 8-stream PRNG XOR. Self-inverse (same PRNG sequence undoes it). */
+static void ap_prngxor8(u8 *d, int n, u32 amp) {
+    u16 ms = (u16)(amp & 0xFFFF);
+    u16 s[8]; s[0] = ms;
+    for (int k = 1; k < 8; k++) s[k] = xs16_next(&ms);
+    for (int i = 0; i < n; i++) d[i] ^= xs16_next(&s[i & 7]);
 }
 
 
@@ -480,6 +535,21 @@ static void inv_mtf(u8 *d, int n) {
     }
 }
 
+/* PRNGBIT3: compact bitstream encoding of 3 T_PRNGBIT passes.
+ * amp=pass1_amp, stride=pass2_amp, phase=pass3_amp (each = seed|(fmask<<16)).
+ * Never emitted by the greedy loop — pack_ilist collapses 3 T_PRNGBIT into this. */
+static void ap_prngbit3(u8 *d, int n, u32 amp, int stride, int phase) {
+    ap_prngbit(d, n, amp);
+    ap_prngbit(d, n, (u32)stride);
+    ap_prngbit(d, n, (u32)phase);
+}
+static void inv_prngbit3(u8 *d, int n, u32 amp, int stride, int phase) {
+    ap_prngbit(d, n, (u32)phase);
+    ap_prngbit(d, n, (u32)stride);
+    ap_prngbit(d, n, amp);
+}
+
+
 /* dispatch: apply / invert any instruction in place */
 static void apply_instr(u8 *d, int n, Instr t) {
     switch (t.type) {
@@ -491,14 +561,18 @@ static void apply_instr(u8 *d, int n, Instr t) {
         case T_BYTEMUL:  ap_bytemul(d, n, t.stride, t.phase, t.amp); break;
         case T_VALUEXOR: ap_valuexor(d, n, t.stride, t.phase, t.amp); break;
         case T_BITREV:   ap_bitrev(d, n, t.stride, t.phase); break;
+        case T_PRNGADD4: ap_prngadd4(d, n, t.amp); break;
+        case T_PRNGADD8: ap_prngadd8(d, n, t.amp); break;
         case T_NIBCXOR:  ap_nibcxor(d, n, t.stride, t.phase, t.amp); break;
         case T_CRMBCXOR: ap_crmbcxor(d, n, t.stride, t.phase, t.amp); break;
         case T_GRAYCODE: ap_graycode(d, n, t.stride, t.phase); break;
         case T_BITASWAP: ap_bitaswap(d, n, t.stride, t.phase); break;
+        case T_PLANEPRNG:ap_planeprng(d, n, t.amp); break;
         case T_REFLECT:  ap_reflect(d, n, (u8)t.amp); break;
         case T_SPLITADD: ap_splitadd(d, n, t.stride, t.phase, t.amp); break;
         case T_SPLITXOR: ap_splitxor(d, n, t.stride, t.phase, t.amp); break;
         case T_PRNGBIT:      ap_prngbit(d, n, t.amp); break;
+        case T_PRNGXOR8:     ap_prngxor8(d, n, t.amp); break;
         case T_VALUEMAP4:    ap_valuemap4(d, n, t.stride, t.phase, t.amp); break;
         case T_SPLITBYTEMUL: ap_splitbytemul(d, n, t.stride, t.phase, t.amp); break;
         case T_ROTXOR:       ap_rotxor(d, n, t.stride, t.phase, t.amp); break;
@@ -506,6 +580,7 @@ static void apply_instr(u8 *d, int n, Instr t) {
         case T_DELTA:          ap_delta(d, n, t.stride); break;
         case T_DELTA2:         ap_delta2(d, n, t.stride); break;
         case T_MTF:            ap_mtf(d, n); break;
+        case T_PRNGBIT3:       ap_prngbit3(d, n, t.amp, t.stride, t.phase); break;
     }
 }
 static void invert_instr(u8 *d, int n, Instr t) {
@@ -518,14 +593,18 @@ static void invert_instr(u8 *d, int n, Instr t) {
         case T_BYTEMUL:  inv_bytemul(d, n, t.stride, t.phase, t.amp); break;
         case T_VALUEXOR: ap_valuexor(d, n, t.stride, t.phase, t.amp); break;  /* self-inv */
         case T_BITREV:   ap_bitrev(d, n, t.stride, t.phase); break;            /* self-inv */
+        case T_PRNGADD4: inv_prngadd4(d, n, t.amp); break;
+        case T_PRNGADD8: inv_prngadd8(d, n, t.amp); break;
         case T_NIBCXOR:  ap_nibcxor(d, n, t.stride, t.phase, t.amp); break;   /* self-inv */
         case T_CRMBCXOR: ap_crmbcxor(d, n, t.stride, t.phase, t.amp); break;  /* self-inv */
         case T_GRAYCODE: inv_graycode(d, n, t.stride, t.phase); break;
         case T_BITASWAP: ap_bitaswap(d, n, t.stride, t.phase); break;          /* self-inv */
+        case T_PLANEPRNG:ap_planeprng(d, n, t.amp); break;                     /* self-inv */
         case T_REFLECT:  inv_reflect(d, n, (u8)t.amp); break;
         case T_SPLITADD: inv_splitadd(d, n, t.stride, t.phase, t.amp); break;
         case T_SPLITXOR: ap_splitxor(d, n, t.stride, t.phase, t.amp); break;  /* self-inv */
         case T_PRNGBIT:      ap_prngbit(d, n, t.amp); break;                      /* self-inv */
+        case T_PRNGXOR8:     ap_prngxor8(d, n, t.amp); break;                    /* self-inv */
         case T_VALUEMAP4:    ap_valuemap4(d, n, t.stride, t.phase, t.amp); break; /* self-inv */
         case T_SPLITBYTEMUL: inv_splitbytemul(d, n, t.stride, t.phase, t.amp); break;
         case T_ROTXOR:       inv_rotxor(d, n, t.stride, t.phase, t.amp); break;
@@ -533,6 +612,7 @@ static void invert_instr(u8 *d, int n, Instr t) {
         case T_DELTA:          inv_delta(d, n, t.stride); break;
         case T_DELTA2:         inv_delta2(d, n, t.stride); break;
         case T_MTF:            inv_mtf(d, n); break;
+        case T_PRNGBIT3:       inv_prngbit3(d, n, t.amp, t.stride, t.phase); break;
     }
 }
 
@@ -875,6 +955,36 @@ static double search_crmbcxor(const u8 *d, int n, double Sb, Instr *out) {
     return best;
 }
 
+/* N-stream PRNG_ADD variants: single master seed, N derived streams by pos%N.
+ * Lower OH than PRNG_ADD (16 bits vs 32) and single-pass search. */
+static double search_prngadd4(const u8 *d, int n, double Sb, Instr *out) {
+    double best = -1e18; u32 bseed = 1;
+    for (u32 seed = 1; seed < PRNG_SEEDS; seed++) {
+        u16 ms = (u16)seed;
+        u16 s[4]; s[0]=ms; s[1]=xs16_next(&ms); s[2]=xs16_next(&ms); s[3]=xs16_next(&ms);
+        int f[256] = {0};
+        for (int i = 0; i < n; i++) f[(u8)(d[i] + xs16_next(&s[i & 3]))]++;
+        double net = (S_from_freq(f) - Sb) - OH_PRNGADD4;
+        if (net > best) { best = net; bseed = seed; }
+    }
+    out->type = T_PRNGADD4; out->stride = 0; out->phase = 0; out->amp = bseed;
+    return best;
+}
+static double search_prngadd8(const u8 *d, int n, double Sb, Instr *out) {
+    double best = -1e18; u32 bseed = 1;
+    for (u32 seed = 1; seed < PRNG_SEEDS; seed++) {
+        u16 ms = (u16)seed;
+        u16 s[8]; s[0]=ms;
+        for (int k=1;k<8;k++) s[k]=xs16_next(&ms);
+        int f[256] = {0};
+        for (int i = 0; i < n; i++) f[(u8)(d[i] + xs16_next(&s[i & 7]))]++;
+        double net = (S_from_freq(f) - Sb) - OH_PRNGADD8;
+        if (net > best) { best = net; bseed = seed; }
+    }
+    out->type = T_PRNGADD8; out->stride = 0; out->phase = 0; out->amp = bseed;
+    return best;
+}
+
 /* BIT_REVERSE: fixed permutation — use freq-table trick (O(256) per stride/phase). */
 static double search_bitrev(const u8 *d, int n, double Sb, Instr *out) {
     /* precompute bitrev table once */
@@ -898,6 +1008,34 @@ static double search_bitrev(const u8 *d, int n, double Sb, Instr *out) {
     out->type = T_BITREV; out->stride = bs; out->phase = bp; out->amp = 0;
     return best;
 }
+
+/* PLANE_PRNG: for each xs16 seed, compute flip/noflip histograms once, then test all 8 planes. */
+static double search_planeprng(const u8 *d, int n, double Sb, Instr *out) {
+    double best = -1e18; int bk = 0; u32 bseed = 1;
+    for (u32 seed = 1; seed < PRNG_SEEDS; seed++) {
+        u16 s = (u16)seed;
+        int flip[256] = {0}, noflip[256] = {0};
+        for (int i = 0; i < n; i++) {
+            u16 r = xs16_next(&s);
+            if (r & 1) flip[d[i]]++;
+            else        noflip[d[i]]++;
+        }
+        for (int k = 0; k < 8; k++) {
+            int f[256] = {0};
+            int kmask = 1 << k;
+            for (int v = 0; v < 256; v++) {
+                f[v]         += noflip[v];
+                f[v ^ kmask] += flip[v];
+            }
+            double net = (S_from_freq(f) - Sb) - OH_PLANEPRNG;
+            if (net > best) { best = net; bk = k; bseed = seed; }
+        }
+    }
+    out->type = T_PLANEPRNG; out->stride = 0; out->phase = 0;
+    out->amp = bseed | ((u32)bk << 16);
+    return best;
+}
+
 
 /* ---- Walsh-Hadamard Transform helpers (used by search_splitxor) ---- */
 static void wht256(int *a) {
@@ -1156,6 +1294,22 @@ static double search_prngbit3(const u8 *d, int n, double Sb, Instr *out) {
 }
 
 
+static double search_prngxor8(const u8 *d, int n, double Sb, Instr *out) {
+    double best = -1e18; u32 bseed = 1;
+    for (u32 seed = 1; seed < 4096; seed++) {
+        u16 ms = (u16)seed;
+        u16 s[8]; s[0]=ms;
+        for (int k=1;k<8;k++) s[k]=xs16_next(&ms);
+        int f[256] = {0};
+        for (int i = 0; i < n; i++) f[(u8)(d[i] ^ xs16_next(&s[i & 7]))]++;
+        double net = (S_from_freq(f) - Sb) - OH_PRNGXOR8;
+        if (net > best) { best = net; bseed = seed; }
+    }
+    out->type = T_PRNGXOR8; out->stride = 0; out->phase = 0; out->amp = bseed;
+    return best;
+}
+
+
 /* VALUEMAP4: for each of 4 quartiles (top-2 bits), find optimal lo-6-bit XOR constant.
  * Quartiles are independent (XOR preserves top-2 bits), so per-quartile greedy is exact. */
 static double search_valuemap4(const u8 *d, int n, double Sb, Instr *out) {
@@ -1326,14 +1480,18 @@ static const InstrDesc REGISTRY[] = {
     { "BYTE_MUL",    search_bytemul,       0, 1 },
     { "VALUE_XOR",   search_valuexor,      1, 0 },
     { "BIT_REV",     search_bitrev,        0, 0 },
+    { "PRNG_ADD4",   search_prngadd4,      1, 1 },
+    { "PRNG_ADD8",   search_prngadd8,      1, 1 },
     { "NIB_CXOR",    search_nibcxor,       0, 0 },
     { "CRMB_CXOR",   search_crmbcxor,      0, 0 },
     { "GRAY_CODE",   search_graycode,      0, 0 },
     { "BIT_ASWAP",   search_bitaswap,      0, 0 },
+    { "PLANE_PRNG",  search_planeprng,     1, 1 },
     { "REFLECT",     search_reflect,       0, 0 },
     { "SPLIT_ADD",   search_splitadd,      1, 0 },
     { "SPLIT_XOR",   search_splitxor,      1, 0 },
     { "PRNG_BIT",    search_prngbit,       1, 1 },
+    { "PRNG_XOR8",   search_prngxor8,      1, 1 },
     { "VALUEMAP4",   search_valuemap4,     0, 0 },
     { "SPLT_BYTEMUL",search_splitbytemul,  1, 0 },
     { "ROT_XOR",     search_rotxor,        1, 0 },
@@ -1347,10 +1505,11 @@ static const InstrDesc REGISTRY[] = {
 #define NREG ((int)(sizeof(REGISTRY)/sizeof(REGISTRY[0])))
 static const char *TYPE_NAME[NTYPES] = {
     "XOR_PHASE",  "ADD_NIBS",   "STRIDE_ADD",  "BYTE_ROT",    "BYTE_MUL",
-    "VALUE_XOR",  "BIT_REV",    "NIB_CXOR",    "CRMB_CXOR",   "GRAY_CODE",
-    "BIT_ASWAP",  "REFLECT",    "SPLIT_ADD",   "SPLIT_XOR",   "PRNG_BIT",
-    "VALUEMAP4",  "SPLT_BMUL",  "ROT_XOR",     "NIB_SWAP",    "XOR_NP",
-    "DELTA",      "DELTA2",     "MTF",         "PRNGBIT3"
+    "VALUE_XOR",  "BIT_REV",    "PRNG_ADD4",   "PRNG_ADD8",   "NIB_CXOR",
+    "CRMB_CXOR", "GRAY_CODE", "BIT_ASWAP",  "PLANE_PRNG", "REFLECT",
+    "SPLIT_ADD", "SPLIT_XOR", "PRNG_BIT",   "PRNG_XOR8",
+    "VALUEMAP4", "SPLT_BMUL", "ROT_XOR",    "NIB_SWAP",   "XOR_NP",
+    "DELTA",     "DELTA2",    "MTF",        "PRNGBIT3"
 };
 
 
@@ -1557,6 +1716,11 @@ static void bb_put_instr(BitBuf *b, Instr t) {
     bb_put(b, t.type, 6);
     int s = t.stride, pb = phase_bits(s);
     switch (t.type) {
+        case T_PRNGADD4: case T_PRNGADD8:
+            bb_put(b, t.amp & 0xFFFF, 16); break;
+        case T_PLANEPRNG:
+            bb_put(b, t.amp & 0xFFFF, 16);
+            bb_put(b, (t.amp >> 16) & 7, 3); break;
         case T_PRNGBIT:
             bb_put(b, t.amp & 0xFFFF, 16);
             bb_put(b, (t.amp >> 16) & 0xFF, 8); break;
@@ -1623,6 +1787,8 @@ static void bb_put_instr(BitBuf *b, Instr t) {
             }
             break;
         }
+        case T_PRNGXOR8:
+            bb_put(b, t.amp & 0xFFFF, 16); break;
         case T_VALUEMAP4:
             bb_put(b, s - 1, 8); bb_put(b, t.phase, pb);
             bb_put(b, t.amp & 0x00FFFFFFu, 24); break;
@@ -1647,6 +1813,12 @@ static Instr bb_get_instr_body(BitBuf *b, u8 type_val) {
     t.type = type_val;
     int s, pb;
     switch (t.type) {
+        case T_PRNGADD4: case T_PRNGADD8:
+            t.amp = bb_get(b, 16); break;
+        case T_PLANEPRNG: {
+            u32 seed = bb_get(b, 16), k = bb_get(b, 3);
+            t.amp = seed | (k << 16); break;
+        }
         case T_PRNGBIT: {
             u32 seed = bb_get(b, 16), fm = bb_get(b, 8);
             t.amp = seed | (fm << 16); break;
@@ -1722,6 +1894,8 @@ static Instr bb_get_instr_body(BitBuf *b, u8 type_val) {
             }
             break;
         }
+        case T_PRNGXOR8:
+            t.amp = bb_get(b, 16); break;
         case T_VALUEMAP4:
             s = (int)bb_get(b, 8) + 1; pb = phase_bits(s);
             t.stride = s; t.phase = (int)bb_get(b, pb);
@@ -1826,11 +2000,14 @@ static int selftest(void) {
         { T_BYTEMUL,   3, 1, 3u },
         { T_VALUEXOR,  3, 1, (3u|(0x24u<<3)|(0x12u<<11)) },
         { T_BITREV,    3, 1, 0 },
+        { T_PRNGADD4,  0, 0, 1234u },
+        { T_PRNGADD8,  0, 0, 5678u },
         { T_NIBCXOR,   3, 1, 0 },
         { T_NIBCXOR,   3, 1, 1 },
         { T_CRMBCXOR,  3, 1, (0|(2<<2)) },
         { T_GRAYCODE,  3, 1, 0 },
         { T_BITASWAP,  3, 1, 0 },
+        { T_PLANEPRNG, 0, 0, (1234u | (3u << 16)) },
         { T_REFLECT,   0, 0, 0x40u },
         { T_SPLITADD,  3, 1|(0<<8), 0x1234u },
         { T_SPLITADD,  3, 1|(1<<8), 0x11223344u },
@@ -1841,6 +2018,7 @@ static int selftest(void) {
         { T_SPLITXOR,  3, 1|(2<<8), 0x12345678u },
         { T_SPLITXOR,  3, 1|(3<<8), (0x2Au | (0x55u << 8)) },
         { T_PRNGBIT,      0, 0, (0xABCDu | (0xA5u << 16)) },
+        { T_PRNGXOR8,     0, 0, 9999u },
         { T_VALUEMAP4,    3, 1, (0x1Au|(0x2Bu<<6)|(0x0Cu<<12)|(0x3Fu<<18)) },
         { T_SPLITBYTEMUL, 3, 1|(0<<8), (u32)(1u|(2u<<7)) },
         { T_SPLITBYTEMUL, 3, 1|(1<<8), (u32)(1u|(2u<<7)|(3u<<14)|(4u<<21)) },
@@ -1885,14 +2063,18 @@ static double instr_oh(Instr t) {
         case T_BYTEMUL:  return OH_SP(OH_BYTEMUL_BASE,   t.stride);
         case T_VALUEXOR: return OH_SP(OH_VALUEXOR_BASE,  t.stride);
         case T_BITREV:   return OH_SP(OH_BITREV_BASE,    t.stride);
+        case T_PRNGADD4: return OH_PRNGADD4;
+        case T_PRNGADD8: return OH_PRNGADD8;
         case T_NIBCXOR:  return OH_SP(OH_NIBCXOR_BASE,  t.stride);
         case T_CRMBCXOR: return OH_SP(OH_CRMBCXOR_BASE, t.stride);
         case T_GRAYCODE: return OH_SP(OH_GRAYCODE_BASE, t.stride);
         case T_BITASWAP: return OH_SP(OH_BITASWAP_BASE, t.stride);
+        case T_PLANEPRNG:return OH_PLANEPRNG;
         case T_REFLECT:  return 0.0;
         case T_SPLITADD:    return oh_splitadd((t.phase >> 8) & 3, t.stride);
         case T_SPLITXOR:    return oh_splitxor((t.phase >> 8) & 3, t.stride);
         case T_PRNGBIT:      return OH_PRNGBIT;
+        case T_PRNGXOR8:     return OH_PRNGXOR8;
         case T_VALUEMAP4:    return oh_valuemap4(t.stride);
         case T_SPLITBYTEMUL: return oh_splitbytemul((t.phase >> 8) & 1, t.stride);
         case T_ROTXOR:       return oh_rotxor(t.stride);
