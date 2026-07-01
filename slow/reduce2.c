@@ -71,7 +71,9 @@ enum {
     T_NIBSWAP,        /* swap hi/lo nibbles v->(v<<4)|(v>>4); self-inverse; stride/phase              */
     T_XORPNP,    /* XOR amp at stride, always phase=0; no phase field stored — saves log2(s) bits  */
     T_DELTA,     /* delta: d[i] -= d[i-stride] (backwards pass); inv: cumsum forward               */
-    NTYPES       /* = 25 */
+    T_DELTA2,    /* 2nd-order delta (Laplacian): d[i] -= 2*d[i-s] - d[i-2s]; inv: cumsum×2       */
+    T_MTF,       /* Move-to-Front remap; inv: MTF decode; no params — overhead = TAGB only        */
+    NTYPES       /* = 27 */
 };
 
 typedef struct { u8 type; int stride, phase; u32 amp; u8 consts[256]; } Instr;
@@ -150,7 +152,9 @@ static double oh_splitbytemul(int kidx, int s) {
     return TAGB + SB + 1.0 + pb_bits(s) + (kidx == 0 ? 14.0 : 28.0);
 }
 static double oh_rotxor(int s)      { return TAGB + SB + pb_bits(s) + 11.0; } /* 3-bit k + 8-bit c */
-#define OH_DELTA_BASE (TAGB + SB)  /* type tag + stride only, no phase or amp */
+#define OH_DELTA_BASE  (TAGB + SB)  /* type tag + stride only, no phase or amp */
+#define OH_DELTA2_BASE (TAGB + SB)  /* same encoding as T_DELTA */
+#define OH_MTF_BASE    (TAGB)        /* no parameters at all */
 static double oh_valuemap4(int s)   { return TAGB + SB + pb_bits(s) + 24.0; } /* 4×6-bit constants */
 
 /* ============================================================ *
@@ -488,6 +492,47 @@ static void inv_delta(u8 *d, int n, int s) {
     for (int i = s; i < n; i++) d[i] = (u8)((d[i] + d[i - s]) & 0xFF);
 }
 
+/* DELTA2: 2nd-order Laplacian predictor: d[i] -= 2*d[i-s] - d[i-2s].
+ * For i in [s, 2s): falls back to 1st-order delta (only one predecessor).
+ * Backwards scan ensures predecessors are still original when referenced.
+ * Inverse: 2-step cumsum forward. */
+static void ap_delta2(u8 *d, int n, int s) {
+    for (int i = n - 1; i >= 2 * s; i--)
+        d[i] = (u8)((d[i] - 2 * d[i - s] + d[i - 2 * s]) & 0xFF);
+    for (int i = (2 * s > n ? n : 2 * s) - 1; i >= s; i--)
+        d[i] = (u8)((d[i] - d[i - s]) & 0xFF);
+}
+static void inv_delta2(u8 *d, int n, int s) {
+    for (int i = s; i < n && i < 2 * s; i++)
+        d[i] = (u8)((d[i] + d[i - s]) & 0xFF);
+    for (int i = 2 * s; i < n; i++)
+        d[i] = (u8)((d[i] + 2 * d[i - s] - d[i - 2 * s]) & 0xFF);
+}
+
+/* MTF (Move-to-Front): replace each byte with its rank in a recency list (0=most recent).
+ * Self-inverse structure: encode and decode use the same list-update logic. */
+static void ap_mtf(u8 *d, int n) {
+    u8 list[256]; for (int i = 0; i < 256; i++) list[i] = (u8)i;
+    for (int i = 0; i < n; i++) {
+        int r = 0; while (list[r] != d[i]) r++;
+        d[i] = (u8)r;
+        /* move to front */
+        u8 v = list[r];
+        memmove(list + 1, list, r);
+        list[0] = v;
+    }
+}
+static void inv_mtf(u8 *d, int n) {
+    u8 list[256]; for (int i = 0; i < 256; i++) list[i] = (u8)i;
+    for (int i = 0; i < n; i++) {
+        int r = (int)d[i];
+        u8 v = list[r];
+        d[i] = v;
+        memmove(list + 1, list, r);
+        list[0] = v;
+    }
+}
+
 
 /* dispatch: apply / invert any instruction in place */
 static void apply_instr(u8 *d, int n, Instr t) {
@@ -517,6 +562,8 @@ static void apply_instr(u8 *d, int n, Instr t) {
         case T_ROTXOR:       ap_rotxor(d, n, t.stride, t.phase, t.amp); break;
         case T_NIBSWAP:        ap_nibswap(d, n, t.stride, t.phase); break;
         case T_DELTA:          ap_delta(d, n, t.stride); break;
+        case T_DELTA2:         ap_delta2(d, n, t.stride); break;
+        case T_MTF:            ap_mtf(d, n); break;
     }
 }
 static void invert_instr(u8 *d, int n, Instr t) {
@@ -546,6 +593,8 @@ static void invert_instr(u8 *d, int n, Instr t) {
         case T_ROTXOR:       inv_rotxor(d, n, t.stride, t.phase, t.amp); break;
         case T_NIBSWAP:        ap_nibswap(d, n, t.stride, t.phase); break;          /* self-inv */
         case T_DELTA:          inv_delta(d, n, t.stride); break;
+        case T_DELTA2:         inv_delta2(d, n, t.stride); break;
+        case T_MTF:            inv_mtf(d, n); break;
     }
 }
 
@@ -616,6 +665,30 @@ static double search_delta(const u8 *d, int n, double Sb, Instr *out) {
     }
     out->type = T_DELTA; out->stride = bs; out->phase = 0; out->amp = 0;
     return best;
+}
+
+/* DELTA2: 2nd-order Laplacian delta. Same scratch-copy approach as T_DELTA. */
+static double search_delta2(const u8 *d, int n, double Sb, Instr *out) {
+    double best = -1e18; int bs = 1;
+    for (int s = 1; s <= g_stride_lim && 2 * s < n; s++) {
+        memcpy(g_scr, d, n);
+        ap_delta2(g_scr, n, s);
+        int f[256]; freq_of(g_scr, n, f);
+        double net = (S_from_freq(f) - Sb) - OH_DELTA2_BASE;
+        if (net > best) { best = net; bs = s; }
+    }
+    out->type = T_DELTA2; out->stride = bs; out->phase = 0; out->amp = 0;
+    return best;
+}
+
+/* MTF: single global pass — no parameters. */
+static double search_mtf(const u8 *d, int n, double Sb, Instr *out) {
+    memcpy(g_scr, d, n);
+    ap_mtf(g_scr, n);
+    int f[256]; freq_of(g_scr, n, f);
+    double net = (S_from_freq(f) - Sb) - OH_MTF_BASE;
+    out->type = T_MTF; out->stride = 1; out->phase = 0; out->amp = 0;
+    return net;
 }
 
 /* STRIDE_ADD: same frequency-table trick as XOR_PHASE, but ADD instead of XOR, an
@@ -1367,6 +1440,8 @@ static const InstrDesc REGISTRY[] = {
     { "NIB_SWAP",    search_nibswap,        0, 0 },
     { "XOR_NP",      search_xorpnp,         0, 0 },
     { "DELTA",       search_delta,          0, 0 },
+    { "DELTA2",      search_delta2,         0, 0 },
+    { "MTF",         search_mtf,            0, 0 },
 };
 #define NREG ((int)(sizeof(REGISTRY)/sizeof(REGISTRY[0])))
 static const char *TYPE_NAME[NTYPES] = {
@@ -1374,7 +1449,8 @@ static const char *TYPE_NAME[NTYPES] = {
     "VALUE_XOR",  "BIT_REV",    "PRNG_ADD4",   "PRNG_ADD8",   "NIB_CXOR",
     "CRMB_CXOR", "GRAY_CODE", "BIT_ASWAP",  "PLANE_PRNG", "REFLECT",
     "SPLIT_ADD", "SPLIT_XOR", "PRNG_BIT",   "PRNG_XOR8",
-    "VALUEMAP4", "SPLT_BMUL", "ROT_XOR",    "NIB_SWAP",   "XOR_NP",  "DELTA"
+    "VALUEMAP4", "SPLT_BMUL", "ROT_XOR",    "NIB_SWAP",   "XOR_NP",
+    "DELTA",     "DELTA2",    "MTF"
 };
 
 
@@ -1597,6 +1673,10 @@ static void bb_put_instr(BitBuf *b, Instr t) {
             bb_put(b, s - 1, 8); bb_put(b, t.amp & 0xFF, 8); break;   /* no phase */
         case T_DELTA:
             bb_put(b, s - 1, 8); break;                                /* stride only */
+        case T_DELTA2:
+            bb_put(b, s - 1, 8); break;                                /* stride only */
+        case T_MTF:
+            break;                                                      /* no params */
         case T_XORP: case T_ANIBS: case T_STRIDEADD:
             bb_put(b, s - 1, 8); bb_put(b, t.phase, pb);
             bb_put(b, t.amp & 0xFF, 8); break;
@@ -1685,6 +1765,10 @@ static Instr bb_get_instr(BitBuf *b) {
             t.amp = bb_get(b, 8); break;                               /* no phase */
         case T_DELTA:
             s = (int)bb_get(b, 8) + 1; t.stride = s; t.phase = 0; t.amp = 0; break;
+        case T_DELTA2:
+            s = (int)bb_get(b, 8) + 1; t.stride = s; t.phase = 0; t.amp = 0; break;
+        case T_MTF:
+            t.stride = 1; t.phase = 0; t.amp = 0; break;              /* no params */
         case T_XORP: case T_ANIBS: case T_STRIDEADD:
             s = (int)bb_get(b, 8) + 1; pb = phase_bits(s);
             t.stride = s; t.phase = (int)bb_get(b, pb);
@@ -1822,6 +1906,8 @@ static int selftest(void) {
         { T_ROTXOR,       3, 1, (u32)((3u-1)|((u32)0x42u<<3)) },
         { T_NIBSWAP,      3, 1, 0 },
         { T_DELTA,        4, 0, 0 },
+        { T_DELTA2,       3, 0, 0 },
+        { T_MTF,          1, 0, 0 },
     };
     int nt = (int)(sizeof(tv) / sizeof(tv[0])), fails = 0;
     for (int i = 0; i < nt; i++) {
@@ -1848,6 +1934,8 @@ static double instr_oh(Instr t) {
         case T_XORP:     return OH_SP(OH_XORP_BASE,      t.stride);
         case T_XORPNP:   return OH_XORP_BASE; /* no phase field */
         case T_DELTA:    return OH_DELTA_BASE;
+        case T_DELTA2:   return OH_DELTA2_BASE;
+        case T_MTF:      return OH_MTF_BASE;
         case T_ANIBS:    return OH_SP(OH_NIBS_BASE,      t.stride);
         case T_STRIDEADD:return OH_SP(OH_STRIDEADD_BASE, t.stride);
         case T_BYTEROT:  return OH_SP(OH_BYTEROT_BASE,   t.stride);
