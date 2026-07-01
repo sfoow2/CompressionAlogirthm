@@ -668,7 +668,7 @@ static double search_xorp(const u8 *d, int n, double Sb, Instr *out) {
     return best;
 }
 /* data-dependent ops: apply to a scratch copy and measure S directly */
-static u8 g_scr[BLOCK];
+static __thread u8 g_scr[BLOCK];
 
 /* DELTA: d[i] -= d[i-stride]. Can't use freq-table trick — must apply to scratch. */
 static double search_delta(const u8 *d, int n, double Sb, Instr *out) {
@@ -1256,7 +1256,7 @@ static double search_prngbit(const u8 *d, int n, double Sb, Instr *out) {
 /* PRNGBIT3: 3 greedy sub-passes; fmask=0xFF (all planes); uses freq-table trick per pass.
  * Returns net = total_raw - OH_PRNGBIT3. Seeds stored in amp(lo,hi) and stride. */
 static double search_prngbit3(const u8 *d, int n, double Sb, Instr *out) {
-    static u8 tmp[BLOCK];
+    u8 tmp[BLOCK];
     memcpy(tmp, d, n);
     u16 seeds[3] = {1, 1, 1};
     double Scur = Sb;
@@ -1514,12 +1514,12 @@ static const char *TYPE_NAME[NTYPES] = {
 
 
 /* 0=all types, 1=prng_first only (layers 0-2), 2=non-prng only (layer 3+) */
-static int g_search_mode = 0;
+static __thread int g_search_mode;
 
 /* Adaptive type-tag cost: replaces fixed TAGB with -log2(laplace_smoothed_freq).
  * Repeated types get cheaper; rare types get more expensive. Reset per block. */
-static int    g_type_freq[NTYPES];
-static int    g_total_instrs_used;
+static __thread int g_type_freq[NTYPES];
+static __thread int g_total_instrs_used;
 
 static double adaptive_tag_cost(int type) {
     /* Denominator frozen at 0.5*18 (the original type count before extension types were added).
@@ -2044,10 +2044,6 @@ static int selftest(void) {
 }
 
 /* last-block instruction list, accessible from main for serialisation */
-static Instr  g_ilist[MAXINSTR];
-static double g_nets[MAXINSTR];
-static int    g_last_ni = 0;
-
 /* overhead in bits for a single applied instruction (mirrors search OH formulas) */
 static double instr_oh(Instr t) {
     switch (t.type) {
@@ -2083,27 +2079,84 @@ static double instr_oh(Instr t) {
     }
 }
 
-/* reduce one block, verify round-trip, accumulate per-type counts + net stats */
-static double do_block(u8 *data, int n, int *counts,
-                       double *type_net_sum, double *type_net_max, double *type_oh_sum,
-                       int verbose, int *ok_out) {
+/* per-block result: all stats + ibuf bytes needed for aggregate reporting */
+typedef struct {
+    double e_in, e_out, net;
+    int    ok, ni, cbits, cok;
+    int    type_counts[NTYPES];
+    double type_net_sum[NTYPES];
+    double type_net_max[NTYPES];
+    double type_oh_sum[NTYPES];
+    int    ibuf_n;
+    u8     ibuf[MAXINSTR * 8];
+} BlockResult;
+
+/* reduce one block into *r; ilist/nets allocated on heap so stack stays small */
+static void do_block(u8 *data, int n, BlockResult *r, int verbose) {
     u8 orig[BLOCK];
     memcpy(orig, data, n);
-    g_last_ni = 0;
-    double net = compress(data, n, g_ilist, g_nets, &g_last_ni, verbose);
-    for (int i = 0; i < g_last_ni; i++) {
-        int t = g_ilist[i].type;
-        counts[t]++;
-        type_net_sum[t] += g_nets[i];
-        if (g_nets[i] > type_net_max[t]) type_net_max[t] = g_nets[i];
-        type_oh_sum[t]  += instr_oh(g_ilist[i]);
+
+    Instr  *ilist       = malloc(MAXINSTR * sizeof(Instr));
+    double *nets        = malloc(MAXINSTR * sizeof(double));
+    u8     *compact_buf = malloc(COMPACT_BUF_BYTES);
+    Instr  *unpacked    = malloc(MAXINSTR * sizeof(Instr));
+    int ni = 0;
+
+    r->e_in = entropy_bits(data, n);
+    r->net  = compress(data, n, ilist, nets, &ni, verbose);
+    r->e_out = entropy_bits(data, n);
+    r->ni   = ni;
+
+    memset(r->type_counts,  0, sizeof r->type_counts);
+    memset(r->type_net_sum, 0, sizeof r->type_net_sum);
+    memset(r->type_net_max, 0, sizeof r->type_net_max);
+    memset(r->type_oh_sum,  0, sizeof r->type_oh_sum);
+    for (int i = 0; i < ni; i++) {
+        int t = ilist[i].type;
+        r->type_counts[t]++;
+        r->type_net_sum[t] += nets[i];
+        if (nets[i] > r->type_net_max[t]) r->type_net_max[t] = nets[i];
+        r->type_oh_sum[t]  += instr_oh(ilist[i]);
+    }
+
+    r->cbits = compact_buf ? pack_ilist(ilist, ni, compact_buf) : 0;
+    r->cok   = 0;
+    if (compact_buf && unpacked) {
+        int ni2 = unpack_ilist(compact_buf, unpacked);
+        r->cok  = (ni2 == ni);
+        for (int i = 0; r->cok && i < ni2; i++)
+            r->cok = (unpacked[i].type   == ilist[i].type   &&
+                      unpacked[i].stride == ilist[i].stride &&
+                      unpacked[i].phase  == ilist[i].phase  &&
+                      unpacked[i].amp    == ilist[i].amp);
     }
 
     u8 dec[BLOCK];
     memcpy(dec, data, n);
-    decompress(dec, n, g_ilist, g_last_ni);
-    *ok_out = (memcmp(dec, orig, n) == 0);
-    return net;
+    decompress(dec, n, ilist, ni);
+    r->ok = (memcmp(dec, orig, n) == 0);
+
+    r->ibuf_n = 0;
+    for (int i = 0; i < ni; i++) {
+        r->ibuf[r->ibuf_n++] = (u8)ilist[i].type;
+        r->ibuf[r->ibuf_n++] = (u8)ilist[i].stride;
+        r->ibuf[r->ibuf_n++] = (u8)(ilist[i].phase & 0xFF);
+        r->ibuf[r->ibuf_n++] = (u8)(ilist[i].phase >> 8);
+        r->ibuf[r->ibuf_n++] = (u8)( ilist[i].amp        & 0xFF);
+        r->ibuf[r->ibuf_n++] = (u8)((ilist[i].amp >>  8) & 0xFF);
+        r->ibuf[r->ibuf_n++] = (u8)((ilist[i].amp >> 16) & 0xFF);
+        r->ibuf[r->ibuf_n++] = (u8)((ilist[i].amp >> 24) & 0xFF);
+    }
+
+    free(ilist); free(nets); free(compact_buf); free(unpacked);
+}
+
+typedef struct { u8 *data; BlockResult *res; int verbose; } BlockArg;
+
+static DWORD WINAPI block_thread(LPVOID arg) {
+    BlockArg *a = (BlockArg *)arg;
+    do_block(a->data, BLOCK, a->res, a->verbose);
+    return 0;
 }
 
 int main(int argc, char **argv) {
@@ -2229,54 +2282,72 @@ int main(int argc, char **argv) {
     FILE *fcomp = fopen("compressed.bin", "wb");
     if (!fcomp) { fprintf(stderr, "cannot open compressed.bin\n"); return 1; }
 
+    BlockResult *results = calloc(NB, sizeof(BlockResult));
+    BlockArg    *args    = malloc(NB * sizeof(BlockArg));
+    SYSTEM_INFO si; GetSystemInfo(&si);
+    int ncpus = (int)si.dwNumberOfProcessors;
+    if (ncpus < 1) ncpus = 1;
+    HANDLE *threads = malloc((size_t)ncpus * sizeof(HANDLE));
+    if (!results || !args || !threads) { fprintf(stderr, "oom\n"); return 1; }
+
+    clock_t t0 = clock();
+    printf("\n=== compressing %d blocks (%d threads) ===\n", NB, ncpus);
+    fflush(stdout);
+
+    /* process in batches of ncpus so we never exceed the logical CPU count */
+    for (int start = 0; start < NB; ) {
+        int batch = NB - start;
+        if (batch > ncpus) batch = ncpus;
+        for (int i = 0; i < batch; i++) {
+            int b = start + i;
+            args[b].data    = all + (size_t)b * BLOCK;
+            args[b].res     = &results[b];
+            args[b].verbose = (NB == 1);
+            threads[i] = CreateThread(NULL, 0, block_thread, &args[b], 0, NULL);
+            if (!threads[i]) { fprintf(stderr, "CreateThread failed for block %d\n", b); return 1; }
+        }
+        for (int i = 0; i < batch; i++) {
+            WaitForSingleObject(threads[i], INFINITE);
+            CloseHandle(threads[i]);
+        }
+        start += batch;
+    }
+    double ms = (double)(clock() - t0) / CLOCKS_PER_SEC * 1000.0;
+
+    /* collect results in order, print and accumulate */
     int counts[NTYPES] = {0};
     double type_net_sum[NTYPES] = {0};
-    double type_net_max[NTYPES];
+    double type_net_max[NTYPES]; for (int t = 0; t < NTYPES; t++) type_net_max[t] = 0.0;
     double type_oh_sum[NTYPES]  = {0};
-    for (int t = 0; t < NTYPES; t++) type_net_max[t] = 0.0;
-    double total_net = 0.0, total_ein = 0.0, total_eout = 0.0;
-    double total_overhead = 0.0;
+    double total_net = 0.0, total_ein = 0.0, total_eout = 0.0, total_overhead = 0.0;
     int total_ni = 0, fails = 0, compact_fails = 0;
     long total_compact_bits = 0;
-    /* flat 8-byte-per-instruction buffer for entropy comparison */
-    u8 *ibuf = malloc((size_t)NB * MAXINSTR * 8);
+    u8 *ibuf  = malloc((size_t)NB * MAXINSTR * 8);
     int ibuf_n = 0;
-    u8 *compact_buf = malloc(COMPACT_BUF_BYTES);
-    Instr *unpacked_tmp = malloc(MAXINSTR * sizeof(Instr));
-    clock_t t0 = clock();
 
-    printf("\n=== compressing %d blocks ===\n", NB);
     for (int b = 0; b < NB; b++) {
-        u8 *data = all + (size_t)b * BLOCK;
-        double e_in = entropy_bits(data, BLOCK);
-        int ok = 0;
-        double net = do_block(data, BLOCK, counts, type_net_sum, type_net_max, type_oh_sum, NB == 1, &ok);
-        double e_out = entropy_bits(data, BLOCK);
-        double raw  = e_in - e_out;
-        double oh   = raw - net;
-        /* compact pack + round-trip verify */
-        int cbits = compact_buf ? pack_ilist(g_ilist, g_last_ni, compact_buf) : 0;
-        int cok = 0;
-        if (compact_buf && unpacked_tmp) {
-            int ni2 = unpack_ilist(compact_buf, unpacked_tmp);
-            cok = (ni2 == g_last_ni);
-            for (int i = 0; cok && i < ni2; i++)
-                cok = (unpacked_tmp[i].type   == g_ilist[i].type   &&
-                       unpacked_tmp[i].stride == g_ilist[i].stride &&
-                       unpacked_tmp[i].phase  == g_ilist[i].phase  &&
-                       unpacked_tmp[i].amp    == g_ilist[i].amp);
-        }
-        total_compact_bits += cbits;
-        if (!cok) compact_fails++;
+        BlockResult *r = &results[b];
+        double raw = r->e_in - r->e_out;
+        double oh  = raw - r->net;
 
-        total_net += net; total_ein += e_in; total_eout += e_out;
-        total_overhead += oh; total_ni += g_last_ni;
-        if (!ok) fails++;
+        total_net      += r->net;   total_ein  += r->e_in;
+        total_eout     += r->e_out; total_overhead += oh;
+        total_ni       += r->ni;    total_compact_bits += r->cbits;
+        if (!r->ok)  fails++;
+        if (!r->cok) compact_fails++;
+        for (int t = 0; t < NTYPES; t++) {
+            counts[t]       += r->type_counts[t];
+            type_net_sum[t] += r->type_net_sum[t];
+            if (r->type_net_max[t] > type_net_max[t]) type_net_max[t] = r->type_net_max[t];
+            type_oh_sum[t]  += r->type_oh_sum[t];
+        }
+
         printf("  block %2d: %.4f -> %.4f bps  net=%+.1f  %s  [%d instrs  raw=%+.1f  OH=%.1f bits  compact=%d bits %s]\n",
-               b, e_in / BLOCK, e_out / BLOCK, net, ok ? "ok" : "FAIL",
-               g_last_ni, raw, oh, cbits, cok ? "ok" : "FAIL");
+               b, r->e_in / BLOCK, r->e_out / BLOCK, r->net,
+               r->ok ? "ok" : "FAIL", r->ni, raw, oh, r->cbits,
+               r->cok ? "ok" : "FAIL");
         if (NB == 1) {
-            int fq[256]; freq_of(data, BLOCK, fq);
+            int fq[256]; freq_of(all, BLOCK, fq);
             printf("\n--- frequency dump (compressed block) ---\n");
             printf("  val  freq  |  val  freq  |  val  freq  |  val  freq\n");
             for (int row = 0; row < 64; row++) {
@@ -2291,27 +2362,15 @@ int main(int argc, char **argv) {
         }
         fflush(stdout);
 
-        /* serialise instructions for entropy measurement */
-        for (int i = 0; ibuf && i < g_last_ni; i++) {
-            ibuf[ibuf_n++] = (u8)g_ilist[i].type;
-            ibuf[ibuf_n++] = (u8)g_ilist[i].stride;
-            ibuf[ibuf_n++] = (u8)(g_ilist[i].phase & 0xFF);
-            ibuf[ibuf_n++] = (u8)(g_ilist[i].phase >> 8);
-            ibuf[ibuf_n++] = (u8)( g_ilist[i].amp        & 0xFF);
-            ibuf[ibuf_n++] = (u8)((g_ilist[i].amp >>  8) & 0xFF);
-            ibuf[ibuf_n++] = (u8)((g_ilist[i].amp >> 16) & 0xFF);
-            ibuf[ibuf_n++] = (u8)((g_ilist[i].amp >> 24) & 0xFF);
-        }
-
-        fwrite(data, 1, BLOCK, fcomp);
+        if (ibuf) { memcpy(ibuf + ibuf_n, r->ibuf, r->ibuf_n); ibuf_n += r->ibuf_n; }
+        fwrite(all + (size_t)b * BLOCK, 1, BLOCK, fcomp);
     }
     fclose(fcomp);
-    double ms = (double)(clock() - t0) / CLOCKS_PER_SEC * 1000.0;
 
     int fired = 0;
     for (int t = 0; t < NTYPES; t++) if (counts[t]) fired++;
 
-    printf("\n=== aggregate over %d blocks (%.0f ms) ===\n", NB, ms);
+    printf("\n=== aggregate over %d blocks (%.0f ms, %d threads) ===\n", NB, ms, ncpus);
     printf("avg input:  %.4f bps     avg output: %.4f bps\n",
            total_ein / (NB * BLOCK), total_eout / (NB * BLOCK));
     printf("total net:  %.1f bits   (avg %.1f / block)\n", total_net, total_net / NB);
@@ -2326,9 +2385,7 @@ int main(int argc, char **argv) {
            total_compact_bits / NB,
            (double)total_compact_bits / NB,
            compact_fails ? "*** COMPACT FAIL ***" : "round-trip ok");
-    free(ibuf);
-    free(compact_buf);
-    free(unpacked_tmp);
+    free(ibuf); free(results); free(args); free(threads);
     printf("round-trip: %s (%d/%d blocks)\n", fails ? "*** FAIL ***" : "OK", NB - fails, NB);
     printf("types fired (across all blocks): %d / %d\n\n", fired, NTYPES);
     printf("  %-14s %6s  %8s  %8s  %12s\n", "type", "fires", "avg net", "top net", "effectivness");
