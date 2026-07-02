@@ -76,7 +76,20 @@ enum {
     T_VALUEADD,  /* sign bit preserved; ADD mod128 to lo7 independently per sign group; amp=alo|(ahi<<7) */
     T_VALUEMUL,  /* sign bit preserved; odd MUL mod128 to lo7 independently per group; amp=aidx|(bidx<<6) */
     T_VALUEMAP4ADD, /* 4-quartile value-conditional lo6 ADD mod64; top-2 bits preserved -> ADD-sib of VALUEMAP4 */
-    NTYPES       /* = 29 */
+    T_NIBGFMUL,  /* independent GF(16) mul per nibble; amp=(a-1)|((b-1)<<4), a,b in 1..15 (nibble-sib of GF_MUL) */
+    T_CRMBMUL,   /* independent GF(4) mul per 2-bit crumb; amp=c0|(c1<<2)|(c2<<4)|(c3<<6), each ci in 0..2 (=a-1) */
+    T_VALUEMAP4MUL, /* 4-quartile value-conditional lo6 odd MUL mod64; top-2 bits preserved -> MUL-sib of VALUEMAP4 */
+    T_CRMBCROSSMUL, /* crumb k *= (crumb j, or 1 if crumb j==0); amp=j|(k<<2), j!=k                              */
+    T_VALUEGFMUL, /* bit-k preserved (searched); GF(128) mul on the other 7 bits, independent per group; amp=k|(aidx<<3)|(bidx<<10) */
+    T_NIBCROSSGFMUL, /* nibble k *= (nibble j, or 1 if nibble j==0), GF(16); amp=dir (0: lo*=hi_or_1, 1: hi*=lo_or_1) */
+    T_VALUEMAP4GFMUL, /* 4-quartile value-conditional lo6 GF(64) mul; top-2 bits preserved -> GFMUL-sib of VALUEMAP4 */
+    T_BITCXOR,   /* bit-level cross-XOR: bit k ^= bit j; amp=j|(k<<3), j!=k; self-inverse; stride/phase */
+    T_CRMBIADD,  /* independent ADD mod4 per crumb; amp=c0|(c1<<2)|(c2<<4)|(c3<<6), each ci in 0..3 (ADD-sib of CRMB_MUL) */
+    T_GFPOW,     /* nonlinear GF(256) power map v->v^e, e coprime to 255; amp=idx into 128-entry e-table (7 bits, no waste) */
+    T_NIBPOW,    /* independent nonlinear GF(16) power map per nibble; amp=idxlo|(idxhi<<3), idx into 8-entry e-table each (nibble-sib of GF_POW) */
+    T_VALUEGFPOW, /* bit-k preserved (searched); nonlinear GF(128) power map on the other 7 bits, independent per group; amp=k|(eaidx<<3)|(ebidx<<10) (pow-sib of VALUE_GFMUL) */
+    T_VALUEMAP4GFPOW, /* 4-quartile value-conditional GF(64) power map; top-2 bits preserved -> GFPOW-sib of VALUEMAP4GFMUL */
+    NTYPES       /* = 42 */
 };
 
 typedef struct { u8 type; int stride, phase; u32 amp; u8 consts[256]; } Instr;
@@ -134,6 +147,11 @@ static inline double pb_bits(int s) { return (s > 1) ? log2((double)s) : 0.0; }
 #define OH_BYTEMUL_BASE (TAGB + SB + 7.0)
 #define OH_GFMUL_BASE   (TAGB + SB + 8.0)  /* full byte a (1..255), not just odd */
 #define OH_NIBMUL16_BASE (TAGB + SB + 6.0) /* 3 bits per nibble multiplier (8 odd values each) */
+#define OH_NIBGFMUL_BASE (TAGB + SB + 8.0) /* 4 bits per nibble multiplier (15 nonzero GF16 values each) */
+#define OH_CRMBMUL_BASE  (TAGB + SB + 8.0) /* 2 bits per crumb multiplier (3 nonzero GF4 values each), 4 crumbs */
+#define OH_CRMBCROSSMUL_BASE (TAGB + SB + 4.0) /* j|(k<<2), same shape as CRMB_CXOR/CRMB_CADD */
+#define OH_VALUEGFMUL_BASE (TAGB + SB + 17.0) /* k(3) + aidx(7) + bidx(7): 127 nonzero GF128 values each */
+#define OH_NIBCROSSGFMUL_BASE (TAGB + SB + 1.0) /* 1-bit direction, same shape as NIB_CXOR/NIB_CADD */
 #define OH_NIBCADD_BASE  (TAGB + SB + 1.0) /* 1-bit direction, same shape as NIB_CXOR */
 #define OH_CRMBCADD_BASE (TAGB + SB + 4.0) /* j|(k<<2), same shape as CRMB_CXOR */
 #define OH_BITSWAP2_BASE (TAGB + SB)       /* fixed permutation, no amp — same shape as BIT_ASWAP */
@@ -145,6 +163,11 @@ static inline double pb_bits(int s) { return (s > 1) ? log2((double)s) : 0.0; }
 #define OH_PRNGADD8       (PRTAGB + 16.0)
 #define OH_NIBCXOR_BASE   (TAGB + SB + 1.0)
 #define OH_CRMBCXOR_BASE  (TAGB + SB + 4.0)
+#define OH_BITCXOR_BASE   (TAGB + SB + 6.0) /* j|(k<<3), j,k in 0..7: 3 bits each */
+#define OH_CRMBIADD_BASE  (TAGB + SB + 8.0) /* 2 bits per crumb additive constant (4 values each), 4 crumbs */
+#define OH_GFPOW_BASE     (TAGB + SB + 7.0) /* idx into 128-entry coprime-exponent table, no waste */
+#define OH_NIBPOW_BASE    (TAGB + SB + 6.0) /* idxlo(3)+idxhi(3): idx into 8-entry coprime-exponent table each */
+#define OH_VALUEGFPOW_BASE (TAGB + SB + 17.0) /* k(3) + eaidx(7) + ebidx(7): 126 exponent values each (127 is prime) */
 #define OH_GRAYCODE_BASE  (TAGB + SB)
 #define OH_BITASWAP_BASE  (TAGB + SB)
 #define OH_PRNGPERM       (PRTAGB + 16.0)  /* 16-bit seed only — no plane index needed */
@@ -161,6 +184,7 @@ static inline double oh_splitxor(int kidx, int s) {
 #define OH_PRNGBIT      (PRTAGB + 16.0 + 8.0)  /* 16-bit seed + 8-bit flip-mask */
 #define OH_NIBSWAP_BASE (TAGB + SB)
 static double oh_valuemap4(int s)   { return TAGB + SB + pb_bits(s) + 24.0; } /* 4×6-bit constants */
+static double oh_valuemap4mul(int s){ return TAGB + SB + pb_bits(s) + 20.0; } /* 4×5-bit odd multipliers */
 
 /* ============================================================ *
  *  apply / invert primitives (in place)                         *
@@ -252,6 +276,7 @@ static void inv_splitadd(u8 *d, int n, int s, int phase_full, u32 amp) {
         for (int i = p; i < n; i += s, k++) d[i] = (u8)(d[i] - a[k % K]);
     }
 }
+
 /* BYTE_ROT: circular bit rotation left by k. Inverse: rotate right by k (= left by 8-k). */
 static inline u8 byterot_fwd(u8 v, int k) { return (u8)((v << k) | (v >> (8 - k))); }
 static inline u8 byterot_inv(u8 v, int k) { return (u8)((v >> k) | (v << (8 - k))); }
@@ -320,6 +345,56 @@ static void inv_gfmul(u8 *d, int n, int s, int p, u32 amp) {
     for (int i = p; i < n; i += s) d[i] = gf_mul(d[i], ainv);
 }
 
+/* GF_POW: nonlinear sibling of GF_MUL/BYTE_MUL — instead of multiplying by a fixed
+ * field element (a LINEAR map over GF(256)), raise every byte to a fixed power e in the
+ * field's multiplicative group (order 255 = 3*5*17, cyclic, generated by 0x03 under this
+ * same x^8+x^4+x^3+x+1 reduction). v^e is invertible over the whole group iff
+ * gcd(e,255)=1, with inverse exponent e^-1 mod 255; 0 always maps to 0. There are exactly
+ * phi(255)=128 such e values -- a 7-bit index with zero wasted code space. Because
+ * exponentiation composes multiplications nonlinearly (unlike GF_MUL's single multiply),
+ * this reaches byte-value correlations that no linear GF/mod-256 multiply can. Built via
+ * log/antilog tables (discrete log base 0x03) so both directions are O(1) table lookups,
+ * same cost profile as GF_MUL. */
+static u8 gf_log[256], gf_antilog[256];
+static u8 gfpow_elist[128], gfpow_einv[128];
+static int gfpow_ne;
+static u8 gfpow_tab[128][256], gfpow_itab[128][256];
+static void init_gf_log(void) {
+    u8 x = 1;
+    for (int i = 0; i < 255; i++) {
+        gf_antilog[i] = x;
+        gf_log[x] = (u8)i;
+        x = gf_mul(x, 0x03);
+    }
+}
+static inline u8 gfpow_raw(u8 v, int e) {
+    if (v == 0) return 0;
+    return gf_antilog[(gf_log[v] * e) % 255];
+}
+static void init_gfpow(void) {
+    gfpow_ne = 0;
+    for (int e = 1; e < 255; e++) {
+        int a = e, b = 255, x0 = 1, x1 = 0;
+        while (b != 0) { int q = a / b, t = b; b = a % b; a = t; t = x1; x1 = x0 - q * x1; x0 = t; }
+        if (a != 1) continue; /* gcd(e,255) != 1: not invertible */
+        int einv = ((x0 % 255) + 255) % 255;
+        int idx = gfpow_ne++;
+        gfpow_elist[idx] = (u8)e; gfpow_einv[idx] = (u8)einv;
+        for (int v = 0; v < 256; v++) {
+            gfpow_tab[idx][v]  = gfpow_raw((u8)v, e);
+            gfpow_itab[idx][v] = gfpow_raw((u8)v, einv);
+        }
+    }
+}
+static void ap_gfpow(u8 *d, int n, int s, int p, u32 amp) {
+    const u8 *col = gfpow_tab[amp & 0x7F];
+    for (int i = p; i < n; i += s) d[i] = col[d[i]];
+}
+static void inv_gfpow(u8 *d, int n, int s, int p, u32 amp) {
+    const u8 *col = gfpow_itab[amp & 0x7F];
+    for (int i = p; i < n; i += s) d[i] = col[d[i]];
+}
+
 /* NIB_MUL16: multiply lo/hi nibbles independently by odd constants mod 16 (coprime to 16,
  * so each is a bijection on 0..15). Nibble-granularity sibling of BYTE_MUL, the way
  * ADD_NIBS is to STRIDE_ADD — no carry crosses the nibble boundary. amp packs (a-1)/2 and
@@ -346,6 +421,229 @@ static void inv_nibmul16(u8 *d, int n, int s, int p, u32 amp) {
         u8 v = d[i];
         u8 lo = (u8)(((v & 0xF) * ainv) & 0xF);
         u8 hi = (u8)((((v >> 4) & 0xF) * binv) & 0xF);
+        d[i] = (u8)(lo | (hi << 4));
+    }
+}
+
+/* NIB_GFMUL: nibble-granularity sibling of GF_MUL, the way NIB_MUL16 is to BYTE_MUL —
+ * multiply lo/hi nibbles independently by nonzero constants in GF(16) under x^4+x+1
+ * (0x13). GF(16) is a field, so all 15 nonzero elements are invertible (vs NIB_MUL16's
+ * 8 odd-only values) — a different bit-mixing structure at the nibble level, same
+ * reasoning as GF_MUL vs BYTE_MUL at the byte level. Table precomputed once at startup. */
+static u8 gf16_mul_tab[16][16];
+static void init_gf16_mul_tab(void) {
+    for (int av = 0; av < 16; av++) {
+        for (int bv = 0; bv < 16; bv++) {
+            u8 a = (u8)av, b = (u8)bv, p = 0;
+            for (int i = 0; i < 4; i++) {
+                if (b & 1) p ^= a;
+                u8 hi = (u8)(a & 0x8);
+                a = (u8)((a << 1) & 0xF);
+                if (hi) a ^= 0x3;
+                b = (u8)(b >> 1);
+            }
+            gf16_mul_tab[av][bv] = p;
+        }
+    }
+}
+static inline u8 gf16_mul(u8 a, u8 b) { return gf16_mul_tab[a & 0xF][b & 0xF]; }
+static u8 gf16_inv(u8 a) {
+    for (int c = 1; c < 16; c++) if (gf16_mul(a, (u8)c) == 1) return (u8)c;
+    return 1; /* unreachable for a != 0 */
+}
+static void ap_nibgfmul(u8 *d, int n, int s, int p, u32 amp) {
+    u8 a = (u8)((amp & 0xF) + 1), b = (u8)(((amp >> 4) & 0xF) + 1);
+    for (int i = p; i < n; i += s) {
+        u8 v = d[i];
+        u8 lo = gf16_mul((u8)(v & 0xF), a);
+        u8 hi = gf16_mul((u8)((v >> 4) & 0xF), b);
+        d[i] = (u8)(lo | (hi << 4));
+    }
+}
+static void inv_nibgfmul(u8 *d, int n, int s, int p, u32 amp) {
+    u8 a = (u8)((amp & 0xF) + 1), b = (u8)(((amp >> 4) & 0xF) + 1);
+    u8 ainv = gf16_inv(a), binv = gf16_inv(b);
+    for (int i = p; i < n; i += s) {
+        u8 v = d[i];
+        u8 lo = gf16_mul((u8)(v & 0xF), ainv);
+        u8 hi = gf16_mul((u8)((v >> 4) & 0xF), binv);
+        d[i] = (u8)(lo | (hi << 4));
+    }
+}
+
+/* NIB_POW: nibble-granularity sibling of GF_POW — nonlinear power map v->v^e within
+ * GF(16)* (order 15 = 3*5, cyclic, generated by 0x02 under x^4+x+1), applied
+ * independently per nibble like NIB_GFMUL. phi(15)=8 valid exponents -> 3-bit index per
+ * nibble, zero waste. Not redundant with NIB_GFMUL: v^e is nonlinear (not expressible as
+ * any single "multiply by a"), so it reaches different value correlations. */
+static u8 gf16_log[16], gf16_antilog[16];
+static u8 nibpow_elist[8], nibpow_einv[8];
+static int nibpow_ne;
+static u8 nibpow_tab[8][16], nibpow_itab[8][16];
+static void init_gf16_log(void) {
+    u8 x = 1;
+    for (int i = 0; i < 15; i++) {
+        gf16_antilog[i] = x;
+        gf16_log[x] = (u8)i;
+        x = gf16_mul(x, 0x02);
+    }
+}
+static inline u8 nibpow_raw(u8 v, int e) {
+    if (v == 0) return 0;
+    return gf16_antilog[(gf16_log[v] * e) % 15];
+}
+static void init_nibpow(void) {
+    nibpow_ne = 0;
+    for (int e = 1; e < 15; e++) {
+        int a = e, b = 15, x0 = 1, x1 = 0;
+        while (b != 0) { int q = a / b, t = b; b = a % b; a = t; t = x1; x1 = x0 - q * x1; x0 = t; }
+        if (a != 1) continue;
+        int einv = ((x0 % 15) + 15) % 15;
+        int idx = nibpow_ne++;
+        nibpow_elist[idx] = (u8)e; nibpow_einv[idx] = (u8)einv;
+        for (int v = 0; v < 16; v++) {
+            nibpow_tab[idx][v]  = nibpow_raw((u8)v, e);
+            nibpow_itab[idx][v] = nibpow_raw((u8)v, einv);
+        }
+    }
+}
+static void ap_nibpow(u8 *d, int n, int s, int p, u32 amp) {
+    const u8 *tlo = nibpow_tab[amp & 7], *thi = nibpow_tab[(amp >> 3) & 7];
+    for (int i = p; i < n; i += s) {
+        u8 v = d[i];
+        u8 lo = tlo[v & 0xF], hi = thi[(v >> 4) & 0xF];
+        d[i] = (u8)(lo | (hi << 4));
+    }
+}
+static void inv_nibpow(u8 *d, int n, int s, int p, u32 amp) {
+    const u8 *tlo = nibpow_itab[amp & 7], *thi = nibpow_itab[(amp >> 3) & 7];
+    for (int i = p; i < n; i += s) {
+        u8 v = d[i];
+        u8 lo = tlo[v & 0xF], hi = thi[(v >> 4) & 0xF];
+        d[i] = (u8)(lo | (hi << 4));
+    }
+}
+
+/* CRMB_MUL: crumb-granularity sibling of NIB_GFMUL — multiply each of the 4 independent
+ * 2-bit crumbs by a nonzero constant in GF(4) under x^2+x+1. GF(4)* is cyclic of order 3
+ * ({1,2,3}), small enough for a direct lookup table instead of a bit-loop. amp packs 4
+ * crumb-index fields (2 bits each, value = constant-1, so 0..2 for constants 1..3). */
+static inline u8 gf4_mul(u8 a, u8 b) {
+    static const u8 tab[4][4] = {
+        {0,0,0,0},
+        {0,1,2,3},
+        {0,2,3,1},
+        {0,3,1,2},
+    };
+    return tab[a & 3][b & 3];
+}
+static inline u8 gf4_inv(u8 a) {
+    static const u8 inv[4] = {0, 1, 3, 2}; /* inv[0] unused */
+    return inv[a & 3];
+}
+static void ap_crmbmul(u8 *d, int n, int s, int p, u32 amp) {
+    u8 c[4];
+    for (int g = 0; g < 4; g++) c[g] = (u8)(((amp >> (g * 2)) & 3) + 1);
+    for (int i = p; i < n; i += s) {
+        u8 v = d[i], w = 0;
+        for (int g = 0; g < 4; g++) {
+            u8 crumb = (u8)((v >> (2 * g)) & 3);
+            w = (u8)(w | (gf4_mul(crumb, c[g]) << (2 * g)));
+        }
+        d[i] = w;
+    }
+}
+static void inv_crmbmul(u8 *d, int n, int s, int p, u32 amp) {
+    u8 ci[4];
+    for (int g = 0; g < 4; g++) ci[g] = gf4_inv((u8)(((amp >> (g * 2)) & 3) + 1));
+    for (int i = p; i < n; i += s) {
+        u8 v = d[i], w = 0;
+        for (int g = 0; g < 4; g++) {
+            u8 crumb = (u8)((v >> (2 * g)) & 3);
+            w = (u8)(w | (gf4_mul(crumb, ci[g]) << (2 * g)));
+        }
+        d[i] = w;
+    }
+}
+
+/* CRMB_IADD: independent-per-crumb ADD mod 4 — direct ADD-sibling of CRMB_MUL (same
+ * shape, 4 independent 2-bit fields), just ADD mod 4 instead of GF(4) mul. Unlike
+ * CRMB_MUL's multiplier codes (which skip 0, the annihilator), all 4 values 0..3 are
+ * valid additive constants — no waste in the 2-bit field. */
+static void ap_crmbiadd(u8 *d, int n, int s, int p, u32 amp) {
+    u8 c[4];
+    for (int g = 0; g < 4; g++) c[g] = (u8)((amp >> (g * 2)) & 3);
+    for (int i = p; i < n; i += s) {
+        u8 v = d[i], w = 0;
+        for (int g = 0; g < 4; g++) {
+            u8 crumb = (u8)((v >> (2 * g)) & 3);
+            w = (u8)(w | (((crumb + c[g]) & 3) << (2 * g)));
+        }
+        d[i] = w;
+    }
+}
+static void inv_crmbiadd(u8 *d, int n, int s, int p, u32 amp) {
+    u8 c[4];
+    for (int g = 0; g < 4; g++) c[g] = (u8)((amp >> (g * 2)) & 3);
+    for (int i = p; i < n; i += s) {
+        u8 v = d[i], w = 0;
+        for (int g = 0; g < 4; g++) {
+            u8 crumb = (u8)((v >> (2 * g)) & 3);
+            w = (u8)(w | (((crumb - c[g]) & 3) << (2 * g)));
+        }
+        d[i] = w;
+    }
+}
+
+/* CRMB_CROSS_MUL: cross-crumb sibling of CRMB_CXOR/CRMB_CADD — crumb k *= crumb j (in
+ * GF(4)), instead of XOR/ADD. A raw data-dependent multiplier is NOT invertible whenever
+ * crumb j happens to be 0 (multiplying by 0 destroys crumb k's value) — substitute 1 in
+ * that case. This is safe and exactly reversible because crumb j is never written by this
+ * transform, so the same substitution is recomputed identically at decode time from the
+ * untouched crumb j. */
+static void ap_crmbcrossmul(u8 *d, int n, int s, int p, u32 amp) {
+    int j = (int)(amp & 3), k = (int)((amp >> 2) & 3);
+    for (int i = p; i < n; i += s) {
+        u8 v = d[i];
+        u8 cj = (u8)((v >> (2*j)) & 3);
+        u8 mult = cj ? cj : 1;
+        u8 ck = (u8)((v >> (2*k)) & 3);
+        u8 nck = gf4_mul(ck, mult);
+        d[i] = (u8)((v & ~(u8)(3 << (2*k))) | (nck << (2*k)));
+    }
+}
+static void inv_crmbcrossmul(u8 *d, int n, int s, int p, u32 amp) {
+    int j = (int)(amp & 3), k = (int)((amp >> 2) & 3);
+    for (int i = p; i < n; i += s) {
+        u8 v = d[i];
+        u8 cj = (u8)((v >> (2*j)) & 3);
+        u8 mult = cj ? cj : 1;
+        u8 multinv = gf4_inv(mult);
+        u8 ck = (u8)((v >> (2*k)) & 3);
+        u8 nck = gf4_mul(ck, multinv);
+        d[i] = (u8)((v & ~(u8)(3 << (2*k))) | (nck << (2*k)));
+    }
+}
+
+/* NIB_CROSS_GFMUL: nibble-granularity sibling of CRMB_CROSSMUL — nibble k *= nibble j
+ * (in GF(16)), substituting 1 whenever nibble j reads 0 (same zero-annihilator fix, still
+ * exactly reversible since nibble j is never written by this transform). Only 2 positions
+ * (lo,hi) instead of 4 crumbs, so amp is just a 1-bit direction like NIB_CXOR/NIB_CADD. */
+static void ap_nibcrossgfmul(u8 *d, int n, int s, int p, u32 amp) {
+    int dir = (int)(amp & 1);
+    for (int i = p; i < n; i += s) {
+        u8 v = d[i]; u8 lo = (u8)(v & 0xF), hi = (u8)((v >> 4) & 0xF);
+        if (dir == 0) { u8 m = hi ? hi : 1; lo = gf16_mul(lo, m); }
+        else          { u8 m = lo ? lo : 1; hi = gf16_mul(hi, m); }
+        d[i] = (u8)(lo | (hi << 4));
+    }
+}
+static void inv_nibcrossgfmul(u8 *d, int n, int s, int p, u32 amp) {
+    int dir = (int)(amp & 1);
+    for (int i = p; i < n; i += s) {
+        u8 v = d[i]; u8 lo = (u8)(v & 0xF), hi = (u8)((v >> 4) & 0xF);
+        if (dir == 0) { u8 m = hi ? hi : 1; lo = gf16_mul(lo, gf16_inv(m)); }
+        else          { u8 m = lo ? lo : 1; hi = gf16_mul(hi, gf16_inv(m)); }
         d[i] = (u8)(lo | (hi << 4));
     }
 }
@@ -444,6 +742,213 @@ static void inv_valuemul(u8 *d, int n, int s, int p, u32 amp) {
     }
 }
 
+/* VALUE_GFMUL: generalizes VALUE_MUL from "sign bit only" to an arbitrary preserved bit
+ * k (searched), using GF(128) field multiply (x^7+x+1) on the compacted other 7 bits
+ * instead of mod-128 integer multiply — same GF-vs-int-mult relationship as GF_MUL is to
+ * BYTE_MUL. Needs the bit-extraction/reinsertion trick VALUE_PERM used (bit k isn't
+ * already contiguous with the rest unless k=7) — that trick was never VALUE_PERM's real
+ * problem; GF(128) has only 127 nonzero elements (fully searchable), so this doesn't
+ * inherit VALUE_PERM's actual flaw (sparse coverage of an astronomically large
+ * permutation space). amp = k|(aidx<<3)|(bidx<<10), a=aidx+1, b=bidx+1, aidx/bidx in 0..126. */
+static u8 gf128_mul_tab[128][128];
+static void init_gf128_mul_tab(void) {
+    for (int av = 0; av < 128; av++) {
+        for (int bv = 0; bv < 128; bv++) {
+            u8 a = (u8)av, b = (u8)bv, p = 0;
+            for (int i = 0; i < 7; i++) {
+                if (b & 1) p ^= a;
+                u8 hi = (u8)(a & 0x40);
+                a = (u8)((a << 1) & 0x7F);
+                if (hi) a ^= 0x03;
+                b = (u8)(b >> 1);
+            }
+            gf128_mul_tab[av][bv] = p;
+        }
+    }
+}
+static inline u8 gf128_mul(u8 a, u8 b) { return gf128_mul_tab[a & 0x7F][b & 0x7F]; }
+static u8 gf128_inv(u8 a) {
+    for (int c = 1; c < 128; c++) if (gf128_mul(a, (u8)c) == 1) return (u8)c;
+    return 1; /* unreachable for a != 0 */
+}
+static inline u8 vk_idx(u8 v, int k) { int mask = (1 << k) - 1; return (u8)((v & mask) | ((v >> (k + 1)) << k)); }
+static inline u8 vk_unidx(u8 idx, int gbit, int k) { int mask = (1 << k) - 1; return (u8)((idx & mask) | (gbit << k) | ((idx >> k) << (k + 1))); }
+static void ap_valuegfmul(u8 *d, int n, int s, int p, u32 amp) {
+    int k = (int)(amp & 7);
+    u8 a = (u8)(((amp >> 3) & 0x7F) + 1), b = (u8)(((amp >> 10) & 0x7F) + 1);
+    for (int i = p; i < n; i += s) {
+        u8 v = d[i]; int gbit = (v >> k) & 1;
+        u8 idx = vk_idx(v, k);
+        u8 nidx = gf128_mul(idx, gbit ? b : a);
+        d[i] = vk_unidx(nidx, gbit, k);
+    }
+}
+static void inv_valuegfmul(u8 *d, int n, int s, int p, u32 amp) {
+    int k = (int)(amp & 7);
+    u8 a = (u8)(((amp >> 3) & 0x7F) + 1), b = (u8)(((amp >> 10) & 0x7F) + 1);
+    u8 ainv = gf128_inv(a), binv = gf128_inv(b);
+    for (int i = p; i < n; i += s) {
+        u8 v = d[i]; int gbit = (v >> k) & 1;
+        u8 idx = vk_idx(v, k);
+        u8 nidx = gf128_mul(idx, gbit ? binv : ainv);
+        d[i] = vk_unidx(nidx, gbit, k);
+    }
+}
+
+/* VALUE_GFPOW: nonlinear sibling of VALUE_GFMUL — bit-k preserved (same vk_idx/vk_unidx
+ * split), but the two groups (gbit=0/1) each get an independent GF(128) power-map
+ * exponent instead of a multiplier. GF(128)* has PRIME order 127, so every exponent
+ * 1..126 is invertible (no gcd filtering needed) -- 126 values, same 7-bit width as
+ * VALUE_GFMUL's multiplier index, so no overhead cost, just a different (nonlinear)
+ * transform space, same relationship as GF_POW to GF_MUL. */
+static u8 gf128_log[128], gf128_antilog[128];
+static void init_gf128_log(void) {
+    u8 x = 1;
+    for (int i = 0; i < 127; i++) {
+        gf128_antilog[i] = x;
+        gf128_log[x] = (u8)i;
+        x = gf128_mul(x, 0x02);
+    }
+}
+static u8 vgfpow_elist[126], vgfpow_einv[126];
+static int vgfpow_ne;
+static u8 vgfpow_tab[126][128], vgfpow_itab[126][128];
+static inline u8 vgfpow_raw(u8 v, int e) {
+    if (v == 0) return 0;
+    return gf128_antilog[(gf128_log[v] * e) % 127];
+}
+static void init_vgfpow(void) {
+    vgfpow_ne = 0;
+    for (int e = 1; e < 127; e++) {
+        int a = e, b = 127, x0 = 1, x1 = 0;
+        while (b != 0) { int q = a / b, t = b; b = a % b; a = t; t = x1; x1 = x0 - q * x1; x0 = t; }
+        int einv = ((x0 % 127) + 127) % 127;
+        int idx = vgfpow_ne++;
+        vgfpow_elist[idx] = (u8)e; vgfpow_einv[idx] = (u8)einv;
+        for (int v = 0; v < 128; v++) {
+            vgfpow_tab[idx][v]  = vgfpow_raw((u8)v, e);
+            vgfpow_itab[idx][v] = vgfpow_raw((u8)v, einv);
+        }
+    }
+}
+static void ap_valuegfpow(u8 *d, int n, int s, int p, u32 amp) {
+    int k = (int)(amp & 7);
+    const u8 *ta = vgfpow_tab[(amp >> 3) & 0x7F], *tb = vgfpow_tab[(amp >> 10) & 0x7F];
+    for (int i = p; i < n; i += s) {
+        u8 v = d[i]; int gbit = (v >> k) & 1;
+        u8 idx = vk_idx(v, k);
+        u8 nidx = gbit ? tb[idx] : ta[idx];
+        d[i] = vk_unidx(nidx, gbit, k);
+    }
+}
+static void inv_valuegfpow(u8 *d, int n, int s, int p, u32 amp) {
+    int k = (int)(amp & 7);
+    const u8 *ta = vgfpow_itab[(amp >> 3) & 0x7F], *tb = vgfpow_itab[(amp >> 10) & 0x7F];
+    for (int i = p; i < n; i += s) {
+        u8 v = d[i]; int gbit = (v >> k) & 1;
+        u8 idx = vk_idx(v, k);
+        u8 nidx = gbit ? tb[idx] : ta[idx];
+        d[i] = vk_unidx(nidx, gbit, k);
+    }
+}
+
+/* VALUEMAP4_GFMUL: GF(64) sibling of VALUEMAP4_MUL, completing the quartile-level
+ * XOR/ADD/MUL-int/MUL-GF family the same way VALUE_GFMUL completes it at the sign-bit
+ * level. GF(64) under x^6+x+1 gives all 63 nonzero elements (vs the mod-64 int version's
+ * 32 odd-only). amp packs 4 quartile codes, 6 bits each (code -> a = code+1, 1..63). */
+static u8 gf64_mul_tab[64][64];
+static void init_gf64_mul_tab(void) {
+    for (int av = 0; av < 64; av++) {
+        for (int bv = 0; bv < 64; bv++) {
+            u8 a = (u8)av, b = (u8)bv, p = 0;
+            for (int i = 0; i < 6; i++) {
+                if (b & 1) p ^= a;
+                u8 hi = (u8)(a & 0x20);
+                a = (u8)((a << 1) & 0x3F);
+                if (hi) a ^= 0x03;
+                b = (u8)(b >> 1);
+            }
+            gf64_mul_tab[av][bv] = p;
+        }
+    }
+}
+static inline u8 gf64_mul(u8 a, u8 b) { return gf64_mul_tab[a & 0x3F][b & 0x3F]; }
+static u8 gf64_inv(u8 a) {
+    for (int c = 1; c < 64; c++) if (gf64_mul(a, (u8)c) == 1) return (u8)c;
+    return 1; /* unreachable for a != 0 */
+}
+static void ap_valuemap4gfmul(u8 *d, int n, int s, int p, u32 amp) {
+    u8 c[4];
+    for (int q = 0; q < 4; q++) c[q] = (u8)(((amp >> (q * 6)) & 0x3F) + 1);
+    for (int i = p; i < n; i += s) {
+        u8 v = d[i];
+        d[i] = (u8)((v & 0xC0) | gf64_mul((u8)(v & 0x3F), c[v >> 6]));
+    }
+}
+static void inv_valuemap4gfmul(u8 *d, int n, int s, int p, u32 amp) {
+    u8 c[4], ci[4];
+    for (int q = 0; q < 4; q++) { c[q] = (u8)(((amp >> (q * 6)) & 0x3F) + 1); ci[q] = gf64_inv(c[q]); }
+    for (int i = p; i < n; i += s) {
+        u8 v = d[i];
+        d[i] = (u8)((v & 0xC0) | gf64_mul((u8)(v & 0x3F), ci[v >> 6]));
+    }
+}
+
+/* VALUEMAP4_GFPOW: nonlinear sibling of VALUEMAP4_GFMUL — same quartile split (top 2
+ * bits select one of 4 independent groups), but each quartile gets a GF(64) power-map
+ * exponent instead of a multiplier. GF(64)* has order 63=7*3^2, phi(63)=36 valid
+ * exponents -- fits the same 6-bit-per-quartile field VM4GFMUL already uses (6 bits is
+ * the minimum needed for 36 values regardless; some code space unused, same as any
+ * non-power-of-2 domain, not a new inefficiency). Same relationship to VM4GFMUL as
+ * GF_POW to GF_MUL. */
+static u8 gf64_log[64], gf64_antilog[64];
+static void init_gf64_log(void) {
+    u8 x = 1;
+    for (int i = 0; i < 63; i++) {
+        gf64_antilog[i] = x;
+        gf64_log[x] = (u8)i;
+        x = gf64_mul(x, 0x02);
+    }
+}
+static u8 vm4pow_elist[36], vm4pow_einv[36];
+static int vm4pow_ne;
+static u8 vm4pow_tab[36][64], vm4pow_itab[36][64];
+static inline u8 vm4pow_raw(u8 v, int e) {
+    if (v == 0) return 0;
+    return gf64_antilog[(gf64_log[v] * e) % 63];
+}
+static void init_vm4pow(void) {
+    vm4pow_ne = 0;
+    for (int e = 1; e < 63; e++) {
+        int a = e, b = 63, x0 = 1, x1 = 0;
+        while (b != 0) { int q = a / b, t = b; b = a % b; a = t; t = x1; x1 = x0 - q * x1; x0 = t; }
+        if (a != 1) continue; /* gcd(e,63) != 1: not invertible */
+        int einv = ((x0 % 63) + 63) % 63;
+        int idx = vm4pow_ne++;
+        vm4pow_elist[idx] = (u8)e; vm4pow_einv[idx] = (u8)einv;
+        for (int v = 0; v < 64; v++) {
+            vm4pow_tab[idx][v]  = vm4pow_raw((u8)v, e);
+            vm4pow_itab[idx][v] = vm4pow_raw((u8)v, einv);
+        }
+    }
+}
+static void ap_valuemap4gfpow(u8 *d, int n, int s, int p, u32 amp) {
+    u8 c[4];
+    for (int q = 0; q < 4; q++) c[q] = (u8)((amp >> (q * 6)) & 0x3F);
+    for (int i = p; i < n; i += s) {
+        u8 v = d[i];
+        d[i] = (u8)((v & 0xC0) | vm4pow_tab[c[v >> 6]][v & 0x3F]);
+    }
+}
+static void inv_valuemap4gfpow(u8 *d, int n, int s, int p, u32 amp) {
+    u8 c[4];
+    for (int q = 0; q < 4; q++) c[q] = (u8)((amp >> (q * 6)) & 0x3F);
+    for (int i = p; i < n; i += s) {
+        u8 v = d[i];
+        d[i] = (u8)((v & 0xC0) | vm4pow_itab[c[v >> 6]][v & 0x3F]);
+    }
+}
+
 /* NIB_CROSS_XOR: XOR one nibble with the other within each byte.
  * amp=0: lo ^= hi  →  d[i] = (d[i] & 0xF0) | ((d[i] ^ (d[i]>>4)) & 0x0F)
  * amp=1: hi ^= lo  →  d[i] = (d[i] & 0x0F) | (((d[i] ^ d[i]>>4) & 0xF) << 4)
@@ -462,6 +967,19 @@ static void ap_crmbcxor(u8 *d, int n, int s, int p, u32 amp) {
     int j = (int)(amp & 3), k = (int)((amp >> 2) & 3);
     for (int i = p; i < n; i += s)
         d[i] ^= (u8)(((d[i] >> (2*j)) & 3) << (2*k));
+}
+
+/* BIT_CROSS_XOR: finest-granularity sibling of CRMB_CXOR/NIB_CXOR — XOR single bit k
+ * with single bit j within each byte. amp = j|(k<<3), j,k in 0..7, j!=k. Self-inverse
+ * (bit j is only read, never written by this transform). Bit-level cross-ADD would be
+ * identical to cross-XOR (mod-2 addition = XOR) so it's redundant and not implemented;
+ * bit-level cross-MUL is trivial (GF(2)'s only nonzero multiplier is 1, i.e. identity)
+ * so it's meaningless and also not implemented — XOR is the only nontrivial op at this
+ * granularity. */
+static void ap_bitcxor(u8 *d, int n, int s, int p, u32 amp) {
+    int j = (int)(amp & 7), k = (int)((amp >> 3) & 7);
+    for (int i = p; i < n; i += s)
+        d[i] ^= (u8)(((d[i] >> j) & 1) << k);
 }
 
 /* CRUMB_CROSS_ADD: ADD-sibling of CRMB_CXOR — same shape (2-bit crumb k gets crumb j
@@ -651,6 +1169,32 @@ static void inv_valuemap4add(u8 *d, int n, int s, int p, u32 amp) {
     }
 }
 
+/* VALUEMAP4_MUL: completes the XOR/ADD/MUL trio at the quartile level, the way
+ * VALUE_XOR/VALUE_ADD/VALUE_MUL already do at the sign-bit level. Multiply the lower 6
+ * bits by an odd constant mod 64 per quartile (odd is coprime to 64, so a bijection on
+ * 0..63); the mod-256 inverse of an odd number, masked to 6 bits, is also its correct
+ * mod-64 inverse (64 divides 256), so mul_inv256 is reused, same trick as VALUE_MUL.
+ * amp packs 4 quartile codes (5 bits each: code -> a = 2*code+1, 32 odd values 1..63). */
+static void ap_valuemap4mul(u8 *d, int n, int s, int p, u32 amp) {
+    u8 c[4];
+    for (int q = 0; q < 4; q++) c[q] = (u8)(2 * ((amp >> (q * 5)) & 0x1F) + 1);
+    for (int i = p; i < n; i += s) {
+        u8 v = d[i];
+        d[i] = (u8)((v & 0xC0) | (u8)(((v & 0x3F) * c[v >> 6]) & 0x3F));
+    }
+}
+static void inv_valuemap4mul(u8 *d, int n, int s, int p, u32 amp) {
+    u8 c[4], ci[4];
+    for (int q = 0; q < 4; q++) {
+        c[q] = (u8)(2 * ((amp >> (q * 5)) & 0x1F) + 1);
+        ci[q] = (u8)(mul_inv256(c[q]) & 0x3F);
+    }
+    for (int i = p; i < n; i += s) {
+        u8 v = d[i];
+        d[i] = (u8)((v & 0xC0) | (u8)(((v & 0x3F) * ci[v >> 6]) & 0x3F));
+    }
+}
+
 /* NIBSWAP: swap high and low nibbles of each byte: v -> (v<<4)|(v>>4). Self-inverse. */
 static void ap_nibswap(u8 *d, int n, int s, int p) {
     for (int i = p; i < n; i += s)
@@ -689,6 +1233,19 @@ static void apply_instr(u8 *d, int n, Instr t) {
         case T_VALUEADD:       ap_valueadd(d, n, t.stride, t.phase, t.amp); break;
         case T_VALUEMUL:       ap_valuemul(d, n, t.stride, t.phase, t.amp); break;
         case T_VALUEMAP4ADD:   ap_valuemap4add(d, n, t.stride, t.phase, t.amp); break;
+        case T_NIBGFMUL:       ap_nibgfmul(d, n, t.stride, t.phase, t.amp); break;
+        case T_CRMBMUL:        ap_crmbmul(d, n, t.stride, t.phase, t.amp); break;
+        case T_VALUEMAP4MUL:   ap_valuemap4mul(d, n, t.stride, t.phase, t.amp); break;
+        case T_CRMBCROSSMUL:   ap_crmbcrossmul(d, n, t.stride, t.phase, t.amp); break;
+        case T_VALUEGFMUL:     ap_valuegfmul(d, n, t.stride, t.phase, t.amp); break;
+        case T_NIBCROSSGFMUL:  ap_nibcrossgfmul(d, n, t.stride, t.phase, t.amp); break;
+        case T_VALUEMAP4GFMUL: ap_valuemap4gfmul(d, n, t.stride, t.phase, t.amp); break;
+        case T_BITCXOR:        ap_bitcxor(d, n, t.stride, t.phase, t.amp); break;
+        case T_CRMBIADD:       ap_crmbiadd(d, n, t.stride, t.phase, t.amp); break;
+        case T_GFPOW:          ap_gfpow(d, n, t.stride, t.phase, t.amp); break;
+        case T_NIBPOW:         ap_nibpow(d, n, t.stride, t.phase, t.amp); break;
+        case T_VALUEGFPOW:     ap_valuegfpow(d, n, t.stride, t.phase, t.amp); break;
+        case T_VALUEMAP4GFPOW: ap_valuemap4gfpow(d, n, t.stride, t.phase, t.amp); break;
     }
 }
 static void invert_instr(u8 *d, int n, Instr t) {
@@ -722,6 +1279,19 @@ static void invert_instr(u8 *d, int n, Instr t) {
         case T_VALUEADD:       inv_valueadd(d, n, t.stride, t.phase, t.amp); break;
         case T_VALUEMUL:       inv_valuemul(d, n, t.stride, t.phase, t.amp); break;
         case T_VALUEMAP4ADD:   inv_valuemap4add(d, n, t.stride, t.phase, t.amp); break;
+        case T_NIBGFMUL:       inv_nibgfmul(d, n, t.stride, t.phase, t.amp); break;
+        case T_CRMBMUL:        inv_crmbmul(d, n, t.stride, t.phase, t.amp); break;
+        case T_VALUEMAP4MUL:   inv_valuemap4mul(d, n, t.stride, t.phase, t.amp); break;
+        case T_CRMBCROSSMUL:   inv_crmbcrossmul(d, n, t.stride, t.phase, t.amp); break;
+        case T_VALUEGFMUL:     inv_valuegfmul(d, n, t.stride, t.phase, t.amp); break;
+        case T_NIBCROSSGFMUL:  inv_nibcrossgfmul(d, n, t.stride, t.phase, t.amp); break;
+        case T_VALUEMAP4GFMUL: inv_valuemap4gfmul(d, n, t.stride, t.phase, t.amp); break;
+        case T_BITCXOR:        ap_bitcxor(d, n, t.stride, t.phase, t.amp); break;  /* self-inv */
+        case T_CRMBIADD:       inv_crmbiadd(d, n, t.stride, t.phase, t.amp); break;
+        case T_GFPOW:          inv_gfpow(d, n, t.stride, t.phase, t.amp); break;
+        case T_NIBPOW:         inv_nibpow(d, n, t.stride, t.phase, t.amp); break;
+        case T_VALUEGFPOW:     inv_valuegfpow(d, n, t.stride, t.phase, t.amp); break;
+        case T_VALUEMAP4GFPOW: inv_valuemap4gfpow(d, n, t.stride, t.phase, t.amp); break;
     }
 }
 
@@ -900,6 +1470,32 @@ static double search_gfmul(const u8 *d, int n, double Sb, Instr *out) {
     return best;
 }
 
+/* GF_POW: same shape as search_gfmul, but iterating the 128-entry coprime-exponent
+ * table (gfpow_tab) instead of the 254 nonzero multipliers. */
+static double search_gfpow(const u8 *d, int n, double Sb, Instr *out) {
+    int total[256]; freq_of(d, n, total);
+    double best = -1e18; int bs = 1, bp = 0; u32 ba = 0;
+    for (int s = 1; s <= g_stride_lim; s++) {
+        double oh = OH_SP(OH_GFPOW_BASE, s);
+        for (int p = 0; p < s; p++) {
+            int hit[256] = {0};
+            for (int i = p; i < n; i += s) hit[d[i]]++;
+            int base[256];
+            for (int v = 0; v < 256; v++) base[v] = total[v] - hit[v];
+            for (int idx = 0; idx < gfpow_ne; idx++) {
+                int rf[256];
+                memcpy(rf, base, sizeof rf);
+                const u8 *col = gfpow_tab[idx];
+                for (int u = 0; u < 256; u++) rf[col[u]] += hit[u];
+                double net = (S_from_freq(rf) - Sb) - oh;
+                if (net > best) { best = net; bs = s; bp = p; ba = (u32)idx; }
+            }
+        }
+    }
+    out->type = T_GFPOW; out->stride = bs; out->phase = bp; out->amp = ba;
+    return best;
+}
+
 /* NIB_MUL16: lo/hi nibbles never interact in the output, so a joint 8x8 brute force
  * (rather than a coordinate-descent approximation) is both exact and cheap. */
 static double search_nibmul16(const u8 *d, int n, double Sb, Instr *out) {
@@ -929,6 +1525,141 @@ static double search_nibmul16(const u8 *d, int n, double Sb, Instr *out) {
         }
     }
     out->type = T_NIBMUL16; out->stride = bs; out->phase = bp; out->amp = bamp;
+    return best;
+}
+
+/* NIB_GFMUL: same joint-brute-force shape as NIB_MUL16 — 15x15 combos instead of 8x8,
+ * still cheap since nibbles stay independent. */
+static double search_nibgfmul(const u8 *d, int n, double Sb, Instr *out) {
+    int total[256]; freq_of(d, n, total);
+    double best = -1e18; int bs = 1, bp = 0; u32 bamp = 0;
+    for (int s = 1; s <= g_stride_lim; s++) {
+        double oh = OH_SP(OH_NIBGFMUL_BASE, s);
+        for (int p = 0; p < s; p++) {
+            int hit[256] = {0};
+            for (int i = p; i < n; i += s) hit[d[i]]++;
+            int base[256];
+            for (int v = 0; v < 256; v++) base[v] = total[v] - hit[v];
+            for (int ai = 0; ai < 15; ai++) {
+                u8 a = (u8)(ai + 1);
+                for (int bi = 0; bi < 15; bi++) {
+                    u8 b = (u8)(bi + 1);
+                    int rf[256]; memcpy(rf, base, sizeof rf);
+                    for (int u = 0; u < 256; u++) {
+                        u8 lo = gf16_mul((u8)(u & 0xF), a);
+                        u8 hi = gf16_mul((u8)((u >> 4) & 0xF), b);
+                        rf[(u8)(lo | (hi << 4))] += hit[u];
+                    }
+                    double net = (S_from_freq(rf) - Sb) - oh;
+                    if (net > best) { best = net; bs = s; bp = p; bamp = (u32)ai | ((u32)bi << 4); }
+                }
+            }
+        }
+    }
+    out->type = T_NIBGFMUL; out->stride = bs; out->phase = bp; out->amp = bamp;
+    return best;
+}
+
+/* NIB_POW: same joint-brute-force shape as NIB_GFMUL, but only 8x8=64 combos (fewer
+ * than NIB_GFMUL's 15x15, since phi(15)=8 valid exponents vs 15 nonzero multipliers). */
+static double search_nibpow(const u8 *d, int n, double Sb, Instr *out) {
+    int total[256]; freq_of(d, n, total);
+    double best = -1e18; int bs = 1, bp = 0; u32 bamp = 0;
+    for (int s = 1; s <= g_stride_lim; s++) {
+        double oh = OH_SP(OH_NIBPOW_BASE, s);
+        for (int p = 0; p < s; p++) {
+            int hit[256] = {0};
+            for (int i = p; i < n; i += s) hit[d[i]]++;
+            int base[256];
+            for (int v = 0; v < 256; v++) base[v] = total[v] - hit[v];
+            for (int ai = 0; ai < nibpow_ne; ai++) {
+                const u8 *tlo = nibpow_tab[ai];
+                for (int bi = 0; bi < nibpow_ne; bi++) {
+                    const u8 *thi = nibpow_tab[bi];
+                    int rf[256]; memcpy(rf, base, sizeof rf);
+                    for (int u = 0; u < 256; u++) {
+                        u8 lo = tlo[u & 0xF], hi = thi[(u >> 4) & 0xF];
+                        rf[(u8)(lo | (hi << 4))] += hit[u];
+                    }
+                    double net = (S_from_freq(rf) - Sb) - oh;
+                    if (net > best) { best = net; bs = s; bp = p; bamp = (u32)ai | ((u32)bi << 3); }
+                }
+            }
+        }
+    }
+    out->type = T_NIBPOW; out->stride = bs; out->phase = bp; out->amp = bamp;
+    return best;
+}
+
+/* CRMB_MUL: 4 independent crumbs, each with only 3 nonzero GF(4) candidates — a full
+ * joint 3^4=81-combo brute force per (stride,phase) is still cheap. */
+static double search_crmbmul(const u8 *d, int n, double Sb, Instr *out) {
+    int total[256]; freq_of(d, n, total);
+    double best = -1e18; int bs = 1, bp = 0; u32 bamp = 0;
+    for (int s = 1; s <= g_stride_lim; s++) {
+        double oh = OH_SP(OH_CRMBMUL_BASE, s);
+        for (int p = 0; p < s; p++) {
+            int hit[256] = {0};
+            for (int i = p; i < n; i += s) hit[d[i]]++;
+            int base[256];
+            for (int v = 0; v < 256; v++) base[v] = total[v] - hit[v];
+            for (int c0 = 0; c0 < 3; c0++) for (int c1 = 0; c1 < 3; c1++)
+            for (int c2 = 0; c2 < 3; c2++) for (int c3 = 0; c3 < 3; c3++) {
+                u8 c[4] = { (u8)(c0+1), (u8)(c1+1), (u8)(c2+1), (u8)(c3+1) };
+                int rf[256]; memcpy(rf, base, sizeof rf);
+                for (int u = 0; u < 256; u++) {
+                    u8 w = 0;
+                    for (int g = 0; g < 4; g++) {
+                        u8 crumb = (u8)((u >> (2*g)) & 3);
+                        w = (u8)(w | (gf4_mul(crumb, c[g]) << (2*g)));
+                    }
+                    rf[w] += hit[u];
+                }
+                double net = (S_from_freq(rf) - Sb) - oh;
+                if (net > best) {
+                    best = net; bs = s; bp = p;
+                    bamp = (u32)c0 | ((u32)c1 << 2) | ((u32)c2 << 4) | ((u32)c3 << 6);
+                }
+            }
+        }
+    }
+    out->type = T_CRMBMUL; out->stride = bs; out->phase = bp; out->amp = bamp;
+    return best;
+}
+
+/* CRMB_IADD: same shape as search_crmbmul, ADD mod4 instead of GF(4) mul (all 4 codes
+ * 0..3 are valid additive constants, no annihilator to skip). */
+static double search_crmbiadd(const u8 *d, int n, double Sb, Instr *out) {
+    int total[256]; freq_of(d, n, total);
+    double best = -1e18; int bs = 1, bp = 0; u32 bamp = 0;
+    for (int s = 1; s <= g_stride_lim; s++) {
+        double oh = OH_SP(OH_CRMBIADD_BASE, s);
+        for (int p = 0; p < s; p++) {
+            int hit[256] = {0};
+            for (int i = p; i < n; i += s) hit[d[i]]++;
+            int base[256];
+            for (int v = 0; v < 256; v++) base[v] = total[v] - hit[v];
+            for (int c0 = 0; c0 < 4; c0++) for (int c1 = 0; c1 < 4; c1++)
+            for (int c2 = 0; c2 < 4; c2++) for (int c3 = 0; c3 < 4; c3++) {
+                u8 c[4] = { (u8)c0, (u8)c1, (u8)c2, (u8)c3 };
+                int rf[256]; memcpy(rf, base, sizeof rf);
+                for (int u = 0; u < 256; u++) {
+                    u8 w = 0;
+                    for (int g = 0; g < 4; g++) {
+                        u8 crumb = (u8)((u >> (2*g)) & 3);
+                        w = (u8)(w | (((crumb + c[g]) & 3) << (2*g)));
+                    }
+                    rf[w] += hit[u];
+                }
+                double net = (S_from_freq(rf) - Sb) - oh;
+                if (net > best) {
+                    best = net; bs = s; bp = p;
+                    bamp = (u32)c0 | ((u32)c1 << 2) | ((u32)c2 << 4) | ((u32)c3 << 6);
+                }
+            }
+        }
+    }
+    out->type = T_CRMBIADD; out->stride = bs; out->phase = bp; out->amp = bamp;
     return best;
 }
 
@@ -1095,6 +1826,102 @@ static double search_valuemul(const u8 *d, int n, double Sb, Instr *out) {
     return best;
 }
 
+/* VALUE_GFMUL: same independent-group-optimization shape as VALUE_MUL, but loops over
+ * every preserved bit k (like VALUE_XOR does) instead of being fixed to the sign bit, and
+ * uses the GF(128) forward map through vk_idx/vk_unidx instead of a plain mod-128
+ * multiply. */
+static double search_valuegfmul(const u8 *d, int n, double Sb, Instr *out) {
+    int total[256]; freq_of(d, n, total);
+    double best = -1e18; int bs = 1, bp = 0; u32 bamp = 0;
+    for (int s = 1; s <= g_stride_lim; s++) {
+        double oh = OH_SP(OH_VALUEGFMUL_BASE, s);
+        for (int p = 0; p < s; p++) {
+            int phF[256] = {0};
+            for (int i = p; i < n; i += s) phF[d[i]]++;
+            int dv[256];
+            for (int v = 0; v < 256; v++) dv[v] = total[v] - phF[v];
+            for (int k = 0; k < 8; k++) {
+                int balo = 1; double bS0 = -1e30;
+                for (int ai = 1; ai < 128; ai++) {
+                    u8 ainv = gf128_inv((u8)ai);
+                    double S = 0.0;
+                    for (int w = 0; w < 128; w++) {
+                        u8 outv = vk_unidx((u8)w, 0, k);
+                        u8 inv_v = vk_unidx(gf128_mul((u8)w, ainv), 0, k);
+                        S += hlog[dv[outv] + phF[inv_v]];
+                    }
+                    if (S > bS0) { bS0 = S; balo = ai; }
+                }
+                int bahi = 1; double bS1 = -1e30;
+                for (int ai = 1; ai < 128; ai++) {
+                    u8 ainv = gf128_inv((u8)ai);
+                    double S = 0.0;
+                    for (int w = 0; w < 128; w++) {
+                        u8 outv = vk_unidx((u8)w, 1, k);
+                        u8 inv_v = vk_unidx(gf128_mul((u8)w, ainv), 1, k);
+                        S += hlog[dv[outv] + phF[inv_v]];
+                    }
+                    if (S > bS1) { bS1 = S; bahi = ai; }
+                }
+                double net = (bS0 + bS1 - Sb) - oh;
+                if (net > best) {
+                    best = net; bs = s; bp = p;
+                    bamp = (u32)k | ((u32)(balo - 1) << 3) | ((u32)(bahi - 1) << 10);
+                }
+            }
+        }
+    }
+    out->type = T_VALUEGFMUL; out->stride = bs; out->phase = bp; out->amp = bamp;
+    return best;
+}
+
+/* VALUE_GFPOW: same shape as search_valuegfmul, iterating the 126-entry power-exponent
+ * table (vgfpow_itab, for the inverse lookup) instead of the 127 nonzero multipliers. */
+static double search_valuegfpow(const u8 *d, int n, double Sb, Instr *out) {
+    int total[256]; freq_of(d, n, total);
+    double best = -1e18; int bs = 1, bp = 0; u32 bamp = 0;
+    for (int s = 1; s <= g_stride_lim; s++) {
+        double oh = OH_SP(OH_VALUEGFPOW_BASE, s);
+        for (int p = 0; p < s; p++) {
+            int phF[256] = {0};
+            for (int i = p; i < n; i += s) phF[d[i]]++;
+            int dv[256];
+            for (int v = 0; v < 256; v++) dv[v] = total[v] - phF[v];
+            for (int k = 0; k < 8; k++) {
+                int balo = 0; double bS0 = -1e30;
+                for (int ei = 0; ei < vgfpow_ne; ei++) {
+                    const u8 *itab = vgfpow_itab[ei];
+                    double S = 0.0;
+                    for (int w = 0; w < 128; w++) {
+                        u8 outv = vk_unidx((u8)w, 0, k);
+                        u8 inv_v = vk_unidx(itab[w], 0, k);
+                        S += hlog[dv[outv] + phF[inv_v]];
+                    }
+                    if (S > bS0) { bS0 = S; balo = ei; }
+                }
+                int bahi = 0; double bS1 = -1e30;
+                for (int ei = 0; ei < vgfpow_ne; ei++) {
+                    const u8 *itab = vgfpow_itab[ei];
+                    double S = 0.0;
+                    for (int w = 0; w < 128; w++) {
+                        u8 outv = vk_unidx((u8)w, 1, k);
+                        u8 inv_v = vk_unidx(itab[w], 1, k);
+                        S += hlog[dv[outv] + phF[inv_v]];
+                    }
+                    if (S > bS1) { bS1 = S; bahi = ei; }
+                }
+                double net = (bS0 + bS1 - Sb) - oh;
+                if (net > best) {
+                    best = net; bs = s; bp = p;
+                    bamp = (u32)k | ((u32)balo << 3) | ((u32)bahi << 10);
+                }
+            }
+        }
+    }
+    out->type = T_VALUEGFPOW; out->stride = bs; out->phase = bp; out->amp = bamp;
+    return best;
+}
+
 /* NIB_CROSS_XOR: try both directions (lo^=hi and hi^=lo) at every stride/phase. */
 static double search_nibcxor(const u8 *d, int n, double Sb, Instr *out) {
     int total[256]; freq_of(d, n, total);
@@ -1120,6 +1947,35 @@ static double search_nibcxor(const u8 *d, int n, double Sb, Instr *out) {
         }
     }
     out->type = T_NIBCXOR; out->stride = bs; out->phase = bp; out->amp = bamp;
+    return best;
+}
+
+/* NIB_CROSS_GFMUL: same shape as search_nibcxor, GF(16) cross-multiply (with the
+ * nibble-is-zero -> substitute-1 fix) instead of XOR. */
+static double search_nibcrossgfmul(const u8 *d, int n, double Sb, Instr *out) {
+    int total[256]; freq_of(d, n, total);
+    double best = -1e18; int bs = 1, bp = 0; u32 bamp = 0;
+    for (int s = 1; s <= g_stride_lim; s++) {
+        double oh = OH_SP(OH_NIBCROSSGFMUL_BASE, s);
+        for (int p = 0; p < s; p++) {
+            int hit[256] = {0};
+            for (int i = p; i < n; i += s) hit[d[i]]++;
+            for (int dir = 0; dir < 2; dir++) {
+                int rf[256];
+                for (int v=0;v<256;v++) rf[v] = total[v] - hit[v];
+                for (int v=0;v<256;v++) {
+                    u8 lo=(u8)(v&0xF), hi=(u8)((v>>4)&0xF);
+                    int w;
+                    if (dir==0) { u8 m=hi?hi:1; w = (int)(gf16_mul(lo,m)|(hi<<4)); }
+                    else        { u8 m=lo?lo:1; w = (int)(lo|(gf16_mul(hi,m)<<4)); }
+                    rf[w] += hit[v];
+                }
+                double net = (S_from_freq(rf) - Sb) - oh;
+                if (net > best) { best = net; bs = s; bp = p; bamp = (u32)dir; }
+            }
+        }
+    }
+    out->type = T_NIBCROSSGFMUL; out->stride = bs; out->phase = bp; out->amp = bamp;
     return best;
 }
 
@@ -1215,6 +2071,35 @@ static double search_crmbcxor(const u8 *d, int n, double Sb, Instr *out) {
     return best;
 }
 
+/* BIT_CROSS_XOR: same shape as search_crmbcxor but bit granularity — try all 56 ordered
+ * (j,k) pairs, j,k in 0..7. */
+static double search_bitcxor(const u8 *d, int n, double Sb, Instr *out) {
+    int total[256]; freq_of(d, n, total);
+    double best = -1e18; int bs = 1, bp = 0; u32 bamp = 0;
+    for (int s = 1; s <= g_stride_lim; s++) {
+        double oh = OH_SP(OH_BITCXOR_BASE, s);
+        for (int p = 0; p < s; p++) {
+            int hit[256] = {0};
+            for (int i = p; i < n; i += s) hit[d[i]]++;
+            for (int j = 0; j < 8; j++) {
+                for (int k = 0; k < 8; k++) {
+                    if (j == k) continue;
+                    int rf[256];
+                    for (int v = 0; v < 256; v++) rf[v] = total[v] - hit[v];
+                    for (int v = 0; v < 256; v++) {
+                        int w = v ^ (((v >> j) & 1) << k);
+                        rf[w] += hit[v];
+                    }
+                    double net = (S_from_freq(rf) - Sb) - oh;
+                    if (net > best) { best = net; bs = s; bp = p; bamp = (u32)(j | (k<<3)); }
+                }
+            }
+        }
+    }
+    out->type = T_BITCXOR; out->stride = bs; out->phase = bp; out->amp = bamp;
+    return best;
+}
+
 /* CRUMB_CROSS_ADD: same shape as search_crmbcxor, ADD instead of XOR. */
 static double search_crmbcadd(const u8 *d, int n, double Sb, Instr *out) {
     int total[256]; freq_of(d, n, total);
@@ -1242,6 +2127,39 @@ static double search_crmbcadd(const u8 *d, int n, double Sb, Instr *out) {
         }
     }
     out->type = T_CRMBCADD; out->stride = bs; out->phase = bp; out->amp = bamp;
+    return best;
+}
+
+/* CRUMB_CROSS_MUL: same shape as search_crmbcadd, GF(4) mul (with the crumb-j==0 ->
+ * substitute-1 fix) instead of ADD. */
+static double search_crmbcrossmul(const u8 *d, int n, double Sb, Instr *out) {
+    int total[256]; freq_of(d, n, total);
+    double best = -1e18; int bs = 1, bp = 0; u32 bamp = 0;
+    for (int s = 1; s <= g_stride_lim; s++) {
+        double oh = OH_SP(OH_CRMBCROSSMUL_BASE, s);
+        for (int p = 0; p < s; p++) {
+            int hit[256] = {0};
+            for (int i = p; i < n; i += s) hit[d[i]]++;
+            for (int j = 0; j < 4; j++) {
+                for (int k = 0; k < 4; k++) {
+                    if (j == k) continue;
+                    int rf[256];
+                    for (int v = 0; v < 256; v++) rf[v] = total[v] - hit[v];
+                    for (int v = 0; v < 256; v++) {
+                        u8 cj = (u8)((v >> (2*j)) & 3);
+                        u8 mult = cj ? cj : 1;
+                        u8 ck = (u8)((v >> (2*k)) & 3);
+                        u8 nck = gf4_mul(ck, mult);
+                        int w = (v & ~(3 << (2*k))) | (nck << (2*k));
+                        rf[w] += hit[v];
+                    }
+                    double net = (S_from_freq(rf) - Sb) - oh;
+                    if (net > best) { best = net; bs = s; bp = p; bamp = (u32)(j | (k<<2)); }
+                }
+            }
+        }
+    }
+    out->type = T_CRMBCROSSMUL; out->stride = bs; out->phase = bp; out->amp = bamp;
     return best;
 }
 
@@ -1621,6 +2539,133 @@ static double search_valuemap4add(const u8 *d, int n, double Sb, Instr *out) {
     return best;
 }
 
+/* VALUEMAP4_MUL: same per-quartile independent-optimisation shape, MUL mod 64 (odd
+ * multiplier) instead of ADD/XOR. For candidate multiplier a, the input that maps to
+ * output j is j*a^{-1} mod 64 (mul_inv256(a) masked to 6 bits, same trick VALUE_MUL uses
+ * for mod 128 — 64 divides 256, so the mod-256 inverse restricted to 6 bits is correct). */
+static double search_valuemap4mul(const u8 *d, int n, double Sb, Instr *out) {
+    int total[256]; freq_of(d, n, total);
+    double best = -1e18; int bs=1, bp=0; u32 bamp=0;
+    for (int s=1; s<=g_stride_lim; s++) {
+        double oh = oh_valuemap4mul(s);
+        for (int p=0; p<s; p++) {
+            int hit[256]={0};
+            for (int i=p; i<n; i+=s) hit[d[i]]++;
+            int base[256];
+            for (int v=0;v<256;v++) base[v]=total[v]-hit[v];
+            u32 amp=0;
+            for (int q=0; q<4; q++) {
+                int bc=0; double bS=-1e30;
+                int qlo=q*64;
+                for (int c=0; c<32; c++) {
+                    u8 a=(u8)(2*c+1);
+                    u8 ainv=(u8)(mul_inv256(a)&0x3F);
+                    double S=0.0;
+                    for (int j=0; j<64; j++) {
+                        int vin = (int)((u8)(j*ainv)&0x3F);
+                        S += hlog[base[qlo+j] + hit[qlo+vin]];
+                    }
+                    if (S>bS) { bS=S; bc=c; }
+                }
+                amp |= (u32)bc << (q*5);
+            }
+            int rf[256]; memcpy(rf, base, sizeof rf);
+            for (int v=0;v<256;v++) if (hit[v]) {
+                int q=v>>6; u8 a=(u8)(2*((amp>>(q*5))&0x1F)+1);
+                int w = (v&0xC0) | (u8)(((v&0x3F)*a)&0x3F);
+                rf[w] += hit[v];
+            }
+            double net = (S_from_freq(rf) - Sb) - oh;
+            if (net>best) { best=net; bs=s; bp=p; bamp=amp; }
+        }
+    }
+    out->type=T_VALUEMAP4MUL; out->stride=bs; out->phase=bp; out->amp=bamp;
+    return best;
+}
+
+/* VALUEMAP4_GFMUL: same per-quartile independent-optimisation shape, GF(64) mul instead
+ * of mod-64 int mul — all 63 nonzero elements usable (vs 32 odd-only). */
+static double search_valuemap4gfmul(const u8 *d, int n, double Sb, Instr *out) {
+    int total[256]; freq_of(d, n, total);
+    double best = -1e18; int bs=1, bp=0; u32 bamp=0;
+    for (int s=1; s<=g_stride_lim; s++) {
+        double oh = oh_valuemap4(s);
+        for (int p=0; p<s; p++) {
+            int hit[256]={0};
+            for (int i=p; i<n; i+=s) hit[d[i]]++;
+            int base[256];
+            for (int v=0;v<256;v++) base[v]=total[v]-hit[v];
+            u32 amp=0;
+            for (int q=0; q<4; q++) {
+                int bc=0; double bS=-1e30;
+                int qlo=q*64;
+                for (int c=1; c<64; c++) {
+                    u8 cinv = gf64_inv((u8)c);
+                    double S=0.0;
+                    for (int w=0; w<64; w++) {
+                        int vin = gf64_mul((u8)w, cinv);
+                        S += hlog[base[qlo+w] + hit[qlo+vin]];
+                    }
+                    if (S>bS) { bS=S; bc=c; }
+                }
+                amp |= (u32)(bc-1) << (q*6);
+            }
+            int rf[256]; memcpy(rf, base, sizeof rf);
+            for (int v=0;v<256;v++) if (hit[v]) {
+                int q=v>>6; u8 a=(u8)(((amp>>(q*6))&0x3F)+1);
+                int w = (v&0xC0) | gf64_mul((u8)(v&0x3F), a);
+                rf[w] += hit[v];
+            }
+            double net = (S_from_freq(rf) - Sb) - oh;
+            if (net>best) { best=net; bs=s; bp=p; bamp=amp; }
+        }
+    }
+    out->type=T_VALUEMAP4GFMUL; out->stride=bs; out->phase=bp; out->amp=bamp;
+    return best;
+}
+
+/* VALUEMAP4_GFPOW: same per-quartile-independent shape as search_valuemap4gfmul (quartiles
+ * occupy disjoint value ranges so their entropy contributions are separable), iterating
+ * the 36-entry power-exponent table instead of the 63 nonzero multipliers. */
+static double search_valuemap4gfpow(const u8 *d, int n, double Sb, Instr *out) {
+    int total[256]; freq_of(d, n, total);
+    double best = -1e18; int bs=1, bp=0; u32 bamp=0;
+    for (int s=1; s<=g_stride_lim; s++) {
+        double oh = oh_valuemap4(s);
+        for (int p=0; p<s; p++) {
+            int hit[256]={0};
+            for (int i=p; i<n; i+=s) hit[d[i]]++;
+            int base[256];
+            for (int v=0;v<256;v++) base[v]=total[v]-hit[v];
+            u32 amp=0;
+            for (int q=0; q<4; q++) {
+                int bc=0; double bS=-1e30;
+                int qlo=q*64;
+                for (int ei=0; ei<vm4pow_ne; ei++) {
+                    const u8 *itab = vm4pow_itab[ei];
+                    double S=0.0;
+                    for (int w=0; w<64; w++) {
+                        int vin = itab[w];
+                        S += hlog[base[qlo+w] + hit[qlo+vin]];
+                    }
+                    if (S>bS) { bS=S; bc=ei; }
+                }
+                amp |= (u32)bc << (q*6);
+            }
+            int rf[256]; memcpy(rf, base, sizeof rf);
+            for (int v=0;v<256;v++) if (hit[v]) {
+                int q=v>>6; u8 ei=(u8)((amp>>(q*6))&0x3F);
+                int w = (v&0xC0) | vm4pow_tab[ei][v&0x3F];
+                rf[w] += hit[v];
+            }
+            double net = (S_from_freq(rf) - Sb) - oh;
+            if (net>best) { best=net; bs=s; bp=p; bamp=amp; }
+        }
+    }
+    out->type=T_VALUEMAP4GFPOW; out->stride=bs; out->phase=bp; out->amp=bamp;
+    return best;
+}
+
 /* NIBSWAP: fixed permutation (swap hi/lo nibbles) — freq-table trick. */
 static double search_nibswap(const u8 *d, int n, double Sb, Instr *out) {
     static u8 nstab[256]; static int nsinit=0;
@@ -1652,7 +2697,7 @@ static double search_reflect(const u8 *d, int n, double Sb, Instr *out) {
     int M = 0;
     for (int v = 1; v < 256; v++) if (f[v] > f[M]) M = v;
     out->type = T_REFLECT; out->stride = 0; out->phase = 0; out->amp = (u32)M;
-    return -(TAGB + 8.0);   /* bijection: ΔS=0, so net = -overhead */
+    return -8.0;   /* bijection: no entropy change; no type tag (structurally last, see pack_ilist), just the 8-bit M */
 }
 
 /* registry of selectable instructions */
@@ -1692,19 +2737,79 @@ static const InstrDesc REGISTRY[] = {
     { "VALUE_ADD",   search_valueadd,       0, 0 },
     { "VALUE_MUL",   search_valuemul,       0, 0 },
     { "VALMAP4ADD",  search_valuemap4add,   0, 0 },
+    { "NIB_GFMUL",   search_nibgfmul,       0, 0 },
+    { "CRMB_MUL",    search_crmbmul,        0, 0 },
+    { "VALMAP4MUL",  search_valuemap4mul,   0, 0 },
+    { "CRMBXMUL",    search_crmbcrossmul,   0, 0 },
+    { "VALUE_GFMUL", search_valuegfmul,     1, 0 },
+    { "NIBXGFMUL",   search_nibcrossgfmul,  0, 0 },
+    { "VM4GFMUL",    search_valuemap4gfmul, 0, 0 },
+    { "BIT_CXOR",    search_bitcxor,        0, 0 },
+    { "CRMB_IADD",   search_crmbiadd,       0, 0 },
+    { "GF_POW",      search_gfpow,          0, 0 },
+    { "NIB_POW",     search_nibpow,         0, 0 },
+    { "VALUE_GFPOW", search_valuegfpow,     1, 0 },
+    { "VM4GFPOW",    search_valuemap4gfpow, 1, 0 },
 };
 #define NREG ((int)(sizeof(REGISTRY)/sizeof(REGISTRY[0])))
 static const char *TYPE_NAME[NTYPES] = {
-    "XOR_PHASE",  "ADD_NIBS",   "STRIDE_ADD",  "BYTE_ROT",    "BYTE_MUL",
-    "VALUE_XOR",  "BIT_REV",    "PRNG_ADD4",   "PRNG_ADD8",   "NIB_CXOR",
-    "CRMB_CXOR", "GRAY_CODE", "BIT_ASWAP",  "PRNG_PERM", "REFLECT",
-    "SPLIT_ADD", "SPLIT_XOR", "PRNG_BIT",
-    "VALUEMAP4", "NIB_SWAP",   "XOR_NP",
-    "GF_MUL",    "NIB_MUL16", "NIB_CADD",
-    "CRMB_CADD", "BIT_SWAP2", "VALUE_ADD",
-    "VALUE_MUL", "VALMAP4ADD"
+    "XOR_PHASE",   /*  0 */
+    "ADD_NIBS",    /*  1 */
+    "STRIDE_ADD",  /*  2 */
+    "BYTE_ROT",    /*  3 */
+    "BYTE_MUL",    /*  4 */
+    "VALUE_XOR",   /*  5 */
+    "BIT_REV",     /*  6 */
+    "PRNG_ADD4",   /*  7 */
+    "PRNG_ADD8",   /*  8 */
+    "NIB_CXOR",    /*  9 */
+    "CRMB_CXOR",   /* 10 */
+    "GRAY_CODE",   /* 11 */
+    "BIT_ASWAP",   /* 12 */
+    "PRNG_PERM",   /* 13 */
+    "REFLECT",     /* 14 */
+    "SPLIT_ADD",   /* 15 */
+    "SPLIT_XOR",   /* 16 */
+    "PRNG_BIT",    /* 17 */
+    "VALUEMAP4",   /* 18 */
+    "NIB_SWAP",    /* 19 */
+    "XOR_NP",      /* 20 */
+    "GF_MUL",      /* 21 */
+    "NIB_MUL16",   /* 22 */
+    "NIB_CADD",    /* 23 */
+    "CRMB_CADD",   /* 24 */
+    "BIT_SWAP2",   /* 25 */
+    "VALUE_ADD",   /* 26 */
+    "VALUE_MUL",   /* 27 */
+    "VALMAP4ADD",  /* 28 */
+    "NIB_GFMUL",   /* 29 */
+    "CRMB_MUL",    /* 30 */
+    "VALMAP4MUL",  /* 31 */
+    "CRMBXMUL",    /* 32 */
+    "VALUE_GFMUL", /* 33 */
+    "NIBXGFMUL",   /* 34 */
+    "VM4GFMUL",    /* 35 */
+    "BIT_CXOR",    /* 36 */
+    "CRMB_IADD",   /* 37 */
+    "GF_POW",      /* 38 */
+    "NIB_POW",     /* 39 */
+    "VALUE_GFPOW", /* 40 */
+    "VM4GFPOW"     /* 41 */
 };
 
+/* True per-type tag bit-length for the canonical Huffman code that pack_ilist actually
+ * writes (see TAGCODE/bb_get_tag near the bitstream section). Declared here (before
+ * adaptive_tag_cost/best_instr/greedy_run) so the search's cost accounting can use the
+ * real cost instead of the old flat TAGB or a hypothetical per-block-adaptive estimate
+ * that doesn't match what's actually encoded. 0 for PRNG-tagged types and REFLECT,
+ * which never go through this path (PRNG types use their own 2-bit PRTAGB; REFLECT is
+ * always structurally last, needing no tag at all). Weighted avg 4.97 bits vs flat 6.0
+ * (aggregated fire-frequency data across many real blocks this session), max 8 bits. */
+static const u8 TAGLEN[NTYPES] = {
+    6, 4, 5, 6, 5, 4, 7, 0, 0, 6, 5, 6, 6, 0, 0, 6, 4, 0, 7, 6,
+    6, 4, 5, 6, 6, 6, 5, 4, 6, 5, 6, 6, 8, 4, 7, 6, 6, 4, 5, 5,
+    5, 8
+};
 
 /* PRNG-tagged types: these are the only ones the greedy loop can pick during the
  * PRNG-first layers (see g_search_mode==1 below), so they always land in a
@@ -1720,20 +2825,6 @@ static int is_prng_tagged(u8 type) { return prng_tag_index(type) >= 0; }
 /* 0=all types, 1=prng_first only (layers 0-2), 2=non-prng only (layer 3+) */
 static __thread int g_search_mode;
 
-/* Adaptive type-tag cost: replaces fixed TAGB with -log2(laplace_smoothed_freq).
- * Repeated types get cheaper; rare types get more expensive. Reset per block.
- * Only applies to the 6-bit-tagged "normal" section — PRNG_TAG_TYPES use a flat
- * 2-bit index instead (see OH_PRNGADD4 etc, which already bake in PRTAGB). */
-static __thread int g_type_freq[NTYPES];
-static __thread int g_total_instrs_used;
-
-static double adaptive_tag_cost(int type) {
-    /* Denominator frozen at 0.5*18 (the original type count before extension types were added).
-     * Keeps the prior stable so adding non-firing types doesn't inflate costs for firing ones. */
-    double p = (g_type_freq[type] + 0.5) / (g_total_instrs_used + 9.0);
-    return -log2(p);
-}
-
 /* best selectable instruction for the current data */
 static double best_instr(const u8 *d, int n, Instr *out) {
     double Sb = S_of(d, n);
@@ -1744,8 +2835,9 @@ static double best_instr(const u8 *d, int n, Instr *out) {
         Instr cand;
         double net = REGISTRY[r].search(d, n, Sb, &cand);
         if (!is_prng_tagged(cand.type)) {
-            /* swap fixed TAGB for the actual adaptive type-coding cost */
-            net = net + TAGB - adaptive_tag_cost(cand.type);
+            /* swap fixed TAGB (baked into oh by every OH_*_BASE macro) for the real
+             * per-type Huffman tag cost that pack_ilist actually writes */
+            net = net + TAGB - (double)TAGLEN[cand.type];
         }
         if (g_diag) printf("    [diag] %-12s net=%+.2f\n", REGISTRY[r].name, net);
         if (net > best) { best = net; bi = cand; }
@@ -1809,30 +2901,49 @@ static void print_layer_struct(const u8 *d, int n) {
            best_s, best_bps);
 }
 
+/* One-step lookahead tolerance: greedy stops the instant the best candidate doesn't
+ * clear its own overhead — but a marginally-negative move can still reshape the residual
+ * into something the NEXT layer exploits for more than the first move cost. Only accept
+ * such a move if a verified 2-step lookahead shows the COMBINED net is positive — never
+ * blindly accept a negative move on faith. */
+#define PATIENCE_BITS 5.0
+
 /* run greedy to convergence; nets[i] receives the net bits saved by ilist[i] */
 static double greedy_run(u8 *d, int n, Instr *ilist, double *nets, int *ni, int verbose) {
-    memset(g_type_freq, 0, sizeof g_type_freq);
-    g_total_instrs_used = 0;
     double gained = 0.0;
     int n_normal_used = 0;  /* count of accepted non-PRNG instructions so far */
+    u8 *scratch = malloc(n);
     for (;;) {
         if (*ni >= MAXINSTR) break;
         Instr t;
         g_search_mode = (*ni < 3) ? 1 : 2;  /* layers 0-2: PRNG only; layer 3+: non-PRNG only */
         double net = best_instr(d, n, &t);
         g_search_mode = 0;
-        /* net was computed with adaptive_tag_cost for normal (6-bit-tag) types; PRNG-
-         * tagged types already bake in their true flat 2-bit tag cost (see OH_PRNGADD4
-         * etc), so their net needs no further threshold adjustment. */
-        double accept_threshold = is_prng_tagged(t.type) ? 0.0 : (TAGB - adaptive_tag_cost(t.type));
-        if (net <= accept_threshold) break;
+        /* net was computed with the real per-type Huffman tag cost (TAGLEN) for normal
+         * types; PRNG-tagged types already bake in their true flat 2-bit tag cost (see
+         * OH_PRNGADD4 etc), so their net needs no further threshold adjustment. */
+        double accept_threshold = is_prng_tagged(t.type) ? 0.0 : (TAGB - (double)TAGLEN[t.type]);
+        int accept = (net > accept_threshold);
+        if (!accept && scratch) {
+            double margin = net - accept_threshold;
+            if (margin > -PATIENCE_BITS) {
+                memcpy(scratch, d, n);
+                apply_instr(scratch, n, t);
+                Instr t2;
+                g_search_mode = (*ni + 1 < 3) ? 1 : 2;
+                double net2 = best_instr(scratch, n, &t2);
+                g_search_mode = 0;
+                double accept_threshold2 = is_prng_tagged(t2.type) ? 0.0 : (TAGB - (double)TAGLEN[t2.type]);
+                double combined = net + ((net2 > accept_threshold2) ? net2 : 0.0);
+                if (combined > 0.0) accept = 1;
+            }
+        }
+        if (!accept) break;
         /* Reserve 1 of the MAX_NORMAL_INSTR slots for the trailing REFLECT try_reflect()
          * always appends, so the compact header's normal-count field never overflows. */
         if (!is_prng_tagged(t.type) && n_normal_used >= MAX_NORMAL_INSTR - 1) break;
         double e0 = entropy_bits(d, n) / n;
         apply_instr(d, n, t);
-        g_type_freq[t.type]++;
-        g_total_instrs_used++;
         if (!is_prng_tagged(t.type)) n_normal_used++;
         nets[*ni] = net;
         ilist[(*ni)++] = t;
@@ -1851,6 +2962,7 @@ static double greedy_run(u8 *d, int n, Instr *ilist, double *nets, int *ni, int 
             fflush(stdout);
         }
     }
+    free(scratch);
     return gained;
 }
 
@@ -1928,10 +3040,30 @@ static int phase_bits(int s) {
     int b = 0; while ((1 << b) < s) b++; return b;
 }
 
-/* Encodes a "normal" (6-bit-tagged) instruction. PRNG_TAG_TYPES never reach here —
+/* Canonical Huffman code for the type tag (TAGLEN defined earlier, near TYPE_NAME,
+ * so the search logic can also reference true per-type tag cost). */
+static const u16 TAGCODE[NTYPES] = {
+    46, 0, 14, 47, 15, 1, 124, 0, 0, 48, 16, 49, 50, 0, 0, 51, 2, 0, 125, 52,
+    53, 3, 17, 54, 55, 56, 18, 4, 57, 19, 58, 59, 254, 5, 126, 60, 61, 6, 20, 21,
+    22, 255
+};
+/* Decode a type tag written by TAGCODE/TAGLEN: read bits MSB-first, one at a time,
+ * until the accumulated (code,length) matches a known entry. Prefix-free by
+ * construction (canonical Huffman), so exactly one match exists at the right length. */
+static u8 bb_get_tag(BitBuf *b) {
+    u32 code = 0;
+    for (int len = 1; len <= 8; len++) {
+        code = (code << 1) | bb_get(b, 1);
+        for (int t = 0; t < NTYPES; t++)
+            if (TAGLEN[t] == len && TAGCODE[t] == code) return (u8)t;
+    }
+    return 0; /* unreachable: table covers all 37 taggable types up to length 8 */
+}
+
+/* Encodes a "normal" (Huffman-tagged) instruction. PRNG_TAG_TYPES never reach here —
  * they're written by bb_put_prng_body into the dedicated PRNG section instead. */
 static void bb_put_instr(BitBuf *b, Instr t) {
-    bb_put(b, t.type, 6);
+    bb_put(b, TAGCODE[t.type], TAGLEN[t.type]);
     int s = t.stride, pb = phase_bits(s);
     switch (t.type) {
         case T_REFLECT:
@@ -2009,6 +3141,45 @@ static void bb_put_instr(BitBuf *b, Instr t) {
         case T_VALUEMAP4ADD:
             bb_put(b, s - 1, 6); bb_put(b, t.phase, pb);
             bb_put(b, t.amp & 0x00FFFFFFu, 24); break;
+        case T_NIBGFMUL:
+            bb_put(b, s - 1, 6); bb_put(b, t.phase, pb);
+            bb_put(b, t.amp & 0xFF, 8); break;      /* aidx(4) | bidx(4) */
+        case T_CRMBMUL:
+            bb_put(b, s - 1, 6); bb_put(b, t.phase, pb);
+            bb_put(b, t.amp & 0xFF, 8); break;      /* 4 crumb codes, 2 bits each */
+        case T_VALUEMAP4MUL:
+            bb_put(b, s - 1, 6); bb_put(b, t.phase, pb);
+            bb_put(b, t.amp & 0xFFFFFu, 20); break; /* 4 quartile codes, 5 bits each */
+        case T_CRMBCROSSMUL:
+            bb_put(b, s - 1, 6); bb_put(b, t.phase, pb);
+            bb_put(b, t.amp & 0xF, 4); break;
+        case T_VALUEGFMUL:
+            bb_put(b, s - 1, 6); bb_put(b, t.phase, pb);
+            bb_put(b, t.amp & 0x1FFFFu, 17); break; /* k(3) | aidx(7) | bidx(7) */
+        case T_NIBCROSSGFMUL:
+            bb_put(b, s - 1, 6); bb_put(b, t.phase, pb);
+            bb_put(b, t.amp & 1, 1); break;
+        case T_VALUEMAP4GFMUL:
+            bb_put(b, s - 1, 6); bb_put(b, t.phase, pb);
+            bb_put(b, t.amp & 0x00FFFFFFu, 24); break;
+        case T_BITCXOR:
+            bb_put(b, s - 1, 6); bb_put(b, t.phase, pb);
+            bb_put(b, t.amp & 0x3F, 6); break;      /* j(3) | k(3) */
+        case T_CRMBIADD:
+            bb_put(b, s - 1, 6); bb_put(b, t.phase, pb);
+            bb_put(b, t.amp & 0xFF, 8); break;      /* 4 crumb constants, 2 bits each */
+        case T_GFPOW:
+            bb_put(b, s - 1, 6); bb_put(b, t.phase, pb);
+            bb_put(b, t.amp & 0x7F, 7); break;      /* idx into 128-entry exponent table */
+        case T_NIBPOW:
+            bb_put(b, s - 1, 6); bb_put(b, t.phase, pb);
+            bb_put(b, t.amp & 0x3F, 6); break;      /* idxlo(3) | idxhi(3) */
+        case T_VALUEGFPOW:
+            bb_put(b, s - 1, 6); bb_put(b, t.phase, pb);
+            bb_put(b, t.amp & 0x1FFFFu, 17); break; /* k(3) | eaidx(7) | ebidx(7) */
+        case T_VALUEMAP4GFPOW:
+            bb_put(b, s - 1, 6); bb_put(b, t.phase, pb);
+            bb_put(b, t.amp & 0x00FFFFFFu, 24); break; /* 4 quartile exponent-idx codes, 6 bits each */
     }
 }
 
@@ -2109,11 +3280,63 @@ static Instr bb_get_instr_body(BitBuf *b, u8 type_val) {
             s = (int)bb_get(b, 6) + 1; pb = phase_bits(s);
             t.stride = s; t.phase = (int)bb_get(b, pb);
             t.amp = bb_get(b, 24); break;
+        case T_NIBGFMUL:
+            s = (int)bb_get(b, 6) + 1; pb = phase_bits(s);
+            t.stride = s; t.phase = (int)bb_get(b, pb);
+            t.amp = bb_get(b, 8); break;
+        case T_CRMBMUL:
+            s = (int)bb_get(b, 6) + 1; pb = phase_bits(s);
+            t.stride = s; t.phase = (int)bb_get(b, pb);
+            t.amp = bb_get(b, 8); break;
+        case T_VALUEMAP4MUL:
+            s = (int)bb_get(b, 6) + 1; pb = phase_bits(s);
+            t.stride = s; t.phase = (int)bb_get(b, pb);
+            t.amp = bb_get(b, 20); break;
+        case T_CRMBCROSSMUL:
+            s = (int)bb_get(b, 6) + 1; pb = phase_bits(s);
+            t.stride = s; t.phase = (int)bb_get(b, pb);
+            t.amp = bb_get(b, 4); break;
+        case T_VALUEGFMUL:
+            s = (int)bb_get(b, 6) + 1; pb = phase_bits(s);
+            t.stride = s; t.phase = (int)bb_get(b, pb);
+            t.amp = bb_get(b, 17); break;
+        case T_NIBCROSSGFMUL:
+            s = (int)bb_get(b, 6) + 1; pb = phase_bits(s);
+            t.stride = s; t.phase = (int)bb_get(b, pb);
+            t.amp = bb_get(b, 1); break;
+        case T_VALUEMAP4GFMUL:
+            s = (int)bb_get(b, 6) + 1; pb = phase_bits(s);
+            t.stride = s; t.phase = (int)bb_get(b, pb);
+            t.amp = bb_get(b, 24); break;
+        case T_BITCXOR:
+            s = (int)bb_get(b, 6) + 1; pb = phase_bits(s);
+            t.stride = s; t.phase = (int)bb_get(b, pb);
+            t.amp = bb_get(b, 6); break;
+        case T_CRMBIADD:
+            s = (int)bb_get(b, 6) + 1; pb = phase_bits(s);
+            t.stride = s; t.phase = (int)bb_get(b, pb);
+            t.amp = bb_get(b, 8); break;
+        case T_GFPOW:
+            s = (int)bb_get(b, 6) + 1; pb = phase_bits(s);
+            t.stride = s; t.phase = (int)bb_get(b, pb);
+            t.amp = bb_get(b, 7); break;
+        case T_NIBPOW:
+            s = (int)bb_get(b, 6) + 1; pb = phase_bits(s);
+            t.stride = s; t.phase = (int)bb_get(b, pb);
+            t.amp = bb_get(b, 6); break;
+        case T_VALUEGFPOW:
+            s = (int)bb_get(b, 6) + 1; pb = phase_bits(s);
+            t.stride = s; t.phase = (int)bb_get(b, pb);
+            t.amp = bb_get(b, 17); break;
+        case T_VALUEMAP4GFPOW:
+            s = (int)bb_get(b, 6) + 1; pb = phase_bits(s);
+            t.stride = s; t.phase = (int)bb_get(b, pb);
+            t.amp = bb_get(b, 24); break;
     }
     return t;
 }
 static Instr bb_get_instr(BitBuf *b) {
-    return bb_get_instr_body(b, (u8)bb_get(b, 6));
+    return bb_get_instr_body(b, bb_get_tag(b));
 }
 
 /* PRNG-tagged instructions are all global (stride=phase=0), so only amp needs encoding.
@@ -2157,28 +3380,35 @@ static Instr bb_get_prng_body(BitBuf *b) {
  * PRNG_TAG_TYPES instructions form a contiguous prefix of ilist, and greedy_run
  * caps n_normal at MAX_NORMAL_INSTR (64) so it always fits (n_normal - 1) in 6 bits.
  * Total instruction count is derived as n_prng + n_normal, never stored directly. */
+/* try_reflect() (see compress()) unconditionally appends exactly one T_REFLECT as the
+ * very last ilist entry in every block -- its position alone determines its type, so its
+ * 6-bit TAGB type tag is pure redundancy. Skip writing/reading it: a guaranteed, 100%-of-
+ * blocks 6-bit/block saving with zero probabilistic risk (unlike a frequency-based code
+ * for the other types, this needs no assumption about the data at all). */
 static int pack_ilist(const Instr *ilist, int ni, u8 *buf) {
     memset(buf, 0, COMPACT_BUF_BYTES);
     int n_prng = 0;
     while (n_prng < ni && is_prng_tagged(ilist[n_prng].type)) n_prng++;
     int n_normal = ni - n_prng;
     BitBuf b = { buf, 0 };
-    bb_put(&b, (u32)n_prng, 3);
+    bb_put(&b, (u32)n_prng, 2);   /* n_prng in {0,1,2,3}: greedy_run's g_search_mode gates PRNG-tagged types to *ni<3, so it can never exceed 3 */
     bb_put(&b, (u32)(n_normal - 1), 6);
     for (int i = 0; i < n_prng; i++) bb_put_prng_body(&b, ilist[i]);
-    for (int i = n_prng; i < ni; i++) bb_put_instr(&b, ilist[i]);
+    for (int i = n_prng; i < ni - 1; i++) bb_put_instr(&b, ilist[i]);
+    bb_put(&b, ilist[ni - 1].amp & 0xFF, 8);  /* trailing REFLECT: amp only, no type tag */
     return b.pos;
 }
 
 /* Unpack. Returns instruction count. */
 static int unpack_ilist(const u8 *buf, Instr *ilist_out) {
     BitBuf b = { (u8 *)buf, 0 };
-    int n_prng   = (int)bb_get(&b, 3);
+    int n_prng   = (int)bb_get(&b, 2);
     int n_normal = (int)bb_get(&b, 6) + 1;
     int ni = n_prng + n_normal;
     int i = 0;
     for (; i < n_prng; i++) ilist_out[i] = bb_get_prng_body(&b);
-    for (; i < ni; i++)     ilist_out[i] = bb_get_instr(&b);
+    for (; i < ni - 1; i++) ilist_out[i] = bb_get_instr(&b);
+    ilist_out[ni - 1] = (Instr){ T_REFLECT, 0, 0, bb_get(&b, 8) };
     return ni;
 }
 
@@ -2228,6 +3458,20 @@ static int selftest(void) {
         { T_VALUEADD,     3, 1, (u32)(37u | (89u << 7)) },
         { T_VALUEMUL,     3, 1, (u32)(5u | (17u << 6)) },
         { T_VALUEMAP4ADD, 3, 1, (u32)(0x1Au|(0x2Bu<<6)|(0x0Cu<<12)|(0x3Fu<<18)) },
+        { T_NIBGFMUL,     3, 1, (u32)(4u | (9u << 4)) },
+        { T_CRMBMUL,      3, 1, (u32)(1u | (2u << 2) | (0u << 4) | (1u << 6)) },
+        { T_VALUEMAP4MUL, 3, 1, (u32)(3u | (10u << 5) | (20u << 10) | (31u << 15)) },
+        { T_CRMBCROSSMUL, 3, 1, (u32)(0u | (2u << 2)) },
+        { T_VALUEGFMUL,   3, 1, (u32)(3u | (10u << 3) | (50u << 10)) },
+        { T_NIBCROSSGFMUL, 3, 1, 1u },
+        { T_VALUEMAP4GFMUL, 3, 1, (u32)(5u | (15u << 6) | (40u << 12) | (62u << 18)) },
+        { T_BITCXOR,      3, 1, (u32)(2u | (5u << 3)) },
+        { T_CRMBIADD,     3, 1, (u32)(1u | (2u << 2) | (3u << 4) | (0u << 6)) },
+        { T_GFPOW,        3, 1, 17u },
+        { T_NIBPOW,       3, 1, (u32)(2u | (5u << 3)) },
+        { T_VALUEGFPOW,   3, 1, (u32)(4u | (10u << 3) | (60u << 10)) },
+        { T_VALUEMAP4GFPOW, 3, 1, (u32)(5u | (15u << 6) | (25u << 12) | (35u << 18)) },
+        { T_XORPNP,       3, 0, 0x99u },
     };
     int nt = (int)(sizeof(tv) / sizeof(tv[0])), fails = 0;
     for (int i = 0; i < nt; i++) {
@@ -2240,7 +3484,93 @@ static int selftest(void) {
         }
     }
     printf("selftest: %d/%d apply-invert pairs OK\n", nt - fails, nt);
-    return fails;
+
+    /* Dedicated bitstream round-trip test: every taggable (non-PRNG, non-REFLECT) type
+     * gets its own entry here, verified through the REAL pack_ilist/unpack_ilist path
+     * (Huffman type tag + stride/phase/amp fields), not just apply/invert semantics.
+     * This specifically targets rare types (e.g. CRMBXMUL, VM4GFPOW) whose Huffman
+     * codes are 8 bits long and may fire only a handful of times in real block runs --
+     * relying on real random data to exercise every code path leaves a gap; this closes
+     * it deterministically. n_prng=3 and REFLECT-last respect the same invariants
+     * pack_ilist assumes (PRNG-tagged prefix capped at 3, REFLECT always last). */
+    Instr bv[] = {
+        /* PRNG-tagged prefix (n_prng=3, the real maximum) */
+        { T_PRNGADD4, 0, 0, 1234u },
+        { T_PRNGADD8, 0, 0, 5678u },
+        { T_PRNGPERM, 0, 0, 1234u },
+        /* every taggable type, one representative each */
+        { T_XORP,      3, 1, 0x5A },
+        { T_ANIBS,     3, 1, 0x35 },
+        { T_STRIDEADD, 3, 1, 0x37 },
+        { T_BYTEROT,   3, 1, 3 },
+        { T_BYTEMUL,   3, 1, 3u },
+        { T_VALUEXOR,  3, 1, (3u|(0x24u<<3)|(0x12u<<11)) },
+        { T_BITREV,    3, 1, 0 },
+        { T_NIBCXOR,   3, 1, 0 },
+        { T_CRMBCXOR,  3, 1, (0|(2<<2)) },
+        { T_GRAYCODE,  3, 1, 0 },
+        { T_BITASWAP,  3, 1, 0 },
+        { T_SPLITADD,  3, 1|(0<<8), 0x1234u },
+        { T_SPLITXOR,  3, 1|(3<<8), (0x2Au | (0x55u << 8)) },
+        { T_VALUEMAP4,    3, 1, (0x1Au|(0x2Bu<<6)|(0x0Cu<<12)|(0x3Fu<<18)) },
+        { T_NIBSWAP,      3, 1, 0 },
+        { T_XORPNP,       3, 0, 0x99u },
+        { T_GFMUL,        3, 1, 0x57u },
+        { T_NIBMUL16,     3, 1, (u32)(2u | (3u << 3)) },
+        { T_NIBCADD,      3, 1, 1u },
+        { T_CRMBCADD,     3, 1, (u32)(0u | (2u << 2)) },
+        { T_BITSWAP2,     3, 1, 0 },
+        { T_VALUEADD,     3, 1, (u32)(37u | (89u << 7)) },
+        { T_VALUEMUL,     3, 1, (u32)(5u | (17u << 6)) },
+        { T_VALUEMAP4ADD, 3, 1, (u32)(0x1Au|(0x2Bu<<6)|(0x0Cu<<12)|(0x3Fu<<18)) },
+        { T_NIBGFMUL,     3, 1, (u32)(4u | (9u << 4)) },
+        { T_CRMBMUL,      3, 1, (u32)(1u | (2u << 2) | (0u << 4) | (1u << 6)) },
+        { T_VALUEMAP4MUL, 3, 1, (u32)(3u | (10u << 5) | (20u << 10) | (31u << 15)) },
+        { T_CRMBCROSSMUL, 3, 1, (u32)(0u | (2u << 2)) },
+        { T_VALUEGFMUL,   3, 1, (u32)(3u | (10u << 3) | (50u << 10)) },
+        { T_NIBCROSSGFMUL, 3, 1, 1u },
+        { T_VALUEMAP4GFMUL, 3, 1, (u32)(5u | (15u << 6) | (40u << 12) | (62u << 18)) },
+        { T_BITCXOR,      3, 1, (u32)(2u | (5u << 3)) },
+        { T_CRMBIADD,     3, 1, (u32)(1u | (2u << 2) | (3u << 4) | (0u << 6)) },
+        { T_GFPOW,        3, 1, 17u },
+        { T_NIBPOW,       3, 1, (u32)(2u | (5u << 3)) },
+        { T_VALUEGFPOW,   3, 1, (u32)(4u | (10u << 3) | (60u << 10)) },
+        { T_VALUEMAP4GFPOW, 3, 1, (u32)(5u | (15u << 6) | (25u << 12) | (35u << 18)) },
+        /* REFLECT: always last, no type tag */
+        { T_REFLECT, 0, 0, 0x40u },
+    };
+    int nb = (int)(sizeof(bv) / sizeof(bv[0]));
+    u8 *packbuf = malloc(COMPACT_BUF_BYTES);
+    Instr *unpacked_bv = malloc(MAXINSTR * sizeof(Instr));
+    int bfails = 0;
+    if (packbuf && unpacked_bv) {
+        pack_ilist(bv, nb, packbuf);
+        int nb2 = unpack_ilist(packbuf, unpacked_bv);
+        if (nb2 != nb) {
+            printf("  BITSTREAM SELFTEST FAIL: count mismatch %d != %d\n", nb2, nb);
+            bfails++;
+        }
+        for (int i = 0; i < nb && i < nb2; i++) {
+            if (unpacked_bv[i].type   != bv[i].type   ||
+                unpacked_bv[i].stride != bv[i].stride ||
+                unpacked_bv[i].phase  != bv[i].phase  ||
+                unpacked_bv[i].amp    != bv[i].amp) {
+                printf("  BITSTREAM SELFTEST FAIL: entry %d (%s): got type=%d s=%d p=%d a=%u, want type=%d s=%d p=%d a=%u\n",
+                       i, TYPE_NAME[bv[i].type],
+                       unpacked_bv[i].type, unpacked_bv[i].stride, unpacked_bv[i].phase, unpacked_bv[i].amp,
+                       bv[i].type, bv[i].stride, bv[i].phase, bv[i].amp);
+                bfails++;
+            }
+        }
+    } else {
+        printf("  BITSTREAM SELFTEST FAIL: allocation failed\n");
+        bfails++;
+    }
+    printf("selftest: bitstream round-trip of all 37 taggable types + 3 PRNG + REFLECT (%d instrs): %s\n",
+           nb, bfails == 0 ? "OK" : "FAIL");
+    free(packbuf); free(unpacked_bv);
+
+    return fails + bfails;
 }
 
 /* last-block instruction list, accessible from main for serialisation */
@@ -2276,6 +3606,19 @@ static double instr_oh(Instr t) {
         case T_VALUEADD:       return OH_SP(OH_VALUEADD_BASE, t.stride);
         case T_VALUEMUL:       return OH_SP(OH_VALUEMUL_BASE, t.stride);
         case T_VALUEMAP4ADD:   return oh_valuemap4(t.stride);
+        case T_NIBGFMUL:       return OH_SP(OH_NIBGFMUL_BASE, t.stride);
+        case T_CRMBMUL:        return OH_SP(OH_CRMBMUL_BASE, t.stride);
+        case T_VALUEMAP4MUL:   return oh_valuemap4mul(t.stride);
+        case T_CRMBCROSSMUL:   return OH_SP(OH_CRMBCROSSMUL_BASE, t.stride);
+        case T_VALUEGFMUL:     return OH_SP(OH_VALUEGFMUL_BASE, t.stride);
+        case T_NIBCROSSGFMUL:  return OH_SP(OH_NIBCROSSGFMUL_BASE, t.stride);
+        case T_VALUEMAP4GFMUL: return oh_valuemap4(t.stride);
+        case T_BITCXOR:      return OH_SP(OH_BITCXOR_BASE, t.stride);
+        case T_CRMBIADD:     return OH_SP(OH_CRMBIADD_BASE, t.stride);
+        case T_GFPOW:        return OH_SP(OH_GFPOW_BASE, t.stride);
+        case T_NIBPOW:       return OH_SP(OH_NIBPOW_BASE, t.stride);
+        case T_VALUEGFPOW:   return OH_SP(OH_VALUEGFPOW_BASE, t.stride);
+        case T_VALUEMAP4GFPOW: return oh_valuemap4(t.stride);
         default:             return 0.0;
     }
 }
@@ -2316,7 +3659,11 @@ static void do_block(u8 *data, int n, BlockResult *r, int verbose) {
 
     memset(r->type_counts,  0, sizeof r->type_counts);
     memset(r->type_net_sum, 0, sizeof r->type_net_sum);
-    memset(r->type_net_max, 0, sizeof r->type_net_max);
+    /* -1e18 floor, not 0 — the patience mechanism can now genuinely accept a
+     * negative-net instruction as part of a lookahead-verified positive combo, and a
+     * 0 floor would silently hide that (max stuck at 0 instead of the true, negative,
+     * value) whenever every fire of a type happened to be negative. */
+    for (int t = 0; t < NTYPES; t++) r->type_net_max[t] = -1e18;
     memset(r->type_oh_sum,  0, sizeof r->type_oh_sum);
     for (int i = 0; i < ni; i++) {
         int t = ilist[i].type;
@@ -2376,6 +3723,17 @@ static DWORD WINAPI block_thread(LPVOID arg) {
 int main(int argc, char **argv) {
     init_hlog();
     init_gf_mul_tab();
+    init_gf_log();
+    init_gfpow();
+    init_gf16_mul_tab();
+    init_gf16_log();
+    init_nibpow();
+    init_gf128_mul_tab();
+    init_gf128_log();
+    init_vgfpow();
+    init_gf64_mul_tab();
+    init_gf64_log();
+    init_vm4pow();
 
     if (argc > 1 && strcmp(argv[1], "selftest") == 0) return selftest() ? 2 : 0;
 
@@ -2532,7 +3890,7 @@ int main(int argc, char **argv) {
     /* collect results in order, print and accumulate */
     int counts[NTYPES] = {0};
     double type_net_sum[NTYPES] = {0};
-    double type_net_max[NTYPES]; for (int t = 0; t < NTYPES; t++) type_net_max[t] = 0.0;
+    double type_net_max[NTYPES]; for (int t = 0; t < NTYPES; t++) type_net_max[t] = -1e18;
     double type_oh_sum[NTYPES]  = {0};
     double total_net = 0.0, total_ein = 0.0, total_eout = 0.0;
     int total_ni = 0, fails = 0, compact_fails = 0;
