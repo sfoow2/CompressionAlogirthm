@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <string.h>
 
 typedef unsigned char u8;
 typedef uint16_t      u16;
@@ -33,7 +34,7 @@ typedef uint64_t      u64;
 
 #define INPUT_PATH  "C:\\Users\\lukac\\Documents\\compressor\\compresseddata.bin"
 #define CHUNKSIZE   8
-#define NUMOFCHUNKS 1
+#define NUMOFCHUNKS 4
 #define SEEDBITS 8
 
 /* Bits of seed searched per chunk (seed range 0..2^SEEDBITS-1). Valid from
@@ -112,6 +113,39 @@ static u32 chunk_transform_layers(const u8 *chunk, u32 seed, u8 layers_out[][CHU
     return score;
 }
 
+/* Inverse of one apply_delta_layer call: given delta[] and the ORIGINAL
+ * value that was at position 0 before that delta was taken (the "anchor",
+ * i.e. in[0] from the forward pass -- NOT part of delta[] itself, since
+ * delta[0]=in[0]-in[CHUNKSIZE-1] mixes both), reconstruct in[] exactly via
+ * the recurrence in[i] = in[i-1] + delta[i]. delta and out may not alias. */
+static void invert_delta_layer(const u8 *delta, u8 anchor, u8 *out) {
+    out[0] = anchor;
+    for (int i = 1; i < CHUNKSIZE; i++)
+        out[i] = (u8)(out[i - 1] + delta[i]);
+}
+
+/* Full inverse of chunk_transform_layers run to depth `layer`: given the
+ * delta bytes at that depth, the anchors used at each layer (anchors[k] =
+ * layers_out[k][0] from the forward pass, i.e. the value fed INTO delta
+ * layer k+1 -- for k=0..layer-1), and the seed, reconstruct the original
+ * CHUNKSIZE raw bytes. Un-invertible without those `layer` anchor bytes:
+ * the delta bytes alone are not enough (see comment on apply_delta_layer /
+ * the DC-loss argument above main()). */
+static void chunk_inverse(const u8 *final_layer, const u8 *anchors, int layer, u32 seed, u8 *raw_out) {
+    u8 cur[CHUNKSIZE];
+    for (int i = 0; i < CHUNKSIZE; i++) cur[i] = final_layer[i];
+
+    for (int L = layer; L >= 1; L--) {
+        u8 prev[CHUNKSIZE];
+        invert_delta_layer(cur, anchors[L - 1], prev);
+        for (int i = 0; i < CHUNKSIZE; i++) cur[i] = prev[i];
+    }
+    /* cur now holds the hashed values (layer 0); reverse the hash-add */
+    u32 s = seed;
+    for (int i = 0; i < CHUNKSIZE; i++)
+        raw_out[i] = (u8)(cur[i] - xs32_next(&s));
+}
+
 static void print_bytes(const char *label, const u8 *b) {
     printf("%s", label);
     for (int i = 0; i < CHUNKSIZE; i++) printf(" %3u", b[i]);
@@ -173,6 +207,35 @@ int main(void) {
     if (total_zero > 0)
         printf("reduction: %.2f%%\n", 100.0 * (double)(total_zero - total_best) / (double)total_zero);
 
+    /* Round-trip verification: each layer of delta throws away that layer's
+     * DC level (see apply_delta_layer/invert_delta_layer comments), so the
+     * final delta bytes ALONE cannot reconstruct the original chunk -- one
+     * anchor byte per delta layer used is also required. Reconstruct every
+     * chunk from (final delta bytes + seed + those anchors) and confirm it
+     * matches the original exactly, and report the anchor cost the score
+     * above doesn't account for. */
+    size_t roundtrip_ok = 0;
+    u64 total_anchor_bytes = 0;
+    for (size_t c = 0; c < nchunks; c++) {
+        const u8 *chunk = buf + c * CHUNKSIZE;
+        u8 layers[DELTALAYERS + 1][CHUNKSIZE];
+        chunk_transform_layers(chunk, best_seed[c], layers);
+
+        u8 anchors[DELTALAYERS];
+        for (int k = 0; k < best_layer[c]; k++) anchors[k] = layers[k][0];
+
+        u8 recon[CHUNKSIZE];
+        chunk_inverse(layers[best_layer[c]], anchors, best_layer[c], best_seed[c], recon);
+
+        if (memcmp(chunk, recon, CHUNKSIZE) == 0) roundtrip_ok++;
+        total_anchor_bytes += (u64)best_layer[c];
+    }
+    printf("\nround-trip: %zu/%zu chunks reconstruct exactly from (final delta bytes + %d-bit seed + anchors)\n",
+           roundtrip_ok, nchunks, SEEDBITS);
+    printf("anchor overhead: %llu bytes total (avg %.2f bytes/chunk of %d) -- NOT counted in the score above\n",
+           (unsigned long long)total_anchor_bytes,
+           nchunks ? (double)total_anchor_bytes / (double)nchunks : 0.0, CHUNKSIZE);
+
     size_t show = nchunks < 20 ? nchunks : 20;
     printf("\nfirst %zu chunks:\n", show);
     for (size_t c = 0; c < show; c++)
@@ -213,6 +276,17 @@ int main(void) {
             snprintf(label, sizeof(label), "    delta L%-2d      :", layer);
             print_bytes(label, layersB[layer]);
         }
+
+        u8 anchorsB[DELTALAYERS];
+        for (int k = 0; k < best_layer[0]; k++) anchorsB[k] = layersB[k][0];
+        u8 recon0[CHUNKSIZE];
+        chunk_inverse(layersB[best_layer[0]], anchorsB, best_layer[0], best_seed[0], recon0);
+
+        printf("\n  round-trip using seed=%u, layer=%d, and %d anchor byte%s (%s):\n",
+               best_seed[0], best_layer[0], best_layer[0], best_layer[0] == 1 ? "" : "s",
+               memcmp(chunk0, recon0, CHUNKSIZE) == 0 ? "MATCH" : "MISMATCH");
+        print_bytes("    reconstructed  :", recon0);
+        print_bytes("    original       :", chunk0);
     }
 
     free(best_seed); free(best_score); free(best_layer); free(zero_score); free(buf);
