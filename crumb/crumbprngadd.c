@@ -33,7 +33,7 @@
                           // as cb grows. The honest optimum is "chunk size infinity" -- i.e. do
                           // not apply the transform. See net/chunk here as an instrument
                           // reading, not a compression ratio.
-#define NUM_CHUNKS 3      // number of chunks to process before stopping
+#define NUM_CHUNKS 8      // number of chunks to process before stopping
 #define SEED_BITS 16      // width of the per-chunk PRNG seed space. The old "plateau above 16"
                           // was an artifact of the seed-aliasing bug, not a real saturation.
                           // With distinct seeds each added bit buys ~1 bit of extra entropy
@@ -149,6 +149,16 @@ int main(void) {
             printf("=== EOF reached mid-chunk ===\n");
             break;
         }
+    }
+
+    if (net_n > 0) {
+        printf("\n=== net over %ld chunk%s (cb=%d, seed_bits=%d) ===\n",
+               net_n, net_n == 1 ? "" : "s", CHUNK_BYTES, SEED_BITS);
+        printf("  avg net = %7.2f bits/chunk\n", net_sum / (double)net_n);
+        printf("  min net = %7.2f bits  (chunk %d)\n", net_min, net_min_chunk);
+        printf("  max net = %7.2f bits  (chunk %d)\n", net_max, net_max_chunk);
+        printf("  total   = %7.2f bits over %ld bytes\n",
+               net_sum, net_n * (long)CHUNK_BYTES);
     }
 
     fclose(f);
