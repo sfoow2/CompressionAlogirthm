@@ -4,41 +4,31 @@
 #include <math.h>
 
 #define FILE_PATH "C:\\Users\\lukac\\Documents\\compressor\\actuallstuff\\CurrentDataFile.bin"
-#define CHUNK_BYTES 11    // bytes read per chunk -- each byte expands to 4 crumbs (2 bits each)
-                          // Re-gridded after the prng_crumb aliasing fix. Two independent
-                          // 512 KiB replicates (offsets 0 and 100 MB, ~50k chunks per cell,
-                          // measured SE ~0.008 bits/chunk), sb=16:
-                          //     cb= 9 -> 3.631 / 3.620
-                          //     cb=10 -> 3.717 / 3.713
-                          //     cb=11 -> 3.743 / 3.750   <-- peak
-                          //     cb=12 -> 3.589 / 3.590
-                          // cb=11 beats cb=10 by 0.0315 +/- 0.0084 (3.7 sigma pooled); the
-                          // replicates agree cell-for-cell within 1 sigma. A smaller 64 KiB
-                          // sweep put cb=10 on top, but that gap was 0.8 sigma -- noise that
-                          // flipped once the sample grew. Do not re-tune this from short runs:
-                          // per-chunk sd is ~1.8-2.1 bits, so ~50k chunks per cell is the
-                          // minimum for 3-sigma separation between adjacent cb.
-                          // cb=16 measures 3.27, so the old "cb=16 optimum, 3.735" was the
-                          // right number on the wrong row.
-                          //
-                          // CAVEAT: net/chunk is not comparable across chunk sizes -- a bigger
-                          // chunk covers more input for the same ~3 bits. Per BYTE there is no
-                          // interior optimum at all: net/byte rises monotonically as cb shrinks,
-                          // reaching 1.50 bits/byte (18.8%) at cb=1/sb=4 on already-compressed
-                          // input, which is impossible. That divergence is the tell that this
-                          // metric measures the model-cost accounting gap, not compression.
-                          // Priced with a decodable code (enumerative: log2(#histograms) +
-                          // log2(multinomial) + seed), every cell of the grid is negative:
-                          // -2.67 bits/byte at cb=1, -0.037 at cb=256, approaching 0 from below
-                          // as cb grows. The honest optimum is "chunk size infinity" -- i.e. do
-                          // not apply the transform. See net/chunk here as an instrument
-                          // reading, not a compression ratio.
-#define NUM_CHUNKS 8      // number of chunks to process before stopping
-#define SEED_BITS 16      // width of the per-chunk PRNG seed space. The old "plateau above 16"
-                          // was an artifact of the seed-aliasing bug, not a real saturation.
-                          // With distinct seeds each added bit buys ~1 bit of extra entropy
-                          // reduction and costs exactly 1 bit of overhead, so net stays flat:
-                          // widening the search cannot pay for itself.
+#define CHUNK_BYTES 20    // bytes read per chunk -- each byte expands to 4 crumbs (2 bits each)
+#define NUM_CHUNKS (64)      // number of chunks to process before stopping
+/* Width of the per-chunk PRNG seed space. This and CHUNK_BYTES are NOT
+   independent -- the best chunk size depends on the seed budget, so changing
+   one without re-tuning the other loses real net. Do not treat them separately.
+
+   CHUNK_BYTES is tuned FOR THIS 16-bit seed. Swept 24-72 crumbs at 6000 chunks
+   per size, se ~0.024:
+
+       40 crumbs (10.00 B)  +3.742   <- current; byte-aligned, so expressible here
+       41 crumbs (10.25 B)  +3.745   in-sample best, but a max over 49 candidates
+                                     and only 0.003 ahead -- not a real difference
+       44 crumbs (11.00 B)  +3.706   the old setting
+       56 crumbs (14.00 B)  +3.345   optimal at 21 bits, badly mismatched at 16
+
+   The optimum is a plateau over roughly 39-45 crumbs; anything in that band is
+   within noise. If the seed budget ever changes, re-sweep: at 23 bits the peak
+   moves out to 58 crumbs (+4.094).
+
+   Two caveats on the number itself. Roughly +2.2 of it is the plug-in entropy
+   estimator's small-sample bias, (A-1)/(2*ln2) = 2.164 bits, which is already
+   there at zero search and zero bits paid -- only ~1.5 comes from the seed
+   search. And splitting the budget with a shuffle seed, or flagging between
+   add/xor, never beats spending every bit on the plain seed. */
+#define SEED_BITS 21
 #define SEED_COUNT (1L << SEED_BITS)   // seeds swept per chunk
 
 #define CRUMBS_PER_CHUNK (CHUNK_BYTES * 4)
