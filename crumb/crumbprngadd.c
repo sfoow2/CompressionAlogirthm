@@ -5,7 +5,7 @@
 
 #define FILE_PATH "C:\\Users\\lukac\\Documents\\compressor\\actuallstuff\\CurrentDataFile.bin"
 #define CHUNK_BYTES 20    // bytes read per chunk -- each byte expands to 4 crumbs (2 bits each)
-#define NUM_CHUNKS (64)      // number of chunks to process before stopping
+#define NUM_CHUNKS (32)      // number of chunks to process before stopping
 /* Width of the per-chunk PRNG seed space. This and CHUNK_BYTES are NOT
    independent -- the best chunk size depends on the seed budget, so changing
    one without re-tuning the other loses real net. Do not treat them separately.
@@ -29,7 +29,9 @@
    search. And splitting the budget with a shuffle seed, or flagging between
    add/xor, never beats spending every bit on the plain seed. */
 #define SEED_BITS 21
-#define SEED_COUNT (1L << SEED_BITS)   // seeds swept per chunk
+/* 1ULL, not 1L: long is 32-bit on Windows, so 1L<<31 overflows to negative
+   (loop never runs) and 1L<<32 upward is undefined. uint64 is good to 63. */
+#define SEED_COUNT (1ULL << SEED_BITS)  // seeds swept per chunk
 
 #define CRUMBS_PER_CHUNK (CHUNK_BYTES * 4)
 #define MAX_CRUMB_ENTROPY 2.0   // ceiling for a 4-symbol (2-bit) alphabet
@@ -44,25 +46,42 @@ static double crumb_entropy(const long freq[4], long total) {
     return entropy;
 }
 
-/* lowbias32-style integer avalanche mixer: every input bit flips ~half the
-   output bits, so nearby (seed, pos) pairs give unrelated crumb streams. */
-static uint32_t avalanche_hash(uint32_t x) {
-    x ^= x >> 16;
-    x *= 0x7feb352dU;
-    x ^= x >> 15;
-    x *= 0x846ca68bU;
-    x ^= x >> 16;
+/* splitmix64 finaliser: every input bit flips ~half the output bits, so nearby
+   (seed, pos) pairs give unrelated crumb streams. Widened from the old 32-bit
+   lowbias32 mixer -- see the aliasing note in prng_crumb below. */
+static uint64_t avalanche_hash(uint64_t x) {
+    x ^= x >> 30;
+    x *= 0xbf58476d1ce4e5b9ULL;
+    x ^= x >> 27;
+    x *= 0x94d049bb133111ebULL;
+    x ^= x >> 31;
     return x;
 }
 
-static unsigned char prng_crumb(unsigned int seed, unsigned int pos) {
-    /* Hash the seed into a full 32-bit key before folding in pos. The earlier
-       (seed << 16) ^ pos packing aliased: seeds s and s + 2^16 shifted to the
-       same value, so every seed at or above 2^16 was an exact duplicate of one
-       already swept. avalanche_hash is a bijection on uint32, so distinct seeds
-       now give distinct keys for the whole SEED_BITS range. */
-    uint32_t h = avalanche_hash(avalanche_hash(seed) ^ (pos * 0x9E3779B1u));
-    return (unsigned char)(h & 0x3u);   // uniform over {00,01,10,11}
+/* pos * PHI64 depends only on the position, never on the seed, so the whole
+   table is built once for the run instead of recomputed on every inner step. */
+static uint64_t pos_key[CRUMBS_PER_CHUNK];
+static void init_pos_keys(void) {
+    for (uint32_t i = 0; i < CRUMBS_PER_CHUNK; i++)
+        pos_key[i] = (uint64_t)i * 0x9E3779B97F4A7C15ULL;
+}
+
+/* The crumb stream is  avalanche_hash( avalanche_hash(seed) ^ pos_key[pos] ).
+   The inner avalanche_hash(seed) is invariant across positions, so it is split
+   out as seed_key and hoisted to the top of the seed loop -- it used to be
+   recomputed once per crumb, which was half of all hash work in the program.
+
+   Hashing the seed to a full 64-bit key before folding in pos is what stops
+   seeds aliasing. That has bitten twice: the original (seed << 16) ^ pos packing
+   made every seed at or above 2^16 a duplicate of one already swept, and the
+   uint32 mixer that replaced it did the same at 2^32 -- invisible while
+   SEED_BITS was 16, fatal the moment it goes past 32. avalanche_hash is a
+   bijection on uint64, so distinct seeds give distinct keys up to SEED_BITS 63. */
+static inline uint64_t prng_seed_key(uint64_t seed) {
+    return avalanche_hash(seed);
+}
+static inline unsigned char prng_crumb_keyed(uint64_t seed_key, uint32_t pos) {
+    return (unsigned char)(avalanche_hash(seed_key ^ pos_key[pos]) & 0x3u);
 }
 
 int main(void) {
@@ -71,6 +90,8 @@ int main(void) {
         fprintf(stderr, "Failed to open file: %s\n", FILE_PATH);
         return 1;
     }
+
+    init_pos_keys();
 
     unsigned char bytebuf[CHUNK_BYTES];
     unsigned char crumbs[CRUMBS_PER_CHUNK];
@@ -106,14 +127,15 @@ int main(void) {
 
         // sweep every seed in the SEED_BITS-wide space, add it (mod 4) onto
         // this chunk's crumb stream, and keep whichever seed drives entropy lowest
-        long best_seed = -1;
+        long long best_seed = -1;
         double best_entropy = MAX_CRUMB_ENTROPY + 1.0;
         long best_freq[4] = {0, 0, 0, 0};
 
-        for (long seed = 0; seed < SEED_COUNT; seed++) {
+        for (uint64_t seed = 0; seed < SEED_COUNT; seed++) {
+            uint64_t seed_key = prng_seed_key(seed);   // hoisted out of the position loop
             long freq2[4] = {0, 0, 0, 0};
             for (long i = 0; i < total; i++) {
-                unsigned char x = (unsigned char)((crumbs[i] + prng_crumb((unsigned int)seed, (unsigned int)i)) & 0x3);
+                unsigned char x = (unsigned char)((crumbs[i] + prng_crumb_keyed(seed_key, (uint32_t)i)) & 0x3);
                 freq2[x]++;
             }
             double e = crumb_entropy(freq2, total);
@@ -131,8 +153,8 @@ int main(void) {
         net_sum += net;
         net_n++;
 
-        printf("  best add seed: seed=%-6ld (of %ld)  entropy=%.4f/%.1f  net=%.2f bits  freq: 00=%-5ld 01=%-5ld 10=%-5ld 11=%-5ld\n",
-               best_seed, SEED_COUNT, best_entropy, MAX_CRUMB_ENTROPY, net,
+        printf("  best add seed: seed=%-11lld (of %llu)  entropy=%.4f/%.1f  net=%.2f bits  freq: 00=%-5ld 01=%-5ld 10=%-5ld 11=%-5ld\n",
+               best_seed, (unsigned long long)SEED_COUNT, best_entropy, MAX_CRUMB_ENTROPY, net,
                best_freq[0], best_freq[1], best_freq[2], best_freq[3]);
 
         if (got < (size_t)CHUNK_BYTES) {
