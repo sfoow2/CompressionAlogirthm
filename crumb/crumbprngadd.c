@@ -3,28 +3,21 @@
 #include <stdint.h>
 #include <math.h>
 #include <string.h>
-#include <immintrin.h>   // AVX-512 (F + VPOPCNTDQ) -- confirmed present on this machine (11900H)
+#include <time.h>
+#include <immintrin.h>
+#include <omp.h>
 
 #define FILE_PATH "C:\\Users\\lukac\\Documents\\compressor\\actuallstuff\\CurrentDataFile.bin"
 
-static int STAGE1_BITS  = 26;
-static int CHUNK_BYTES  = 9;   // bytes read per chunk -- each byte expands to 4 crumbs (2 bits each)
-/* 26/9 chosen 2026-08-21 via CrumbReduceCuda.cu: large-sample, held-out,
-   random-chunk-sampled sweep under the forced-1peak selection (see
-   FORCE_SHAPE below) found net/chunk peaking on a broad, flat plateau at
-   36-44 crumbs (cb 9-11), s1 24-26, avg net ~2.92-2.96 bits/chunk -- a real
-   jump from the old 24/15 default's ~2.5. cb=9 and cb=11 are a statistical
-   tie (each won one of two independent validation runs); 9 was picked
-   arbitrarily between them. Non-byte-aligned crumb counts (37, 38) were
-   also swept and lost to their byte-aligned neighbors, so this is not an
-   arbitrary rounding -- byte alignment measurably matters on this data. */
-#define NUM_CHUNKS (32)         // number of chunks to process before stopping
-    
+static int STAGE1_BITS  = 16;
+static int CHUNK_BYTES  = 7;   // bytes read per chunk -- each byte expands to 4 crumbs (2 bits each)
+
+#define NUM_CHUNKS (8)         // number of chunks to process before stopping
+
 #define MAX_CRUMB_ENTROPY 2.0   // ceiling for a 4-symbol (2-bit) alphabet
-#define DUMP_CHUNK 3           // which chunk's crumbs/bytes get dumped at the end
+#define DUMP_CHUNK 4           // which chunk's crumbs/bytes get dumped at the end
 
 static int crumbs_per_chunk;    // = CHUNK_BYTES * 4, set once CHUNK_BYTES is known
-static int nw;                  // = ceil(crumbs_per_chunk / 64), words per value bitset
 
 static double crumb_entropy(const long freq[4], long total) {
     double entropy = 0.0;
@@ -37,8 +30,7 @@ static double crumb_entropy(const long freq[4], long total) {
 }
 
 /* splitmix64 finaliser: every input bit flips ~half the output bits, so nearby
-   (seed, pos) pairs give unrelated crumb streams. Widened from the old 32-bit
-   lowbias32 mixer -- see the aliasing note in prng_crumb below. */
+   (seed, pos) pairs give unrelated crumb streams. */
 static uint64_t avalanche_hash(uint64_t x) {
     x ^= x >> 30;
     x *= 0xbf58476d1ce4e5b9ULL;
@@ -49,9 +41,7 @@ static uint64_t avalanche_hash(uint64_t x) {
 }
 
 /* pos * PHI64 depends only on the position, never on the seed, so the whole
-   table is built once for the run instead of recomputed on every inner step.
-   Sized at runtime now (was a fixed CRUMBS_PER_CHUNK array) so CHUNK_BYTES
-   can change without a recompile. */
+   table is built once for the run instead of recomputed on every inner step. */
 static uint64_t *pos_key;
 static void init_pos_keys(void) {
     pos_key = malloc((size_t)crumbs_per_chunk * sizeof(uint64_t));
@@ -62,61 +52,23 @@ static void init_pos_keys(void) {
 
 /* The crumb stream is  avalanche_hash( avalanche_hash(seed) ^ pos_key[pos] ).
    The inner avalanche_hash(seed) is invariant across positions, so it is split
-   out as seed_key and hoisted to the top of the seed loop -- it used to be
-   recomputed once per crumb, which was half of all hash work in the program.
+   out as seed_key and hoisted to the top of any per-seed loop.
 
    Hashing the seed to a full 64-bit key before folding in pos is what stops
-   seeds aliasing. That has bitten twice: the original (seed << 16) ^ pos packing
-   made every seed at or above 2^16 a duplicate of one already swept, and the
-   uint32 mixer that replaced it did the same at 2^32 -- invisible while
-   STAGE1_BITS was 16, fatal the moment it goes past 32. avalanche_hash is a
-   bijection on uint64, so distinct seeds give distinct keys up to STAGE1_BITS 63. */
+   seeds aliasing -- avalanche_hash is a bijection on uint64, so distinct
+   seeds give distinct keys up to STAGE1_BITS 63. */
 static inline uint64_t prng_seed_key(uint64_t seed) {
     return avalanche_hash(seed);
 }
 static inline unsigned char prng_crumb_keyed(uint64_t seed_key, uint32_t pos) {
     return (unsigned char)(avalanche_hash(seed_key ^ pos_key[pos]) & 0x3u);
 }
-
+static void seed_keystream(uint64_t seed, unsigned char *out) {
+    uint64_t key = prng_seed_key(seed);
+    for (int i = 0; i < crumbs_per_chunk; i++) out[i] = prng_crumb_keyed(key, (uint32_t)i);
+}
 
 static uint64_t STAGE1_COUNT;
-
-/* ---------------------------------------------------------- keystream cache
-   The layer-1 keystream is a function of (seed, position) only -- it never
-   depends on the data -- so hashing it per chunk repeats identical work once
-   per chunk. It is instead hashed ONCE here and kept as bitsets:
-       KSM[seed][v] = the positions where seed's keystream crumb equals v
-   The stage-1 output bitsets for a chunk then come out as
-       SM[v] = OR over u of ( DM[u] AND KSM[seed][(v-u) & 3] )
-   where DM[u] is the chunk's own value-u bitset. That is 16 ANDs and 12 ORs of
-   nw words in place of `total` avalanche_hash calls per (chunk, seed) -- about
-   32 word ops instead of 640 at 64 crumbs -- and the saving compounds with the
-   chunk count, since the hashing is now amortised over the whole run.
-
-   Costs 2^STAGE1_BITS * 4 * nw * 8 bytes. nw only grows once CHUNK_BYTES
-   exceeds 16 (64 crumbs > one 64-bit word) -- below that, changing crumb
-   count does NOT change the cache size at all, only STAGE1_BITS does. The
-   real number for whatever settings are in use is printed at startup below;
-   trust that printout over any comment here. */
-static uint64_t *KSM;
-
-static void build_ksm(void) {
-    size_t words = (size_t)STAGE1_COUNT * 4 * (size_t)nw;
-    KSM = calloc(words, sizeof(uint64_t));
-    if (!KSM) {
-        fprintf(stderr, "out of memory for keystream cache (%.1f MB); "
-                        "lower STAGE1_BITS\n", words * 8.0 / 1e6);
-        exit(1);
-    }
-    for (uint64_t s = 0; s < STAGE1_COUNT; s++) {
-        uint64_t key = prng_seed_key(s);
-        uint64_t *row = KSM + (size_t)s * 4 * (size_t)nw;
-        for (int i = 0; i < crumbs_per_chunk; i++)
-            row[(size_t)prng_crumb_keyed(key, (uint32_t)i) * (size_t)nw + (i >> 6)]
-                |= 1ULL << (i & 63);
-    }
-
-}
 
 /* LT[f] = f*log2(f), so a histogram scores in 4 lookups instead of 4 log2 calls */
 static double *LT;
@@ -148,14 +100,6 @@ static int verify_roundtrip(void) {
     return failed;
 }
 
-/* per-depth bests, and the scoring constants the recursion needs */
-/* ns per seed PER WORD of chunk, measured on this machine: 11.8 ns at nw=1
-   (cb=14), from the marginal cost between a 256- and a 1024-chunk run so that
-   cache build and startup are differenced out. Cost per seed is FLAT in the
-   seed count -- that is exactly what "time = c * 2^seed_bits" means -- and
-   scales with nw because the inner body runs once per 64-crumb word. */
-#define NS_PER_COMBO 11.8
-
 static const char *fmt_time(double s) {
     static char buf[64];
     if      (s <      90.0) snprintf(buf, sizeof buf, "%.1f s",  s);
@@ -166,8 +110,7 @@ static const char *fmt_time(double s) {
     return buf;
 }
 
-/* best deficit per chunk, filled by the sweep (seed-outermost, so per-chunk
-   results only exist once it finishes) */
+/* best deficit per chunk, filled by the exhaustive seed-search loop */
 static double *bestD;
 
 /* ---------------------------------------------------- histogram shape types
@@ -184,14 +127,13 @@ static double *bestD;
 static const char *TYPE_NAME[5] = {
     "3way-bal", "2big-1med", "1peak", "2peak", "flat" };
 
-/* The winning seed per chunk is no longer the unconstrained entropy-deficit
-   best -- it is the best deficit among seeds whose resulting histogram
-   classifies as FORCE_SHAPE (must match a TYPE_NAME index above). A chunk
-   with zero qualifying seeds in the whole STAGE1_COUNT sweep is possible at
-   small seed_bits, so every consumer of best_s/bestD below must treat
-   best_s[c] == -1 as "no shape-matching seed found" rather than assuming the
-   search always succeeds the way the old unconstrained version did. */
-#define FORCE_SHAPE 2   /* 1peak */
+/* The winning seed per chunk is simply the best deficit among ALL
+   STAGE1_COUNT seeds, found by exhaustive scan -- shape-UNRESTRICTED (see
+   exhaustive_query_chunk below). FORCE_SHAPE/hist_type are kept only to
+   LABEL the winning histogram's shape for the shape-mix display below, not
+   to filter candidates -- classifying the winner never changes which seed
+   wins. */
+#define FORCE_SHAPE 2   /* 1peak -- label only, see above */
 
 static int hist_type(const long f[4]) {
     long s[4] = { f[0], f[1], f[2], f[3] };
@@ -207,7 +149,155 @@ static int hist_type(const long f[4]) {
     return 1;                            /* steady descent                  */
 }
 
+/* ---- AVX-512 avalanche_hash, 8 lanes at once (needs AVX512F/DQ/BW,
+   confirmed present on this machine) ---- */
+static inline __m512i avalanche_hash_x8(__m512i x) {
+    x = _mm512_xor_si512(x, _mm512_srli_epi64(x, 30));
+    x = _mm512_mullo_epi64(x, _mm512_set1_epi64((long long)0xbf58476d1ce4e5b9ULL));
+    x = _mm512_xor_si512(x, _mm512_srli_epi64(x, 27));
+    x = _mm512_mullo_epi64(x, _mm512_set1_epi64((long long)0x94d049bb133111ebULL));
+    x = _mm512_xor_si512(x, _mm512_srli_epi64(x, 31));
+    return x;
+}
+
+/* Computes the (f0,f1,f2,f3) histogram for 16 seeds against `data` at once --
+   two interleaved 8-lane groups, so the CPU has a second, unrelated
+   multiply-latency chain to execute while the first is still in flight
+   (validated ~1.5x over scalar with 0 mismatches in MIHSimdScore.c,
+   2026-08-22). Histogram-only, not D/shape -- exhaustive_query_chunk below
+   applies the exact same LT/hist_type/bestD bookkeeping the scalar fallback
+   uses, so tie-breaking (first max wins, ascending seed order) is untouched. */
+static void score_x16_hist(const uint64_t seeds[16], const unsigned char *data,
+                            long f0[16], long f1[16], long f2[16], long f3[16]) {
+    __m512i sraw0 = _mm512_loadu_si512((const void*)(seeds + 0));
+    __m512i sraw1 = _mm512_loadu_si512((const void*)(seeds + 8));
+    __m512i skey0 = avalanche_hash_x8(sraw0);
+    __m512i skey1 = avalanche_hash_x8(sraw1);
+
+    __m512i c0a = _mm512_setzero_si512(), c1a = _mm512_setzero_si512();
+    __m512i c2a = _mm512_setzero_si512(), c3a = _mm512_setzero_si512();
+    __m512i c0b = _mm512_setzero_si512(), c1b = _mm512_setzero_si512();
+    __m512i c2b = _mm512_setzero_si512(), c3b = _mm512_setzero_si512();
+    const __m512i one = _mm512_set1_epi64(1);
+    const __m512i three = _mm512_set1_epi64(3);
+
+    for (int p = 0; p < crumbs_per_chunk; p++) {
+        __m512i pk = _mm512_set1_epi64((long long)pos_key[p]);
+        __m512i dv = _mm512_set1_epi64(data[p]);
+
+        __m512i ha = avalanche_hash_x8(_mm512_xor_si512(skey0, pk));
+        __m512i hb = avalanche_hash_x8(_mm512_xor_si512(skey1, pk));
+        __m512i outa = _mm512_and_si512(_mm512_add_epi64(dv, _mm512_and_si512(ha, three)), three);
+        __m512i outb = _mm512_and_si512(_mm512_add_epi64(dv, _mm512_and_si512(hb, three)), three);
+
+        __mmask8 a0 = _mm512_cmpeq_epi64_mask(outa, _mm512_setzero_si512()), b0 = _mm512_cmpeq_epi64_mask(outb, _mm512_setzero_si512());
+        __mmask8 a1 = _mm512_cmpeq_epi64_mask(outa, one),   b1 = _mm512_cmpeq_epi64_mask(outb, one);
+        __mmask8 a2 = _mm512_cmpeq_epi64_mask(outa, _mm512_set1_epi64(2)), b2 = _mm512_cmpeq_epi64_mask(outb, _mm512_set1_epi64(2));
+        __mmask8 a3 = _mm512_cmpeq_epi64_mask(outa, three), b3 = _mm512_cmpeq_epi64_mask(outb, three);
+        c0a = _mm512_mask_add_epi64(c0a, a0, c0a, one); c0b = _mm512_mask_add_epi64(c0b, b0, c0b, one);
+        c1a = _mm512_mask_add_epi64(c1a, a1, c1a, one); c1b = _mm512_mask_add_epi64(c1b, b1, c1b, one);
+        c2a = _mm512_mask_add_epi64(c2a, a2, c2a, one); c2b = _mm512_mask_add_epi64(c2b, b2, c2b, one);
+        c3a = _mm512_mask_add_epi64(c3a, a3, c3a, one); c3b = _mm512_mask_add_epi64(c3b, b3, c3b, one);
+    }
+
+    uint64_t t0[16], t1[16], t2[16], t3[16];
+    _mm512_storeu_si512((void*)(t0 + 0), c0a); _mm512_storeu_si512((void*)(t0 + 8), c0b);
+    _mm512_storeu_si512((void*)(t1 + 0), c1a); _mm512_storeu_si512((void*)(t1 + 8), c1b);
+    _mm512_storeu_si512((void*)(t2 + 0), c2a); _mm512_storeu_si512((void*)(t2 + 8), c2b);
+    _mm512_storeu_si512((void*)(t3 + 0), c3a); _mm512_storeu_si512((void*)(t3 + 8), c3b);
+    for (int lane = 0; lane < 16; lane++) {
+        f0[lane] = (long)t0[lane]; f1[lane] = (long)t1[lane];
+        f2[lane] = (long)t2[lane]; f3[lane] = (long)t3[lane];
+    }
+}
+
+/* All per-query mutable state used to live in file-scope globals. That was
+   fine single-threaded, but every chunk's seed search is fully independent
+   of every other chunk's -- nothing about it needs to be shared -- so
+   bundling this state into a per-thread QueryCtx (one instance per OpenMP
+   thread, not one per chunk) is what makes the per-chunk loop in main()
+   safe to run with #pragma omp parallel for. */
+typedef struct {
+    unsigned char *scratch_ks;
+} QueryCtx;
+
+static void ctx_init(QueryCtx *ctx) {
+    ctx->scratch_ks = malloc((size_t)crumbs_per_chunk);
+    if (!ctx->scratch_ks) {
+        fprintf(stderr, "out of memory for per-thread query context\n"); exit(1);
+    }
+}
+static void ctx_free(QueryCtx *ctx) {
+    free(ctx->scratch_ks);
+}
+
+/* Runs one chunk's query by trying every seed in [0, STAGE1_COUNT) and
+   keeping the single best-D one in bestD[c]/best_s[c]/best_f[c*4..] --
+   shape-UNRESTRICTED: D is computed for every seed regardless of its
+   histogram's shape, so taking the best regardless of shape is free.
+   16 seeds at a time go through the AVX-512 histogram kernel above; the
+   <16 remainder falls back to scalar. Returns the number of seeds examined
+   (always STAGE1_COUNT) and how many scored net > 0, for the diagnostic
+   columns in the per-chunk table. */
+static double g_t_score = 0.0;   /* profiling accumulator, see the breakdown printout */
+static void exhaustive_query_chunk(QueryCtx *ctx, int c, const unsigned char *data, double base_D_full,
+                                    long long *best_s, long *best_f,
+                                    long *out_cand_n, long *out_cand_pos) {
+    double t0 = omp_get_wtime();
+    long cpos = 0;
+    uint64_t seeds16[16];
+    uint64_t s = 0;
+    for (; s + 16 <= STAGE1_COUNT; s += 16) {
+        for (int lane = 0; lane < 16; lane++) seeds16[lane] = s + (uint64_t)lane;
+        long f0[16], f1[16], f2[16], f3[16];
+        score_x16_hist(seeds16, data, f0, f1, f2, f3);
+        for (int lane = 0; lane < 16; lane++) {
+            double D = base_D_full + LT[f0[lane]] + LT[f1[lane]] + LT[f2[lane]] + LT[f3[lane]];
+            if (D - STAGE1_BITS > 0.0) cpos++;
+            if (D > bestD[c]) {
+                bestD[c] = D;
+                best_s[c] = (long long)seeds16[lane];
+                best_f[c*4+0] = f0[lane]; best_f[c*4+1] = f1[lane];
+                best_f[c*4+2] = f2[lane]; best_f[c*4+3] = f3[lane];
+            }
+        }
+    }
+    for (; s < STAGE1_COUNT; s++) {
+        seed_keystream(s, ctx->scratch_ks);
+        long f0 = 0, f1 = 0, f2 = 0, f3 = 0;
+        for (int p = 0; p < crumbs_per_chunk; p++) {
+            unsigned char out = (unsigned char)((data[p] + ctx->scratch_ks[p]) & 3);
+            if      (out == 0) f0++;
+            else if (out == 1) f1++;
+            else if (out == 2) f2++;
+            else               f3++;
+        }
+        double D = base_D_full + LT[f0] + LT[f1] + LT[f2] + LT[f3];
+        if (D - STAGE1_BITS > 0.0) cpos++;
+        if (D > bestD[c]) {
+            bestD[c] = D;
+            best_s[c] = (long long)s;
+            best_f[c*4+0] = f0; best_f[c*4+1] = f1; best_f[c*4+2] = f2; best_f[c*4+3] = f3;
+        }
+    }
+    double t1 = omp_get_wtime();
+    #pragma omp atomic
+    g_t_score += (t1 - t0);
+
+    *out_cand_n = (long)STAGE1_COUNT;
+    *out_cand_pos = cpos;
+}
+
 int main(int argc, char **argv) {
+    /* Single-threaded by default -- the AVX-512 scoring speedup (score_x16_hist)
+       applies regardless of thread count, but multithreading is opt-in via
+       CTDT_THREADS=n (n>1) rather than the default, since single-thread wall
+       time is what "how fast is the search itself" actually means here. */
+    { int nthreads = 1;
+      const char *e = getenv("CTDT_THREADS");
+      if (e) nthreads = atoi(e);
+      omp_set_num_threads(nthreads); }
+
     int n_chunks = argc > 1 ? atoi(argv[1]) : NUM_CHUNKS;
     if (argc > 2) STAGE1_BITS = atoi(argv[2]);
     if (argc > 3) CHUNK_BYTES = atoi(argv[3]);
@@ -216,8 +306,7 @@ int main(int argc, char **argv) {
             "usage: %s [chunks] [seed_bits] [chunk_bytes]\n"
             "  seed_bits 1..40, chunk_bytes >=1 (default 16).\n"
             "  CTDT_SHOW=n sets how many per-chunk rows to print.\n"
-            "  CTDT_FORCE_TYPE=0..4 makes CTDT_HIST dump each chunk's best\n"
-            "  net>0 seed WITHIN that shape type instead of the global best.\n",
+            "  CTDT_THREADS=n sets thread count (default 1).\n",
             argv[0]);
         return 1;
     }
@@ -226,7 +315,6 @@ int main(int argc, char **argv) {
         return 1;
     }
     crumbs_per_chunk = CHUNK_BYTES * 4;
-    nw = (crumbs_per_chunk + 63) / 64;
     STAGE1_COUNT = 1ULL << STAGE1_BITS;
 
     const char *file_path = argc > 4 ? argv[4] : FILE_PATH;
@@ -250,34 +338,14 @@ int main(int argc, char **argv) {
 
     init_pos_keys();
     init_lt();
-    build_ksm();
     if (verify_roundtrip()) { fprintf(stderr, "round-trip self-test FAILED\n"); return 1; }
 
-    {
-        double combos  = (double)STAGE1_COUNT;
-        double cachemb = combos * 4 * nw * 8 / 1e6;
-        /* The estimate is SEARCH ONLY and deliberately so: the cache is already
-           built by the time this prints (build_ksm ran above), and it is not a
-           meaningful cost anyway -- measured 0.26 s to build the whole 2^21
-           table, against 26 s of search at 1024 chunks. Startup is a rounding
-           error; the search is 2^seed_bits per chunk and that is what matters.
-           NS_PER_COMBO is calibrated per WORD of chunk, since the inner body is
-           4 ANDs + 3 ORs + 1 popcount per value per word. */
-        double secs = combos * NS_PER_COMBO * nw * 1e-9 * (double)n_chunks;
-        double full = combos * NS_PER_COMBO * nw * 1e-9
-                    * (198766075.0 / (double)CHUNK_BYTES);
-        printf("seed %d bits (%llu seeds), chunk %d B = %d crumbs (nw=%d)\n",
-               STAGE1_BITS, (unsigned long long)STAGE1_COUNT,
-               CHUNK_BYTES, crumbs_per_chunk, nw);
-        printf("  overhead %d bits/chunk;  EXACT search over %.3g seeds; cache %.1f MB\n",
-               STAGE1_BITS, combos, cachemb);
-        printf("  est. search %s for %d chunks", fmt_time(secs), n_chunks);
-        printf("  |  whole 198 MB file: %s\n\n", fmt_time(full));
-        fflush(stdout);
-    }
+    printf("seed %d bits (%llu seeds), chunk %d B = %d crumbs -- exhaustive search\n",
+           STAGE1_BITS, (unsigned long long)STAGE1_COUNT, CHUNK_BYTES, crumbs_per_chunk);
+    printf("  threads: %d\n\n", omp_get_max_threads());
+    fflush(stdout);
 
     unsigned char *bytebuf   = malloc((size_t)CHUNK_BYTES);
-    unsigned char *crumbs    = malloc((size_t)crumbs_per_chunk);
 
     // chunk DUMP_CHUNK with its winning seed actually applied, kept for the dump at the end
     unsigned char *chunk0_out = malloc((size_t)crumbs_per_chunk);
@@ -287,40 +355,24 @@ int main(int argc, char **argv) {
     // running net stats across every chunk actually processed
     double net_sum = 0.0, net_min = 0.0, net_max = 0.0;
     long   net_n = 0;
-    double netraw_sum = 0.0, raw_ent_sum = 0.0;
+    double netraw_sum = 0.0;
     int    net_min_chunk = -1, net_max_chunk = -1;
 
     long   *all_total  = malloc((size_t)n_chunks * sizeof(long));
     double *all_rawent = malloc((size_t)n_chunks * sizeof(double));
     long   *all_rawfrq = malloc((size_t)n_chunks * 4 * sizeof(long));
-    /* Transposed [u][w][c] layout (chunk axis innermost/contiguous), not the
-       natural [c][u][w] -- so the AVX-512 search loop below can load 8
-       consecutive chunks' DM words with one vector load instead of a gather.
-       Same axis-to-vectorize-must-be-contiguous lesson as coalesced GPU
-       memory access. calloc zeroes it once; no per-chunk memset needed since
-       each chunk's slot is only ever written by that chunk. */
-    uint64_t *all_DM_T = calloc((size_t)4 * (size_t)nw * (size_t)n_chunks, sizeof(uint64_t));
-    double *best_D     = malloc((size_t)n_chunks * sizeof(double));
+    unsigned char *all_crumbs = malloc((size_t)n_chunks * (size_t)crumbs_per_chunk);
     long long *best_s  = malloc((size_t)n_chunks * sizeof(long long));
-    long long *best_t  = malloc((size_t)n_chunks * sizeof(long long));
-    long long *best_u  = malloc((size_t)n_chunks * sizeof(long long));
-    double *bestL2_D   = malloc((size_t)n_chunks * sizeof(double));
-    double *bestL1_D   = malloc((size_t)n_chunks * sizeof(double));
-    /* calloc, not malloc: a chunk with no FORCE_SHAPE-matching seed leaves
-       best_f untouched by the search loop, and hist_type(0,0,0,0) (via the
+    /* calloc, not malloc: a chunk that somehow examines zero seeds leaves
+       best_f untouched by the query, and hist_type(0,0,0,0) (via the
        s[0]==0 check) safely falls out as "flat" instead of reading garbage. */
     long   *best_f     = calloc((size_t)n_chunks * 4, sizeof(long));
     unsigned char *chunk0_raw = malloc((size_t)crumbs_per_chunk);
-    /* per (chunk, shape type) best deficit among seeds that are BOTH net>0 AND
-       classify to that type -- lets us ask "if every chunk were forced onto
-       shape X, how many could still clear net>0, and what would the net be"
-       instead of always taking the single best seed regardless of shape. */
-    double    *bestD_ty = malloc((size_t)n_chunks * 5 * sizeof(double));
-    long long *best_s_ty = malloc((size_t)n_chunks * 5 * sizeof(long long));
-    long      *best_f_ty = malloc((size_t)n_chunks * 5 * 4 * sizeof(long));
-    if (!bytebuf || !crumbs || !chunk0_out || !all_total || !all_rawent || !all_rawfrq
-        || !all_DM_T || !best_D || !best_s || !best_f || !chunk0_raw
-        || !bestD_ty || !best_s_ty || !best_f_ty) {
+    long *cand_count     = malloc((size_t)n_chunks * sizeof(long));
+    long *cand_pos_count = malloc((size_t)n_chunks * sizeof(long));
+    if (!bytebuf || !chunk0_out || !all_total || !all_rawent
+        || !all_rawfrq || !all_crumbs || !best_s || !best_f || !chunk0_raw
+        || !cand_count || !cand_pos_count) {
         fprintf(stderr, "out of memory for per-chunk state\n"); return 1;
     }
 
@@ -330,22 +382,18 @@ int main(int argc, char **argv) {
         if (got == 0) break;
         long freq[4] = {0, 0, 0, 0};
         long total = 0;
+        unsigned char *dst = all_crumbs + (size_t)nc * crumbs_per_chunk;
         for (size_t b = 0; b < got; b++)
             for (int shift = 6; shift >= 0; shift -= 2) {
                 unsigned char crumb = (unsigned char)((bytebuf[b] >> shift) & 0x3);
-                crumbs[total] = crumb;
-                all_DM_T[((size_t)crumb * nw + (total >> 6)) * (size_t)n_chunks + nc]
-                    |= 1ULL << (total & 63);
+                dst[total] = crumb;
                 freq[crumb]++;
                 total++;
             }
-        if (nc == DUMP_CHUNK) memcpy(chunk0_raw, crumbs, (size_t)total);
+        if (nc == DUMP_CHUNK) memcpy(chunk0_raw, dst, (size_t)total);
         all_total[nc]  = total;
         all_rawent[nc] = crumb_entropy(freq, total);
         for (int v = 0; v < 4; v++) all_rawfrq[nc*4+v] = freq[v];
-        best_D[nc] = -HUGE_VAL; best_s[nc] = -1; best_t[nc] = 0;
-        bestL1_D[nc] = -HUGE_VAL; bestL2_D[nc] = -HUGE_VAL; best_u[nc] = 0;
-        for (int t = 0; t < 5; t++) { bestD_ty[nc*5+t] = -HUGE_VAL; best_s_ty[nc*5+t] = -1; }
         nc++;
         if (got < (size_t)CHUNK_BYTES) break;
     }
@@ -353,131 +401,60 @@ int main(int argc, char **argv) {
 
     bestD = malloc((size_t)n_chunks * sizeof(double));
     if (!bestD) { fprintf(stderr, "out of memory\n"); return 1; }
-    for (int c = 0; c < n_chunks; c++) bestD[c] = -HUGE_VAL;
+    for (int c = 0; c < n_chunks; c++) { bestD[c] = -HUGE_VAL; best_s[c] = -1; }
 
-    /* per-chunk count of how many of the STAGE1_COUNT seeds give a net
-       (deficit - STAGE1_BITS) that is positive vs. non-positive -- tallied
-       across the WHOLE sweep, not just at the best seed. */
-    long *cnt_pos = calloc((size_t)n_chunks, sizeof(long));
-    long *cnt_neg = calloc((size_t)n_chunks, sizeof(long));
-    if (!cnt_pos || !cnt_neg) { fprintf(stderr, "out of memory for net counters\n"); return 1; }
-    const double net_cost = (double)STAGE1_BITS;
-
-    /* Score by entropy DEFICIT, not entropy, so the inner loop never calls
-       log2(): (2-H)*n = 2n - n*log2(n) + SUM_v f_v*log2(f_v), and the sum is
-       four LT[] lookups. Minimising H is the same as maximising this. */
     double base_D_full = 2.0 * (double)crumbs_per_chunk
                        - (double)crumbs_per_chunk * log2((double)crumbs_per_chunk);
-
-    /* AVX-512 fast path: at nw==1 (chunk <=64 crumbs, true for every setting
-       this project has found competitive), the keystream is 4 scalar words
-       per seed -- broadcast them ONCE per seed, then AND/OR/popcount 8
-       chunks at a time via VPOPCNTDQ instead of one chunk at a time. Falls
-       back to the original scalar path (now reading the transposed layout)
-       for nw>1 and for the <8-chunk remainder. Verified bit-for-bit against
-       the pre-SIMD scalar version before being trusted -- see
-       compressthisdamthing_scalar_ref.c. */
-    for (uint64_t seed = 0; seed < STAGE1_COUNT; seed++) {
-        const uint64_t *K = KSM + (size_t)seed * 4 * (size_t)nw;
-        int c = 0;
-
-        if (nw == 1) {
-            __m512i kb[4][4];
-            for (int v = 0; v < 4; v++)
-                for (int u = 0; u < 4; u++)
-                    kb[v][u] = _mm512_set1_epi64((long long)K[(size_t)((v - u) & 3)]);
-
-            for (; c + 8 <= nc; c += 8) {
-                __m512i dm[4];
-                for (int u = 0; u < 4; u++)
-                    dm[u] = _mm512_loadu_si512((const void *)&all_DM_T[(size_t)u * n_chunks + c]);
-
-                uint64_t fr[4][8];
-                for (int v = 0; v < 4; v++) {
-                    __m512i acc = _mm512_setzero_si512();
-                    for (int u = 0; u < 4; u++)
-                        acc = _mm512_or_si512(acc, _mm512_and_si512(dm[u], kb[v][u]));
-                    _mm512_storeu_si512((void *)fr[v], _mm512_popcnt_epi64(acc));
-                }
-
-                for (int lane = 0; lane < 8; lane++) {
-                    int cc = c + lane;
-                    long f0 = (long)fr[0][lane], f1 = (long)fr[1][lane],
-                         f2 = (long)fr[2][lane], f3 = (long)fr[3][lane];
-                    double D = base_D_full + LT[f0] + LT[f1] + LT[f2] + LT[f3];
-                    if (D - net_cost > 0.0) cnt_pos[cc]++; else cnt_neg[cc]++;
-                    long fr4[4] = { f0, f1, f2, f3 };
-                    int ty = hist_type(fr4);
-                    if (ty == FORCE_SHAPE && D > bestD[cc]) {
-                        bestD[cc] = D;
-                        best_s[cc] = (long long)seed;
-                        best_f[cc*4+0] = f0; best_f[cc*4+1] = f1;
-                        best_f[cc*4+2] = f2; best_f[cc*4+3] = f3;
-                    }
-                    if (D - net_cost > 0.0) {
-                        if (D > bestD_ty[cc*5+ty]) {
-                            bestD_ty[cc*5+ty] = D;
-                            best_s_ty[cc*5+ty] = (long long)seed;
-                            long *bf = &best_f_ty[(cc*5+ty)*4];
-                            bf[0] = f0; bf[1] = f1; bf[2] = f2; bf[3] = f3;
-                        }
-                    }
-                }
-            }
-        }
-
-        for (; c < nc; c++) {
-            long fr[4];
-            for (int v = 0; v < 4; v++) {
-                long q = 0;
-                for (int w = 0; w < nw; w++) {
-                    uint64_t acc = 0;
-                    for (int u = 0; u < 4; u++)
-                        acc |= all_DM_T[((size_t)u * nw + w) * (size_t)n_chunks + c]
-                             & K[(size_t)((v - u) & 3) * (size_t)nw + w];
-                    q += __builtin_popcountll(acc);
-                }
-                fr[v] = q;
-            }
-            double D = base_D_full + LT[fr[0]] + LT[fr[1]] + LT[fr[2]] + LT[fr[3]];
-            if (D - net_cost > 0.0) cnt_pos[c]++; else cnt_neg[c]++;
-            int ty = hist_type(fr);
-            if (ty == FORCE_SHAPE && D > bestD[c]) {
-                bestD[c] = D;
-                best_s[c] = (long long)seed;
-                for (int v = 0; v < 4; v++) best_f[c*4+v] = fr[v];
-            }
-            if (D - net_cost > 0.0) {
-                if (D > bestD_ty[c*5+ty]) {
-                    bestD_ty[c*5+ty] = D;
-                    best_s_ty[c*5+ty] = (long long)seed;
-                    long *bf = &best_f_ty[(c*5+ty)*4];
-                    for (int v = 0; v < 4; v++) bf[v] = fr[v];
-                }
-            }
-        }
-    }
-
     const double cost = STAGE1_BITS;
+
+    /* Calibrate on a small prefix BEFORE committing to the full n_chunks run --
+       the whole point is to know if n_chunks is too many chunks up front, not
+       after already paying for the whole thing. Per-chunk cost is fixed (it's
+       always exactly STAGE1_COUNT seeds), so a small sample calibrates well.
+       Run multithreaded here too (not single-thread) so ms/chunk reflects the
+       SAME throughput the real run below will actually get. */
+    int calib_n = nc < 50 ? nc : 50;
+    double t_query0 = omp_get_wtime();
+    #pragma omp parallel
+    {
+        QueryCtx ctx; ctx_init(&ctx);
+        #pragma omp for schedule(dynamic, 4)
+        for (int c = 0; c < calib_n; c++)
+            exhaustive_query_chunk(&ctx, c, all_crumbs + (size_t)c * crumbs_per_chunk, base_D_full,
+                                    best_s, best_f, &cand_count[c], &cand_pos_count[c]);
+        ctx_free(&ctx);
+    }
+    double t_calib = omp_get_wtime();
+    double calib_secs    = t_calib - t_query0;
+    double ms_per_chunk  = 1000.0 * calib_secs / calib_n;
+    printf("  calibration: %.3f ms/chunk wall (from first %d chunk%s, %d threads) -> estimated %s for all %d chunks\n",
+           ms_per_chunk, calib_n, calib_n == 1 ? "" : "s", omp_get_max_threads(),
+           fmt_time(ms_per_chunk / 1000.0 * nc), nc);
+    printf("  |  whole 198 MB file (%.0f chunks) at this rate: %s\n\n",
+           198766075.0 / CHUNK_BYTES, fmt_time(ms_per_chunk / 1000.0 * (198766075.0 / CHUNK_BYTES)));
+    fflush(stdout);
+
+    #pragma omp parallel
+    {
+        QueryCtx ctx; ctx_init(&ctx);
+        #pragma omp for schedule(dynamic, 4)
+        for (int c = calib_n; c < nc; c++)
+            exhaustive_query_chunk(&ctx, c, all_crumbs + (size_t)c * crumbs_per_chunk, base_D_full,
+                                    best_s, best_f, &cand_count[c], &cand_pos_count[c]);
+        ctx_free(&ctx);
+    }
+    double t_query1 = omp_get_wtime();
+
+    double query_secs = t_query1 - t_query0;
+    printf("  actual: %s for %d chunks (%.3f ms/chunk wall, %llu seeds/chunk)\n",
+           fmt_time(query_secs), nc, 1000.0 * query_secs / nc, (unsigned long long)STAGE1_COUNT);
+    printf("  |  score time: %.2f s [summed across threads]\n\n", g_t_score);
 
     FILE *hf = NULL;
     { const char *e = getenv("CTDT_HIST");
       if (e) {
           hf = fopen(e, "wb");
           if (!hf) { fprintf(stderr, "cannot write %s\n", e); return 1; }
-      } }
-
-    /* CTDT_FORCE_TYPE=0..4 redirects the CTDT_HIST dump from each chunk's
-       unconstrained best seed to its best net>0 seed WITHIN that shape type --
-       so every line in the file is the same TYPE_NAME shape (or the sentinel
-       -1/-1/-1/-1 on chunks where that shape never clears net>0 at all). */
-    int force_type = -1;
-    { const char *e = getenv("CTDT_FORCE_TYPE");
-      if (e) {
-          force_type = atoi(e);
-          if (force_type < 0 || force_type > 4) {
-              fprintf(stderr, "CTDT_FORCE_TYPE must be 0..4\n"); return 1;
-          }
       } }
 
     long   tcount[5] = {0,0,0,0,0};   /* chunks per histogram shape */
@@ -488,13 +465,13 @@ int main(int argc, char **argv) {
     if (show > nc) show = nc;
     if (show > 0) {
         printf("=== per chunk (first %d of %d) ===\n", show, nc);
-        printf("  %5s %8s %8s %10s  %-18s %-18s %-10s %8s  %12s %12s\n",
+        printf("  %5s %8s %8s %10s  %-18s %-18s %-10s %8s  %10s %10s\n",
                "chunk", "H_raw", "H_best", "seed",
                "histogram raw", "histogram best", "type", "net",
-               "seeds net>0", "seeds net<=0");
+               "seeds", "seeds net>0");
     }
 
-    long no_shape = 0;   /* chunks where NO seed in the whole sweep gave FORCE_SHAPE */
+    long no_shape = 0;   /* chunks with zero seeds (only possible if STAGE1_COUNT is 0) */
 
     for (int chunk = 0; chunk < nc; chunk++) {
         long   total     = all_total[chunk];
@@ -506,15 +483,10 @@ int main(int argc, char **argv) {
         if (hf) {
             if (!have_best)
                 fprintf(hf, "-1/-1/-1/-1\n");
-            else if (force_type < 0)
+            else
                 fprintf(hf, "%ld/%ld/%ld/%ld\n",
                         best_f[chunk*4+0], best_f[chunk*4+1],
                         best_f[chunk*4+2], best_f[chunk*4+3]);
-            else if (bestD_ty[chunk*5+force_type] > -HUGE_VAL) {
-                long *bf = &best_f_ty[(chunk*5+force_type)*4];
-                fprintf(hf, "%ld/%ld/%ld/%ld\n", bf[0], bf[1], bf[2], bf[3]);
-            } else
-                fprintf(hf, "-1/-1/-1/-1\n");
         }
 
         if (chunk < show) {
@@ -523,19 +495,17 @@ int main(int argc, char **argv) {
                      all_rawfrq[chunk*4+0], all_rawfrq[chunk*4+1],
                      all_rawfrq[chunk*4+2], all_rawfrq[chunk*4+3]);
             if (!have_best) {
-                char none[32];
-                snprintf(none, sizeof none, "(no %s)", TYPE_NAME[FORCE_SHAPE]);
-                printf("  %5d %8.4f %8s %10s  %-18s %-18s %-10s %8s  %12ld %12ld\n",
-                       chunk, entropy, "--", "--", hr, none,
-                       "--", "--", cnt_pos[chunk], cnt_neg[chunk]);
+                printf("  %5d %8.4f %8s %10s  %-18s %-18s %-10s %8s  %10ld %10ld\n",
+                       chunk, entropy, "--", "--", hr, "(no candidate)",
+                       "--", "--", cand_count[chunk], cand_pos_count[chunk]);
             } else {
                 snprintf(hb, sizeof hb, "%ld/%ld/%ld/%ld",
                          best_f[chunk*4+0], best_f[chunk*4+1],
                          best_f[chunk*4+2], best_f[chunk*4+3]);
-                printf("  %5d %8.4f %8.4f %10lld  %-18s %-18s %-10s %+8.2f  %12ld %12ld\n",
+                printf("  %5d %8.4f %8.4f %10lld  %-18s %-18s %-10s %+8.2f  %10ld %10ld\n",
                        chunk, entropy, best_entropy, best_s[chunk], hr, hb,
                        TYPE_NAME[hist_type(&best_f[chunk*4])],
-                       bestD[chunk] - cost, cnt_pos[chunk], cnt_neg[chunk]);
+                       bestD[chunk] - cost, cand_count[chunk], cand_pos_count[chunk]);
             }
         }
 
@@ -550,7 +520,6 @@ int main(int argc, char **argv) {
         net_sum += net;
         net_n++;
         netraw_sum  += (entropy - best_entropy) * (double)total - cost;
-        raw_ent_sum += entropy;
 
         if (chunk == DUMP_CHUNK && best_s[DUMP_CHUNK] >= 0) {
             uint64_t k = prng_seed_key((uint64_t)best_s[DUMP_CHUNK]);
@@ -562,9 +531,9 @@ int main(int argc, char **argv) {
     }
 
     if (no_shape)
-        printf("  %ld/%d chunks had NO seed producing %s in the whole %.3g-seed "
-               "sweep (excluded from the net stats below)\n",
-               no_shape, nc, TYPE_NAME[FORCE_SHAPE], (double)STAGE1_COUNT);
+        printf("  %ld/%d chunks: no seeds examined (STAGE1_COUNT was 0 --\n"
+               "  excluded from the net stats below)\n",
+               no_shape, nc);
 
     if (net_n > 0) {
         printf("=== net over %ld chunk%s (cb=%d, %.0f-bit seed) ===\n",
@@ -582,35 +551,6 @@ int main(int argc, char **argv) {
                        100.0 * tcount[k] / (double)net_n, tnet[k] / tcount[k]);
             else
                 printf("  %-10s %6d   0.0%%\n", TYPE_NAME[k], 0);
-        }
-
-        /* Different question from the mix above: not "what shape did the best
-           seed land on", but "if I FORCE this chunk onto shape X (giving up
-           whatever seed the unconstrained search actually preferred), can I
-           still find a net>0 seed of that shape, and what net does it cost
-           me". A type with high coverage here is a candidate for a shared/
-           implicit type across chunks -- you would not need to transmit the
-           type per chunk if (almost) every chunk can hit it anyway. */
-        printf("\n  --- forced-type coverage (best net>0 seed WITHIN each shape) ---\n");
-        printf("  %-10s %8s %7s   %10s %10s\n",
-               "type", "coverage", "of nc", "mean net", "vs unconstrained");
-        for (int t = 0; t < 5; t++) {
-            long   cover = 0;
-            double sumnet = 0.0, sumgap = 0.0;
-            for (int c = 0; c < nc; c++) {
-                if (bestD_ty[c*5+t] > -HUGE_VAL) {
-                    cover++;
-                    double net_t = bestD_ty[c*5+t] - cost;
-                    sumnet += net_t;
-                    sumgap += (bestD[c] - cost) - net_t;   /* best - forced, always >= 0 */
-                }
-            }
-            if (cover)
-                printf("  %-10s %6ld/%-4d %6.1f%%   %+10.3f %+10.3f\n",
-                       TYPE_NAME[t], cover, nc, 100.0 * cover / (double)nc,
-                       sumnet / cover, sumgap / cover);
-            else
-                printf("  %-10s %6ld/%-4d %6.1f%%\n", TYPE_NAME[t], 0L, nc, 0.0);
         }
     }
 
@@ -639,32 +579,24 @@ int main(int argc, char **argv) {
 
     /* CTDT_RESIDUAL=path writes the actual layer-1 OUTPUT (winning seed applied,
        packed 4 crumbs/byte) for every processed chunk, not just DUMP_CHUNK --
-       so a downstream tool (e.g. chunkgrid_cuda) can resweep chunk-size x S1
-       fresh on the real post-layer-1 residual instead of the raw file, to test
-       whether any grain still has exploitable skew. Crumb values are recovered
-       from all_DM_T (one-hot per position across the 4 value planes) since the
-       plain crumb array itself is not retained per-chunk after the search. */
+       so a downstream tool can resweep chunk-size x S1 fresh on the real
+       post-layer-1 residual instead of the raw file. */
     { const char *e = getenv("CTDT_RESIDUAL");
       if (e) {
           FILE *rf = fopen(e, "wb");
           if (!rf) { fprintf(stderr, "cannot write %s\n", e); return 1; }
           for (int c = 0; c < nc; c++) {
-              /* no FORCE_SHAPE seed found for this chunk -- key 0 leaves the
+              /* no candidate found for this chunk -- key 0 leaves the
                  keystream well-defined (still a valid, just unsearched, seed)
                  rather than reading the -1 sentinel as a huge bogus seed. */
               uint64_t k = prng_seed_key(best_s[c] >= 0 ? (uint64_t)best_s[c] : 0);
               int total = (int)all_total[c];
+              const unsigned char *src = all_crumbs + (size_t)c * crumbs_per_chunk;
               for (int i = 0; i < total; i += 4) {
                   int b = 0;
                   for (int j = 0; j < 4; j++) {
                       int pos = i + j;
-                      int w = pos >> 6, bit = pos & 63;
-                      unsigned char crumb = 0;
-                      for (int v = 0; v < 4; v++) {
-                          uint64_t word = all_DM_T[((size_t)v * nw + w) * (size_t)n_chunks + c];
-                          if ((word >> bit) & 1ULL) { crumb = (unsigned char)v; break; }
-                      }
-                      unsigned char out = (unsigned char)((crumb + prng_crumb_keyed(k, (uint32_t)pos)) & 3u);
+                      unsigned char out = (unsigned char)((src[pos] + prng_crumb_keyed(k, (uint32_t)pos)) & 3u);
                       b = (b << 2) | out;
                   }
                   unsigned char byte = (unsigned char)b;
