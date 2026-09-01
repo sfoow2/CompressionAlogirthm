@@ -1,0 +1,1020 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <math.h>
+#include <string.h>
+#include <time.h>
+#include <immintrin.h>
+#include <omp.h>
+
+#define FILE_PATH "C:\\Users\\lukac\\Documents\\compressor\\actuallstuff\\CurrentDataFile.bin"
+
+static int STAGE1_BITS  = 28;
+static int CHUNK_BYTES  = 12;   // bytes read per chunk -- each byte expands to 4 crumbs (2 bits each)
+
+#define NUM_CHUNKS (64)         // number of chunks to process before stopping
+
+#define MAX_CRUMB_ENTROPY 2.0   // ceiling for a 4-symbol (2-bit) alphabet
+#define DUMP_CHUNK 4           // which chunk's crumbs/bytes get dumped at the end
+
+static int crumbs_per_chunk;    // = CHUNK_BYTES * 4, set once CHUNK_BYTES is known
+
+static double crumb_entropy(const long freq[4], long total) {
+    double entropy = 0.0;
+    for (int i = 0; i < 4; i++) {
+        if (freq[i] == 0) continue;
+        double p = (double)freq[i] / (double)total;
+        entropy -= p * log2(p);
+    }
+    return entropy;
+}
+
+/* splitmix64 finaliser: every input bit flips ~half the output bits, so nearby
+   (seed, pos) pairs give unrelated crumb streams. */
+static uint64_t avalanche_hash(uint64_t x) {
+    x ^= x >> 30;
+    x *= 0xbf58476d1ce4e5b9ULL;
+    x ^= x >> 27;
+    x *= 0x94d049bb133111ebULL;
+    x ^= x >> 31;
+    return x;
+}
+
+/* pos * PHI64 depends only on the position, never on the seed, so the whole
+   table is built once for the run instead of recomputed on every inner step. */
+static uint64_t *pos_key;
+static void init_pos_keys(void) {
+    pos_key = malloc((size_t)crumbs_per_chunk * sizeof(uint64_t));
+    if (!pos_key) { fprintf(stderr, "out of memory for pos_key\n"); exit(1); }
+    for (int i = 0; i < crumbs_per_chunk; i++)
+        pos_key[i] = (uint64_t)i * 0x9E3779B97F4A7C15ULL;
+}
+
+/* The crumb stream is  avalanche_hash( avalanche_hash(seed) ^ pos_key[pos] ).
+   The inner avalanche_hash(seed) is invariant across positions, so it is split
+   out as seed_key and hoisted to the top of any per-seed loop.
+
+   Hashing the seed to a full 64-bit key before folding in pos is what stops
+   seeds aliasing -- avalanche_hash is a bijection on uint64, so distinct
+   seeds give distinct keys up to STAGE1_BITS 63. */
+static inline uint64_t prng_seed_key(uint64_t seed) {
+    return avalanche_hash(seed);
+}
+static inline unsigned char prng_crumb_keyed(uint64_t seed_key, uint32_t pos) {
+    return (unsigned char)(avalanche_hash(seed_key ^ pos_key[pos]) & 0x3u);
+}
+static void seed_keystream(uint64_t seed, unsigned char *out) {
+    uint64_t key = prng_seed_key(seed);
+    for (int i = 0; i < crumbs_per_chunk; i++) out[i] = prng_crumb_keyed(key, (uint32_t)i);
+}
+
+static uint64_t STAGE1_COUNT;
+
+/* LT[f] = f*log2(f), so a histogram scores in 4 lookups instead of 4 log2 calls */
+static double *LT;
+static void init_lt(void) {
+    LT = malloc((size_t)(crumbs_per_chunk + 1) * sizeof(double));
+    if (!LT) { fprintf(stderr, "out of memory for LT\n"); exit(1); }
+    LT[0] = 0.0;
+    for (int f = 1; f <= crumbs_per_chunk; f++) LT[f] = (double)f * log2((double)f);
+}
+
+/* Round-trip: raw -> layer 1 -> undo layer 1. An add mod 4 cannot really fail,
+   which is exactly why it is cheap enough to just run every time. */
+static int verify_roundtrip(void) {
+    unsigned char *orig = malloc((size_t)crumbs_per_chunk);
+    unsigned char *work = malloc((size_t)crumbs_per_chunk);
+    int failed = 0;
+    srand(4242);
+    for (int trial = 0; trial < 200 && !failed; trial++) {
+        uint64_t seed = (uint64_t)rand() % STAGE1_COUNT;
+        uint64_t k = prng_seed_key(seed);
+        for (int i = 0; i < crumbs_per_chunk; i++) orig[i] = (unsigned char)(rand() & 3);
+        for (int i = 0; i < crumbs_per_chunk; i++)
+            work[i] = (unsigned char)((orig[i] + prng_crumb_keyed(k, (uint32_t)i)) & 3);
+        for (int i = 0; i < crumbs_per_chunk; i++)
+            work[i] = (unsigned char)((work[i] - prng_crumb_keyed(k, (uint32_t)i)) & 3);
+        if (memcmp(work, orig, (size_t)crumbs_per_chunk) != 0) failed = 1;
+    }
+    free(orig); free(work);
+    return failed;
+}
+
+static const char *fmt_time(double s) {
+    static char buf[64];
+    if      (s <      90.0) snprintf(buf, sizeof buf, "%.1f s",  s);
+    else if (s <    5400.0) snprintf(buf, sizeof buf, "%.1f min", s / 60.0);
+    else if (s <  172800.0) snprintf(buf, sizeof buf, "%.1f h",  s / 3600.0);
+    else if (s < 3.15e9)    snprintf(buf, sizeof buf, "%.1f days", s / 86400.0);
+    else                    snprintf(buf, sizeof buf, "%.3g years", s / 3.156e7);
+    return buf;
+}
+
+/* best deficit per chunk, filled by the exhaustive seed-search loop */
+static double *bestD;
+
+/* ---------------------------------------------------- histogram shape types
+   The post-transform histograms fall into a handful of recognisable shapes.
+   Classified on the bins SORTED DESCENDING and measured as ratios to the
+   largest bin, so the label depends on shape alone and not on chunk size.
+
+       a >= b >= c >= d,  rb = b/a, rc = c/a, rd = d/a
+
+   Note what this is and is not. Net is a deterministic function of the
+   histogram -- net = (2 - H(h))*n - bits -- so these labels are a coarse
+   binning of net itself, not independent information about a chunk. They are
+   here to make the shape distribution visible, not to feed a decision. */
+static const char *TYPE_NAME[5] = {
+    "3way-bal", "2big-1med", "1peak", "2peak", "flat" };
+
+/* The winning seed per chunk is the best deficit among every MIH candidate
+   whose resulting histogram classifies as FORCE_SHAPE (see hist_type
+   below) -- score_candidates skips any candidate whose shape doesn't
+   match before it's allowed to become the new best. A chunk where MIH's
+   probe found no candidate at all, or none that landed on FORCE_SHAPE,
+   leaves best_s[c] == -1 ("(no candidate)" in the per-chunk table,
+   excluded from the net stats). */
+#define FORCE_SHAPE 2   /* 1peak -- see hist_type; the only shape accepted */
+
+static int hist_type(const long f[4]) {
+    long s[4] = { f[0], f[1], f[2], f[3] };
+    for (int i = 0; i < 3; i++)          /* sort descending, n=4 so bubble is fine */
+        for (int j = 0; j < 3 - i; j++)
+            if (s[j] < s[j+1]) { long t = s[j]; s[j] = s[j+1]; s[j+1] = t; }
+    if (s[0] == 0) return 4;
+    double rb = (double)s[1] / s[0], rc = (double)s[2] / s[0], rd = (double)s[3] / s[0];
+    if (rd > 0.60) return 4;             /* all four bins comparable        */
+    if (rc > 0.65) return 0;             /* three similar, fourth spent     */
+    if (rb > 0.80) return 3;             /* two tied peaks over a small rest */
+    if (rb < 0.55) return 2;             /* one bin dominates everything    */
+    return 1;                            /* steady descent                  */
+}
+
+/* ================================================================ layer 1.5
+   A constant rotation (+X mod 4 to every crumb in the chunk) is a bijection
+   on the 4-symbol alphabet, so it cannot change a chunk's own entropy/shape
+   -- hist_type(f) and D are identical before and after. What it changes is
+   WHERE that skew lands. mih_query_chunk probes all 4 possible target values
+   and keeps whichever wins, so the winning chunk's dominant crumb value is
+   close to uniform across chunks; pooling many differently-aligned skewed
+   histograms washes back out toward flat. Rotating every chunk so its own
+   mode lands on value 0 keeps the skew aligned in the GLOBAL pooled
+   histogram, which is what a single non-per-chunk-adaptive downstream code
+   can actually exploit -- at a cost of 2 more bits/chunk to store which
+   rotation was used (this file doesn't serialize that side channel, same as
+   it doesn't serialize the seed stream; see CTDT_RESIDUAL below). */
+static int rotate_for_mode(const long f[4]) {
+    int arg = 0;
+    for (int v = 1; v < 4; v++) if (f[v] > f[arg]) arg = v;
+    return (4 - arg) & 3;
+}
+
+/* ============================================================ MIH index
+   Multi-index hashing. The keystream a seed produces depends only on
+   (seed, position) -- never the data -- so instead of re-scanning every one
+   of the STAGE1_COUNT seeds against every chunk (O(chunks * 2^S1)), the
+   keystreams are indexed ONCE (O(2^S1)) and each chunk pays only a cheap
+   approximate nearest-neighbor query.
+
+   Mechanics: split each seed's crumbs_per_chunk-length keystream into
+   NBLOCKS blocks of BLOCK_CRUMBS crumbs (chosen below so 4^BLOCK_CRUMBS is
+   about the same size as STAGE1_COUNT -- that is what keeps a block's
+   "exact value" bucket small). Bucket-sort all seeds by each block's value
+   via a direct-indexed CSR table (not a hash table -- block values are
+   small dense integers). A query for a chunk works out the "ideal"
+   keystream that would concentrate it entirely onto each of the 4 possible
+   target values, then for each of the 4 targets probes every value within
+   Hamming distance PROBE_RADIUS of each of its blocks (a small ball, not
+   just the exact block value) in that block's table, and unions the
+   resulting candidate seeds. Pigeonhole guarantee: any seed whose FULL
+   keystream is within Hamming distance r of a query is found as long as
+   PROBE_RADIUS >= floor(r / NBLOCKS) (some block must have that few diffs).
+
+   This targeting is exactly matched to FORCE_SHAPE=1peak: a 1peak result
+   IS "most of the chunk landed on one value," i.e. small Hamming distance
+   to one of the 4 single-value targets below -- so scoring (see
+   score_candidates) additionally rejects any candidate whose actual
+   histogram doesn't classify as FORCE_SHAPE, same acceptance rule the
+   exhaustive search used before this file went back to MIH. */
+static int NBLOCKS, BLOCK_CRUMBS, PROBE_RADIUS = 3;
+static uint64_t BLOCK_VALUES;
+
+/* Searches BLOCK_CRUMBS directly against the REAL index-memory formula,
+   instead of the old approach of requiring BLOCK_CRUMBS to exactly divide
+   crumbs_per_chunk and picking whichever divisor lands closest to S1/2.
+   That divisor constraint is what caused wild, unpredictable blowups: two
+   adjacent CHUNK_BYTES values could differ by 20-70x in index memory purely
+   because one had a divisor near the target and the other didn't (measured
+   2026-08-24: cb=8 needed 35GB at s1=26 while cb=9 needed 1.8GB, same S1,
+   one byte apart -- a divisor-luck artifact, not a property of the data).
+
+   NBLOCKS = crumbs_per_chunk / BLOCK_CRUMBS via plain integer division, so a
+   remainder of up to BLOCK_CRUMBS-1 crumbs at the end of the chunk goes
+   unindexed by MIH -- this needs no other code changes, since probe_block/
+   build_mih_index already only ever touch the first NBLOCKS*BLOCK_CRUMBS
+   crumbs (score_candidates still scores candidates against the FULL chunk,
+   MIH just doesn't use the fringe to help GENERATE candidates). */
+static void choose_mih_params(void) {
+    int max_bc = crumbs_per_chunk < 24 ? crumbs_per_chunk : 24;   /* cap so 4^bc stays a sane table size */
+    int best_bc = 1, best_nb = crumbs_per_chunk < 1 ? 1 : crumbs_per_chunk;
+    double best_cost = -1.0;
+    int best_fringe = crumbs_per_chunk;   /* crumbs left un-indexed by this bc, i.e. crumbs_per_chunk - nb*bc */
+    for (int bc = 1; bc <= max_bc; bc++) {
+        int nb = crumbs_per_chunk / bc;
+        if (nb < 1) nb = 1;
+        int fringe = crumbs_per_chunk - nb * bc;
+        double block_values = (double)(1ULL << (2 * bc));
+        /* STAGE1_COUNT * 4.0, not 8.0: this estimates the PERMANENT retained
+           index (BlockIndex.seed_list is uint32_t, see build_mih_index) --
+           the *8.0 that was here matched the transient uint64_t blockval[]
+           build buffer instead, which is freed before build_mih_index
+           returns and isn't part of the steady-state footprint this
+           function is supposed to be minimizing. */
+        double cost = (double)nb * (block_values * 4.0 + (double)STAGE1_COUNT * 4.0);
+        /* Minimize fringe FIRST, cost second (was: cost first, coverage only
+           as a same-cost tie-break). A fringe crumb -- crumbs_per_chunk % bc,
+           left over because NBLOCKS = crumbs_per_chunk/bc truncates -- is a
+           permanent blind spot: it's scored once a candidate is found but
+           can never help generate one, and no amount of PROBE_RADIUS reaches
+           it. Measured 2026-08-30 at cb=10/S1=26: switching bc=11->10 (33/40
+           -> 40/40 crumbs covered) took MIH's net from 2.778 to 2.911
+           bits/chunk against a 2.914 exhaustive ceiling -- 97.8% of the
+           recall gap, for the memory/compute cost below. crumbs_per_chunk is
+           always 4*CHUNK_BYTES, so bc=1/2/4 are always exact divisors (fringe
+           0 is always achievable somewhere <= max_bc); the loop still picks
+           the cheapest such divisor rather than hardcoding one. 0.1%
+           tolerance on the cost tie-break treats floating-point noise as a
+           true tie instead of letting it pick arbitrarily. */
+        if (fringe < best_fringe ||
+            (fringe == best_fringe &&
+             (best_cost < 0 || cost < best_cost * 0.999 ||
+              (cost < best_cost * 1.001 && nb * bc > best_nb * best_bc)))) {
+            best_fringe = fringe; best_cost = cost; best_bc = bc; best_nb = nb;
+        }
+    }
+    NBLOCKS = best_nb;
+    BLOCK_CRUMBS = best_bc;
+    /* CTDT_MIH_BLOCKCRUMBS overrides the auto pick above -- kept as an escape
+       hatch for testing other block sizes (e.g. reverting to the old
+       memory-minimizing choice) without touching default (env unset)
+       behavior. */
+    { const char *e = getenv("CTDT_MIH_BLOCKCRUMBS");
+      if (e) {
+          BLOCK_CRUMBS = atoi(e);
+          NBLOCKS = crumbs_per_chunk / BLOCK_CRUMBS;
+          if (NBLOCKS < 1) NBLOCKS = 1;
+      } }
+    BLOCK_VALUES = 1ULL << (2 * BLOCK_CRUMBS);
+    { const char *e = getenv("CTDT_MIH_RADIUS"); if (e) PROBE_RADIUS = atoi(e); }
+    /* build_mih_index's transient blockval[] buffers are uint32_t, not
+       uint64_t, to halve peak build memory (see there) -- safe exactly when
+       a packed block value (2 bits/crumb) fits in 32 bits, i.e. BLOCK_CRUMBS
+       <= 16 (4^16 = 2^32, so the max packed value 2^32-1 still fits). The
+       cost formula above would only ever pick a larger bc if block_values'
+       4x term were cheaper than more blocks -- 4^17 alone is ~17 billion,
+       far past where that could happen for any realistic STAGE1_COUNT, so
+       this should never fire; it's here so a future change to that formula
+       fails loudly instead of silently truncating pack_block's output. */
+    if (BLOCK_CRUMBS > 16) {
+        fprintf(stderr, "BLOCK_CRUMBS=%d exceeds the 32-bit packed-block-value assumption in build_mih_index\n", BLOCK_CRUMBS);
+        exit(1);
+    }
+}
+
+static inline uint64_t pack_block(const unsigned char *digits, int n) {
+    uint64_t v = 0;
+    for (int i = 0; i < n; i++) v = (v << 2) | digits[i];
+    return v;
+}
+
+/* seed_list holds seed IDs as uint32_t, not uint64_t -- STAGE1_BITS is
+   capped at 32 (see main()) specifically so every seed ID fits, halving
+   this array for free with no effect on speed or recall. */
+typedef struct { uint32_t *offset; uint32_t *seed_list; } BlockIndex;
+
+static BlockIndex *mih_index_a;   /* [NBLOCKS] -- single partition */
+
+static void build_mih_index(BlockIndex **out_index) {
+    BlockIndex *idx = calloc((size_t)NBLOCKS, sizeof(BlockIndex));
+    if (!idx) { fprintf(stderr, "out of memory for MIH index\n"); exit(1); }
+
+    /* uint32_t, not uint64_t: packed block values fit in 32 bits whenever
+       BLOCK_CRUMBS <= 16 (enforced in choose_mih_params), which halves this
+       buffer -- NBLOCKS * STAGE1_COUNT * 4 bytes instead of *8. This is the
+       actual peak-memory bottleneck during index build (all NBLOCKS of these
+       exist simultaneously, before any of them get converted into the much
+       smaller permanent CSR index below), so halving it directly doubles the
+       largest S1/CHUNK_BYTES config that fits in a given amount of RAM. */
+    uint32_t **blockval = malloc((size_t)NBLOCKS * sizeof(uint32_t *));
+    for (int b = 0; b < NBLOCKS; b++) {
+        blockval[b] = malloc((size_t)STAGE1_COUNT * sizeof(uint32_t));
+        if (!blockval[b]) { fprintf(stderr, "out of memory building MIH index\n"); exit(1); }
+    }
+    /* Each seed's keystream/block-values are independent of every other
+       seed's -- embarrassingly parallel, and this loop (67M seeds at
+       S1=26) is the dominant cost of index build. */
+    #pragma omp parallel
+    {
+        unsigned char ks[crumbs_per_chunk];
+        #pragma omp for schedule(static)
+        for (uint64_t s = 0; s < STAGE1_COUNT; s++) {
+            seed_keystream(s, ks);
+            for (int b = 0; b < NBLOCKS; b++)
+                blockval[b][s] = (uint32_t)pack_block(ks + (size_t)b * BLOCK_CRUMBS, BLOCK_CRUMBS);
+        }
+    }
+
+    for (int b = 0; b < NBLOCKS; b++) {
+        uint32_t *count = calloc((size_t)BLOCK_VALUES + 1, sizeof(uint32_t));
+        uint32_t *seed_list = malloc((size_t)STAGE1_COUNT * sizeof(uint32_t));
+        uint32_t *cursor = malloc((size_t)BLOCK_VALUES * sizeof(uint32_t));
+        if (!count || !seed_list || !cursor) { fprintf(stderr, "out of memory building MIH index\n"); exit(1); }
+        for (uint64_t s = 0; s < STAGE1_COUNT; s++) count[blockval[b][s] + 1]++;
+        for (uint64_t v = 0; v < BLOCK_VALUES; v++) count[v + 1] += count[v];
+        memcpy(cursor, count, (size_t)BLOCK_VALUES * sizeof(uint32_t));
+        for (uint64_t s = 0; s < STAGE1_COUNT; s++) {
+            uint32_t v = blockval[b][s];
+            seed_list[cursor[v]++] = (uint32_t)s;
+        }
+        free(cursor);
+        free(blockval[b]);
+        idx[b].offset = count;
+        idx[b].seed_list = seed_list;
+    }
+    free(blockval);
+    *out_index = idx;
+}
+
+/* ---- AVX-512 avalanche_hash, 8 lanes at once (needs AVX512F/DQ/BW,
+   confirmed present on this machine) ---- */
+static inline __m512i avalanche_hash_x8(__m512i x) {
+    x = _mm512_xor_si512(x, _mm512_srli_epi64(x, 30));
+    x = _mm512_mullo_epi64(x, _mm512_set1_epi64((long long)0xbf58476d1ce4e5b9ULL));
+    x = _mm512_xor_si512(x, _mm512_srli_epi64(x, 27));
+    x = _mm512_mullo_epi64(x, _mm512_set1_epi64((long long)0x94d049bb133111ebULL));
+    x = _mm512_xor_si512(x, _mm512_srli_epi64(x, 31));
+    return x;
+}
+
+/* Computes the (f0,f1,f2,f3) histogram for 16 seeds against `data` at once --
+   two interleaved 8-lane groups, so the CPU has a second, unrelated
+   multiply-latency chain to execute while the first is still in flight
+   (validated ~1.5x over scalar with 0 mismatches in MIHSimdScore.c,
+   2026-08-22). Histogram-only, not D/shape -- score_candidates below applies
+   the exact same LT/hist_type/bestD bookkeeping the scalar fallback uses,
+   so tie-breaking (first max wins, cand_buf order) is untouched. */
+static void score_x16_hist(const uint64_t seeds[16], const unsigned char *data,
+                            long f0[16], long f1[16], long f2[16], long f3[16]) {
+    __m512i sraw0 = _mm512_loadu_si512((const void*)(seeds + 0));
+    __m512i sraw1 = _mm512_loadu_si512((const void*)(seeds + 8));
+    __m512i skey0 = avalanche_hash_x8(sraw0);
+    __m512i skey1 = avalanche_hash_x8(sraw1);
+
+    __m512i c0a = _mm512_setzero_si512(), c1a = _mm512_setzero_si512();
+    __m512i c2a = _mm512_setzero_si512(), c3a = _mm512_setzero_si512();
+    __m512i c0b = _mm512_setzero_si512(), c1b = _mm512_setzero_si512();
+    __m512i c2b = _mm512_setzero_si512(), c3b = _mm512_setzero_si512();
+    const __m512i one = _mm512_set1_epi64(1);
+    const __m512i three = _mm512_set1_epi64(3);
+
+    for (int p = 0; p < crumbs_per_chunk; p++) {
+        __m512i pk = _mm512_set1_epi64((long long)pos_key[p]);
+        __m512i dv = _mm512_set1_epi64(data[p]);
+
+        __m512i ha = avalanche_hash_x8(_mm512_xor_si512(skey0, pk));
+        __m512i hb = avalanche_hash_x8(_mm512_xor_si512(skey1, pk));
+        __m512i outa = _mm512_and_si512(_mm512_add_epi64(dv, _mm512_and_si512(ha, three)), three);
+        __m512i outb = _mm512_and_si512(_mm512_add_epi64(dv, _mm512_and_si512(hb, three)), three);
+
+        __mmask8 a0 = _mm512_cmpeq_epi64_mask(outa, _mm512_setzero_si512()), b0 = _mm512_cmpeq_epi64_mask(outb, _mm512_setzero_si512());
+        __mmask8 a1 = _mm512_cmpeq_epi64_mask(outa, one),   b1 = _mm512_cmpeq_epi64_mask(outb, one);
+        __mmask8 a2 = _mm512_cmpeq_epi64_mask(outa, _mm512_set1_epi64(2)), b2 = _mm512_cmpeq_epi64_mask(outb, _mm512_set1_epi64(2));
+        __mmask8 a3 = _mm512_cmpeq_epi64_mask(outa, three), b3 = _mm512_cmpeq_epi64_mask(outb, three);
+        c0a = _mm512_mask_add_epi64(c0a, a0, c0a, one); c0b = _mm512_mask_add_epi64(c0b, b0, c0b, one);
+        c1a = _mm512_mask_add_epi64(c1a, a1, c1a, one); c1b = _mm512_mask_add_epi64(c1b, b1, c1b, one);
+        c2a = _mm512_mask_add_epi64(c2a, a2, c2a, one); c2b = _mm512_mask_add_epi64(c2b, b2, c2b, one);
+        c3a = _mm512_mask_add_epi64(c3a, a3, c3a, one); c3b = _mm512_mask_add_epi64(c3b, b3, c3b, one);
+    }
+
+    uint64_t t0[16], t1[16], t2[16], t3[16];
+    _mm512_storeu_si512((void*)(t0 + 0), c0a); _mm512_storeu_si512((void*)(t0 + 8), c0b);
+    _mm512_storeu_si512((void*)(t1 + 0), c1a); _mm512_storeu_si512((void*)(t1 + 8), c1b);
+    _mm512_storeu_si512((void*)(t2 + 0), c2a); _mm512_storeu_si512((void*)(t2 + 8), c2b);
+    _mm512_storeu_si512((void*)(t3 + 0), c3a); _mm512_storeu_si512((void*)(t3 + 8), c3b);
+    for (int lane = 0; lane < 16; lane++) {
+        f0[lane] = (long)t0[lane]; f1[lane] = (long)t1[lane];
+        f2[lane] = (long)t2[lane]; f3[lane] = (long)t3[lane];
+    }
+}
+
+/* All per-query mutable state used to live in file-scope globals (cand_buf,
+   scratch_ideal, ...). That was fine single-threaded, but every chunk's MIH
+   query is fully independent of every other chunk's -- nothing about it
+   needs to be shared -- so bundling this state into a per-thread QueryCtx
+   (one instance per OpenMP thread, not one per chunk) is what makes the
+   per-chunk loop in main() safe to run with #pragma omp parallel for. */
+typedef struct {
+    uint64_t      *cand_buf;
+    size_t         cand_n, cand_cap;
+    unsigned char *scratch_ideal, *scratch_ks;
+} QueryCtx;
+
+static void ctx_init(QueryCtx *ctx) {
+    ctx->cand_buf = NULL; ctx->cand_n = 0; ctx->cand_cap = 0;
+    ctx->scratch_ideal = malloc((size_t)crumbs_per_chunk);
+    ctx->scratch_ks    = malloc((size_t)crumbs_per_chunk);
+    if (!ctx->scratch_ideal || !ctx->scratch_ks) {
+        fprintf(stderr, "out of memory for per-thread query context\n"); exit(1);
+    }
+}
+static void ctx_free(QueryCtx *ctx) {
+    free(ctx->cand_buf); free(ctx->scratch_ideal); free(ctx->scratch_ks);
+}
+
+static void cand_push(QueryCtx *ctx, uint64_t seed) {
+    if (ctx->cand_n == ctx->cand_cap) {
+        ctx->cand_cap = ctx->cand_cap ? ctx->cand_cap * 2 : 4096;
+        ctx->cand_buf = realloc(ctx->cand_buf, ctx->cand_cap * sizeof(uint64_t));
+    }
+    ctx->cand_buf[ctx->cand_n++] = seed;
+}
+static void lookup_block(QueryCtx *ctx, BlockIndex *idx, int b, uint64_t packed) {
+    uint32_t start = idx[b].offset[packed], end = idx[b].offset[packed + 1];
+    for (uint32_t i = start; i < end; i++) cand_push(ctx, idx[b].seed_list[i]);
+}
+/* Every point within Hamming ball radius PROBE_RADIUS of a block's digits is
+   a choice of WHICH <=PROBE_RADIUS positions change, and by WHICH of the 3
+   non-original values (equivalently, a delta of 1/2/3 mod 4 relative to
+   whatever the original digit at that position happens to be). That choice
+   of (positions, deltas) is a purely combinatorial property of BLOCK_CRUMBS
+   and PROBE_RADIUS -- it never depends on the actual data being queried --
+   so precomputing the flat (positions, deltas) list ONCE at startup and
+   reusing it for every call, applying deltas as incremental field edits to
+   a single base pack_block() result rather than rebuilding from scratch,
+   avoids re-deriving it by recursion (with a full O(BLOCK_CRUMBS)
+   pack_block() rebuild) on every probe_block call. */
+typedef struct { unsigned char npos; unsigned char pos[16], delta[16]; } ProbePattern;
+static ProbePattern *probe_patterns;
+static size_t n_probe_patterns, probe_patterns_cap;
+
+static void pattern_push(unsigned char npos, const unsigned char *pos, const unsigned char *delta) {
+    if (n_probe_patterns == probe_patterns_cap) {
+        probe_patterns_cap = probe_patterns_cap ? probe_patterns_cap * 2 : 1024;
+        probe_patterns = realloc(probe_patterns, probe_patterns_cap * sizeof(ProbePattern));
+    }
+    ProbePattern *pp = &probe_patterns[n_probe_patterns++];
+    pp->npos = npos;
+    memcpy(pp->pos, pos, npos);
+    memcpy(pp->delta, delta, npos);
+}
+/* Monotonically increasing position index so each combination of changed
+   positions is generated exactly once, not once per permutation. delta in
+   {1,2,3} mod 4 covers the 3 non-original values at a position regardless
+   of what that position's original digit turns out to be at query time. */
+static void gen_patterns_recurse(unsigned char *pos_buf, unsigned char *delta_buf,
+                                  int depth, int start_pos, int remaining) {
+    pattern_push((unsigned char)depth, pos_buf, delta_buf);
+    if (remaining == 0) return;
+    for (int p = start_pos; p < BLOCK_CRUMBS; p++)
+        for (int dlt = 1; dlt <= 3; dlt++) {
+            pos_buf[depth] = (unsigned char)p;
+            delta_buf[depth] = (unsigned char)dlt;
+            gen_patterns_recurse(pos_buf, delta_buf, depth + 1, p + 1, remaining - 1);
+        }
+}
+static void build_probe_patterns(void) {
+    if (PROBE_RADIUS >= 16) { fprintf(stderr, "PROBE_RADIUS too large for the flattened probe table\n"); exit(1); }
+    unsigned char pos_buf[16], delta_buf[16];
+    n_probe_patterns = 0;
+    gen_patterns_recurse(pos_buf, delta_buf, 0, 0, PROBE_RADIUS);
+}
+
+static void probe_block(QueryCtx *ctx, BlockIndex *idx, int b, const unsigned char *base) {
+    uint64_t base_packed = pack_block(base, BLOCK_CRUMBS);   /* one O(BLOCK_CRUMBS) pack per call, not per pattern */
+    for (size_t i = 0; i < n_probe_patterns; i++) {
+        const ProbePattern *pp = &probe_patterns[i];
+        uint64_t packed = base_packed;
+        for (int k = 0; k < pp->npos; k++) {
+            int p = pp->pos[k];
+            int shift = 2 * (BLOCK_CRUMBS - 1 - p);
+            unsigned char new_digit = (unsigned char)((base[p] + pp->delta[k]) & 3);
+            packed = (packed & ~(3ULL << shift)) | ((uint64_t)new_digit << shift);
+        }
+        lookup_block(ctx, idx, b, packed);
+    }
+}
+
+/* Scores every candidate currently in ctx->cand_buf[0..cand_n) against `data`,
+   keeping the single best-D one, AMONG CANDIDATES WHOSE HISTOGRAM CLASSIFIES
+   AS FORCE_SHAPE, in bestD[c]/best_s[c]/best_f[c*4..] -- a candidate whose
+   shape doesn't match is scored (for the cpos net>0 count) but can never
+   become the best. 16 candidates at a time go through the AVX-512 histogram
+   kernel above; the <16 remainder falls back to scalar. */
+static long score_candidates(QueryCtx *ctx, int c, const unsigned char *data, double base_D_full,
+                              long long *best_s, long *best_f) {
+    long cpos = 0;
+    size_t i = 0;
+    for (; i + 16 <= ctx->cand_n; i += 16) {
+        long f0[16], f1[16], f2[16], f3[16];
+        score_x16_hist(ctx->cand_buf + i, data, f0, f1, f2, f3);
+        for (int lane = 0; lane < 16; lane++) {
+            double D = base_D_full + LT[f0[lane]] + LT[f1[lane]] + LT[f2[lane]] + LT[f3[lane]];
+            if (D - STAGE1_BITS > 0.0) cpos++;
+            if (D > bestD[c]) {
+                long f[4] = { f0[lane], f1[lane], f2[lane], f3[lane] };
+                if (hist_type(f) == FORCE_SHAPE) {
+                    bestD[c] = D;
+                    best_s[c] = (long long)ctx->cand_buf[i + lane];
+                    best_f[c*4+0] = f0[lane]; best_f[c*4+1] = f1[lane];
+                    best_f[c*4+2] = f2[lane]; best_f[c*4+3] = f3[lane];
+                }
+            }
+        }
+    }
+    for (; i < ctx->cand_n; i++) {
+        uint64_t seed = ctx->cand_buf[i];
+        seed_keystream(seed, ctx->scratch_ks);
+        long f0 = 0, f1 = 0, f2 = 0, f3 = 0;
+        for (int p = 0; p < crumbs_per_chunk; p++) {
+            unsigned char out = (unsigned char)((data[p] + ctx->scratch_ks[p]) & 3);
+            if      (out == 0) f0++;
+            else if (out == 1) f1++;
+            else if (out == 2) f2++;
+            else               f3++;
+        }
+        double D = base_D_full + LT[f0] + LT[f1] + LT[f2] + LT[f3];
+        if (D - STAGE1_BITS > 0.0) cpos++;
+        if (D > bestD[c]) {
+            long f[4] = { f0, f1, f2, f3 };
+            if (hist_type(f) == FORCE_SHAPE) {
+                bestD[c] = D;
+                best_s[c] = (long long)seed;
+                best_f[c*4+0] = f0; best_f[c*4+1] = f1; best_f[c*4+2] = f2; best_f[c*4+3] = f3;
+            }
+        }
+    }
+    return cpos;
+}
+
+/* Runs one chunk's MIH query, writing the single best-D candidate found
+   straight into the caller's bestD/best_s/best_f slot. Returns the number
+   of candidates examined and how many were net > 0 (regardless of shape),
+   for the diagnostic columns in the per-chunk table -- MIH doesn't examine
+   every seed, so this is NOT the same as "seeds net>0 out of STAGE1_COUNT". */
+static double g_t_probe = 0.0, g_t_score = 0.0;   /* profiling accumulators, see the breakdown printout */
+static void mih_query_chunk(QueryCtx *ctx, int c, const unsigned char *data, double base_D_full,
+                             long long *best_s, long *best_f,
+                             long *out_cand_n, long *out_cand_pos) {
+    double tp0 = omp_get_wtime();
+    ctx->cand_n = 0;
+    for (int v = 0; v < 4; v++) {
+        for (int i = 0; i < crumbs_per_chunk; i++)
+            ctx->scratch_ideal[i] = (unsigned char)(((v - data[i]) % 4 + 4) % 4);
+        for (int b = 0; b < NBLOCKS; b++)
+            probe_block(ctx, mih_index_a, b, ctx->scratch_ideal + (size_t)b * BLOCK_CRUMBS);
+    }
+    long total_cand = (long)ctx->cand_n;
+    double tp1 = omp_get_wtime();
+    long cpos = score_candidates(ctx, c, data, base_D_full, best_s, best_f);
+    double tp2 = omp_get_wtime();
+    #pragma omp atomic
+    g_t_probe += (tp1 - tp0);
+    #pragma omp atomic
+    g_t_score += (tp2 - tp1);
+
+    *out_cand_n = total_cand;
+    *out_cand_pos = cpos;
+}
+
+int main(int argc, char **argv) {
+    /* Forced single-threaded for prod -- the AVX-512 scoring speedup
+       (score_x16_hist) applies regardless of thread count, and single-thread
+       wall time is what "how fast is the search itself" actually means here.
+       CTDT_THREADS=n overrides this for ad-hoc verification runs where wall
+       time isn't the thing being measured, just the net -- printed ms/chunk
+       and the whole-file day/hour projections are meaningless under this
+       override and shouldn't be read as single-thread numbers. */
+    { const char *e = getenv("CTDT_THREADS");
+      omp_set_num_threads(e ? atoi(e) : 1); }
+
+    int n_chunks = argc > 1 ? atoi(argv[1]) : NUM_CHUNKS;
+    if (argc > 2) STAGE1_BITS = atoi(argv[2]);
+    if (argc > 3) CHUNK_BYTES = atoi(argv[3]);
+    if (STAGE1_BITS < 1 || STAGE1_BITS > 32) {
+        fprintf(stderr,
+            "usage: %s [chunks] [seed_bits] [chunk_bytes]\n"
+            "  seed_bits 1..32 (MIH's seed_list is uint32_t), chunk_bytes >=1 (default 16).\n"
+            "  CTDT_SHOW=n sets how many per-chunk rows to print.\n"
+            "  CTDT_MIH_RADIUS=n overrides the MIH probe radius (default 3).\n"
+            "  single-threaded, always.\n",
+            argv[0]);
+        return 1;
+    }
+    if (CHUNK_BYTES < 1) {
+        fprintf(stderr, "chunk_bytes must be >= 1\n");
+        return 1;
+    }
+    crumbs_per_chunk = CHUNK_BYTES * 4;
+    STAGE1_COUNT = 1ULL << STAGE1_BITS;
+
+    const char *file_path = argc > 4 ? argv[4] : FILE_PATH;
+    FILE *f = fopen(file_path, "rb");
+    if (!f) {
+        fprintf(stderr, "Failed to open file: %s\n", file_path);
+        return 1;
+    }
+    /* CTDT_SKIP=n starts n chunks into the file. This exists so a config picked
+       as the best of a grid can be re-scored on chunks it was NOT picked on --
+       without it, every "confirmation" at a larger chunk count still contains
+       the sample that did the selecting, and best-of-N selection inflates by
+       about 1 SE on shared data. */
+    long skip_chunks = 0;
+    { const char *e = getenv("CTDT_SKIP"); if (e) skip_chunks = atol(e); }
+    if (skip_chunks > 0 &&
+        fseek(f, skip_chunks * (long)CHUNK_BYTES, SEEK_SET) != 0) {
+        fprintf(stderr, "cannot skip %ld chunks\n", skip_chunks);
+        return 1;
+    }
+
+    init_pos_keys();
+    init_lt();
+    choose_mih_params();
+    build_probe_patterns();
+    if (verify_roundtrip()) { fprintf(stderr, "round-trip self-test FAILED\n"); return 1; }
+
+    /* sizeof(uint32_t) on both terms -- offset[] and seed_list[] (see
+       BlockIndex) are both uint32_t; this now matches what's actually kept
+       resident after build_mih_index returns, not the transient uint64_t
+       blockval[] build buffer's size. */
+    double index_mb = (double)NBLOCKS *
+        ((double)(BLOCK_VALUES + 1) * sizeof(uint32_t) + (double)STAGE1_COUNT * sizeof(uint32_t)) / 1e6;
+    printf("seed %d bits (%llu seeds), chunk %d B = %d crumbs\n",
+           STAGE1_BITS, (unsigned long long)STAGE1_COUNT, CHUNK_BYTES, crumbs_per_chunk);
+    printf("  MIH: %d blocks x %d crumbs (4^%d = %llu values/block), probe radius %d, index %.1f MB\n",
+           NBLOCKS, BLOCK_CRUMBS, BLOCK_CRUMBS, (unsigned long long)BLOCK_VALUES, PROBE_RADIUS, index_mb);
+    fflush(stdout);
+
+    printf("  threads: %d\n", omp_get_max_threads());
+    double t_build0 = omp_get_wtime();
+    build_mih_index(&mih_index_a);
+    double t_build1 = omp_get_wtime();
+    printf("  index build: %.2f s\n\n", t_build1 - t_build0);
+
+    unsigned char *bytebuf   = malloc((size_t)CHUNK_BYTES);
+
+    // chunk DUMP_CHUNK with its winning seed actually applied, kept for the dump at the end
+    unsigned char *chunk0_out    = malloc((size_t)crumbs_per_chunk);
+    unsigned char *chunk0_rotout = malloc((size_t)crumbs_per_chunk);   // chunk0_out rotated so its mode = 0
+    long long     chunk0_seed = -1;
+    int           chunk0_len  = 0;
+    int           chunk0_rot  = 0;
+
+    // running net stats across every chunk actually processed
+    double net_sum = 0.0, net_min = 0.0, net_max = 0.0;
+    double net_rot_sum = 0.0;   // net_sum with the flat 2-bit/chunk rotation side channel charged, per chunk
+    long rot_freq[4] = {0,0,0,0};   // how often each rotation value actually gets used -- is 2 bits/chunk the true cost, or can a real code beat it?
+    long   net_n = 0;
+    double netraw_sum = 0.0;
+    int    net_min_chunk = -1, net_max_chunk = -1;
+
+    long   *all_total  = malloc((size_t)n_chunks * sizeof(long));
+    double *all_rawent = malloc((size_t)n_chunks * sizeof(double));
+    long   *all_rawfrq = malloc((size_t)n_chunks * 4 * sizeof(long));
+    unsigned char *all_crumbs = malloc((size_t)n_chunks * (size_t)crumbs_per_chunk);
+    long long *best_s  = malloc((size_t)n_chunks * sizeof(long long));
+    /* calloc, not malloc: a chunk with zero accepted candidates (MIH's probe
+       found none at all, or found some but none classified as FORCE_SHAPE)
+       leaves best_f untouched by the query, and hist_type(0,0,0,0) (via the
+       s[0]==0 check) safely falls out as "flat" instead of reading garbage. */
+    long   *best_f     = calloc((size_t)n_chunks * 4, sizeof(long));
+    unsigned char *chunk0_raw = malloc((size_t)crumbs_per_chunk);
+    long *cand_count     = malloc((size_t)n_chunks * sizeof(long));
+    long *cand_pos_count = malloc((size_t)n_chunks * sizeof(long));
+    if (!bytebuf || !chunk0_out || !chunk0_rotout || !all_total || !all_rawent
+        || !all_rawfrq || !all_crumbs || !best_s || !best_f || !chunk0_raw
+        || !cand_count || !cand_pos_count) {
+        fprintf(stderr, "out of memory for per-chunk state\n"); return 1;
+    }
+
+    int nc = 0;
+    for (int chunk = 0; chunk < n_chunks; chunk++) {
+        size_t got = fread(bytebuf, 1, (size_t)CHUNK_BYTES, f);
+        if (got == 0) break;
+        long freq[4] = {0, 0, 0, 0};
+        long total = 0;
+        unsigned char *dst = all_crumbs + (size_t)nc * crumbs_per_chunk;
+        for (size_t b = 0; b < got; b++)
+            for (int shift = 6; shift >= 0; shift -= 2) {
+                unsigned char crumb = (unsigned char)((bytebuf[b] >> shift) & 0x3);
+                dst[total] = crumb;
+                freq[crumb]++;
+                total++;
+            }
+        if (nc == DUMP_CHUNK) memcpy(chunk0_raw, dst, (size_t)total);
+        all_total[nc]  = total;
+        all_rawent[nc] = crumb_entropy(freq, total);
+        for (int v = 0; v < 4; v++) all_rawfrq[nc*4+v] = freq[v];
+        nc++;
+        if (got < (size_t)CHUNK_BYTES) break;
+    }
+    if (nc == 0) { fprintf(stderr, "no chunks read\n"); return 1; }
+
+    bestD = malloc((size_t)n_chunks * sizeof(double));
+    if (!bestD) { fprintf(stderr, "out of memory\n"); return 1; }
+    for (int c = 0; c < n_chunks; c++) { bestD[c] = -HUGE_VAL; best_s[c] = -1; }
+
+    double base_D_full = 2.0 * (double)crumbs_per_chunk
+                       - (double)crumbs_per_chunk * log2((double)crumbs_per_chunk);
+    const double cost = STAGE1_BITS;
+
+    /* Calibrate on a small prefix BEFORE committing to the full n_chunks run --
+       the whole point is to know if n_chunks is too many chunks up front, not
+       after already paying for the whole thing. Candidate count is fairly
+       stable chunk-to-chunk (it's dominated by the fixed NBLOCKS/radius/bucket
+       geometry, not chunk content), so a small sample calibrates well. Run
+       multithreaded here too (not single-thread) so ms/chunk reflects the
+       SAME throughput the real run below will actually get. */
+    int calib_n = nc < 50 ? nc : 50;
+    double t_query0 = omp_get_wtime();
+    #pragma omp parallel
+    {
+        QueryCtx ctx; ctx_init(&ctx);
+        #pragma omp for schedule(dynamic, 4)
+        for (int c = 0; c < calib_n; c++)
+            mih_query_chunk(&ctx, c, all_crumbs + (size_t)c * crumbs_per_chunk, base_D_full,
+                             best_s, best_f, &cand_count[c], &cand_pos_count[c]);
+        ctx_free(&ctx);
+    }
+    double t_calib = omp_get_wtime();
+    double calib_secs    = t_calib - t_query0;
+    double ms_per_chunk  = 1000.0 * calib_secs / calib_n;
+    printf("  calibration: %.3f ms/chunk wall (from first %d chunk%s, %d threads) -> estimated %s for all %d chunks\n",
+           ms_per_chunk, calib_n, calib_n == 1 ? "" : "s", omp_get_max_threads(),
+           fmt_time(ms_per_chunk / 1000.0 * nc), nc);
+    printf("  |  whole 198 MB file (%.0f chunks) at this rate: %s\n\n",
+           198766075.0 / CHUNK_BYTES, fmt_time(ms_per_chunk / 1000.0 * (198766075.0 / CHUNK_BYTES)));
+    fflush(stdout);
+
+    #pragma omp parallel
+    {
+        QueryCtx ctx; ctx_init(&ctx);
+        #pragma omp for schedule(dynamic, 4)
+        for (int c = calib_n; c < nc; c++)
+            mih_query_chunk(&ctx, c, all_crumbs + (size_t)c * crumbs_per_chunk, base_D_full,
+                             best_s, best_f, &cand_count[c], &cand_pos_count[c]);
+        ctx_free(&ctx);
+    }
+    double t_query1 = omp_get_wtime();
+
+    /* long long, not long: on Windows long is 32-bit even in 64-bit builds,
+       and this sum overflows it once fuller-coverage block configs push
+       per-chunk candidate counts into the millions (seen 2026-08-30: printed
+       a negative average at cb=10/S1=26/bc=10 with a plain `long`). */
+    long long total_candidates = 0;
+    for (int c = 0; c < nc; c++) total_candidates += cand_count[c];
+    double query_secs = t_query1 - t_query0;
+    printf("  actual: %s for %d chunks (%.3f ms/chunk wall, avg %lld candidates/chunk vs %llu exhaustive)\n",
+           fmt_time(query_secs), nc, 1000.0 * query_secs / nc,
+           total_candidates / nc, (unsigned long long)STAGE1_COUNT);
+    printf("  |  breakdown: probe/gather %.1f%% (%.2f s)  vs  score %.1f%% (%.2f s)  [summed across threads]\n\n",
+           100.0 * g_t_probe / (g_t_probe + g_t_score), g_t_probe,
+           100.0 * g_t_score / (g_t_probe + g_t_score), g_t_score);
+
+    FILE *hf = NULL;
+    { const char *e = getenv("CTDT_HIST");
+      if (e) {
+          hf = fopen(e, "wb");
+          if (!hf) { fprintf(stderr, "cannot write %s\n", e); return 1; }
+      } }
+
+    long   tcount[5] = {0,0,0,0,0};   /* chunks per histogram shape */
+    double tnet[5]   = {0,0,0,0,0};
+
+    int show = 24;
+    { const char *e = getenv("CTDT_SHOW"); if (e) show = atoi(e); }
+    if (show > nc) show = nc;
+    if (show > 0) {
+        printf("=== per chunk (first %d of %d) ===\n", show, nc);
+        printf("  %5s %8s %8s %10s  %-18s %-18s %-10s %8s  %10s %10s\n",
+               "chunk", "H_raw", "H_best", "seed",
+               "histogram raw", "histogram best", "type", "net",
+               "candidates", "cand net>0");
+    }
+
+    long no_shape = 0;   /* chunks with no accepted candidate: MIH's probe found none at
+                             all, or found some but none classified as FORCE_SHAPE */
+
+    for (int chunk = 0; chunk < nc; chunk++) {
+        long   total     = all_total[chunk];
+        double entropy   = all_rawent[chunk];
+        int    have_best = best_s[chunk] >= 0;
+        double best_entropy = have_best
+            ? MAX_CRUMB_ENTROPY - bestD[chunk] / (double)total : MAX_CRUMB_ENTROPY;
+
+        if (hf) {
+            if (!have_best)
+                fprintf(hf, "-1/-1/-1/-1\n");
+            else
+                fprintf(hf, "%ld/%ld/%ld/%ld\n",
+                        best_f[chunk*4+0], best_f[chunk*4+1],
+                        best_f[chunk*4+2], best_f[chunk*4+3]);
+        }
+
+        if (chunk < show) {
+            char hr[32], hb[32];
+            snprintf(hr, sizeof hr, "%ld/%ld/%ld/%ld",
+                     all_rawfrq[chunk*4+0], all_rawfrq[chunk*4+1],
+                     all_rawfrq[chunk*4+2], all_rawfrq[chunk*4+3]);
+            if (!have_best) {
+                printf("  %5d %8.4f %8s %10s  %-18s %-18s %-10s %8s  %10ld %10ld\n",
+                       chunk, entropy, "--", "--", hr, "(no candidate)",
+                       "--", "--", cand_count[chunk], cand_pos_count[chunk]);
+            } else {
+                snprintf(hb, sizeof hb, "%ld/%ld/%ld/%ld",
+                         best_f[chunk*4+0], best_f[chunk*4+1],
+                         best_f[chunk*4+2], best_f[chunk*4+3]);
+                printf("  %5d %8.4f %8.4f %10lld  %-18s %-18s %-10s %+8.2f  %10ld %10ld\n",
+                       chunk, entropy, best_entropy, best_s[chunk], hr, hb,
+                       TYPE_NAME[hist_type(&best_f[chunk*4])],
+                       bestD[chunk] - cost, cand_count[chunk], cand_pos_count[chunk]);
+            }
+        }
+
+        if (!have_best) { no_shape++; continue; }
+
+        { int ty = hist_type(&best_f[chunk*4]);
+          tcount[ty]++; tnet[ty] += bestD[chunk] - cost; }
+
+        double net = bestD[chunk] - cost;
+        if (net_n == 0 || net < net_min) { net_min = net; net_min_chunk = chunk; }
+        if (net_n == 0 || net > net_max) { net_max = net; net_max_chunk = chunk; }
+        net_sum += net;
+        /* Rotation is a bijection on a chunk's own 4 symbol labels, so it
+           cannot change that chunk's own D/entropy -- net_rot is exactly net,
+           per chunk, minus the flat 2-bit rotation side channel. Deliberately
+           NOT the pooled/global-histogram framing (see CTDT_RESIDUAL below,
+           which answers a different, harsher question: can ONE shared code
+           across every chunk exploit the alignment). This is the direct
+           per-chunk answer: does storing the rotation, chunk by chunk, cost
+           more than the (already S1-charged) net it rides on. */
+        net_rot_sum += (net - 2.0);
+        rot_freq[rotate_for_mode(&best_f[chunk*4])]++;
+        net_n++;
+        netraw_sum  += (entropy - best_entropy) * (double)total - cost;
+
+        if (chunk == DUMP_CHUNK && best_s[DUMP_CHUNK] >= 0) {
+            uint64_t k = prng_seed_key((uint64_t)best_s[DUMP_CHUNK]);
+            int rot = rotate_for_mode(&best_f[DUMP_CHUNK*4]);
+            for (long i = 0; i < total; i++) {
+                unsigned char l1 = (unsigned char)((chunk0_raw[i] + prng_crumb_keyed(k, (uint32_t)i)) & 0x3);
+                chunk0_out[i]    = l1;
+                chunk0_rotout[i] = (unsigned char)((l1 + rot) & 0x3);
+            }
+            chunk0_seed = best_s[DUMP_CHUNK];
+            chunk0_len  = (int)total;
+            chunk0_rot  = rot;
+        }
+    }
+
+    if (no_shape)
+        printf("  %ld/%d chunks: MIH's probe found no candidate producing a %s\n"
+               "  histogram (approximate-search miss or genuine absence -- excluded\n"
+               "  from the net stats below)\n",
+               no_shape, nc, TYPE_NAME[FORCE_SHAPE]);
+
+    if (net_n > 0) {
+        printf("=== net over %ld chunk%s (cb=%d, %.0f-bit seed) ===\n",
+               net_n, net_n == 1 ? "" : "s", CHUNK_BYTES, cost);
+        printf("  avg net = %7.3f bits/chunk   min %+.2f (chunk %d)   max %+.2f (chunk %d)\n",
+               net_sum / (double)net_n, net_min, net_min_chunk, net_max, net_max_chunk);
+        printf("  avg net incl. layer-1.5 rotate (flat -2 bits/chunk, per-chunk basis): %+.3f bits/chunk\n",
+               net_rot_sum / (double)net_n);
+        /* Is 2 bits/chunk the true cost of the rotation side channel, or can
+           a real code beat it? Only possible if rotation values aren't
+           uniform across chunks -- measure it, don't assume it. mih_query_chunk
+           probes all 4 target values symmetrically and the source data is
+           close to uniform, so a priori this should land near flat (H~2.0),
+           but that's a guess worth checking against what actually won. */
+        { double H_rot = crumb_entropy(rot_freq, net_n);
+          double net_rot_real = net_sum / (double)net_n - H_rot;
+          printf("  rotation value usage: %ld/%ld/%ld/%ld  (H=%.4f bits/chunk vs flat 2.0000)\n",
+                 rot_freq[0], rot_freq[1], rot_freq[2], rot_freq[3], H_rot);
+          printf("  avg net incl. layer-1.5 rotate, REAL entropy-coded cost instead of flat -2: %+.3f bits/chunk\n",
+                 net_rot_real); }
+        printf("  vs raw entropy instead of the 2.0 ceiling: %+.3f bits/chunk\n",
+               netraw_sum / (double)net_n);
+
+        printf("\n  --- histogram shape mix ---\n");
+        for (int k = 0; k < 5; k++) {
+            if (tcount[k])
+                printf("  %-10s %6ld  %5.1f%%   mean net %+7.3f\n",
+                       TYPE_NAME[k], tcount[k],
+                       100.0 * tcount[k] / (double)net_n, tnet[k] / tcount[k]);
+            else
+                printf("  %-10s %6d   0.0%%\n", TYPE_NAME[k], 0);
+        }
+    }
+
+    if (hf) {
+        fclose(hf);
+        printf("\n  wrote %d per-chunk histograms to %s\n",
+               nc, getenv("CTDT_HIST"));
+    }
+
+    if (chunk0_len > 0) {
+        printf("\n=== chunk %d after layer-1 add (seed=%lld) ===\n", DUMP_CHUNK, chunk0_seed);
+        printf("  %d crumbs, decimal 0-3:\n   ", chunk0_len);
+        for (int i = 0; i < chunk0_len; i++) {
+            printf(" %d", chunk0_out[i]);
+            if ((i & 31) == 31 && i + 1 < chunk0_len) printf("\n   ");
+        }
+        printf("\n  %d bytes, decimal 0-255:\n   ", chunk0_len / 4);
+        for (int i = 0; i + 3 < chunk0_len; i += 4) {
+            int b = (chunk0_out[i]     << 6) | (chunk0_out[i + 1] << 4)
+                  | (chunk0_out[i + 2] << 2) |  chunk0_out[i + 3];
+            printf(" %d", b);
+            if (((i / 4) & 15) == 15 && i + 4 < chunk0_len) printf("\n   ");
+        }
+        printf("\n");
+
+        printf("\n=== chunk %d after layer-1.5 rotate (rot=%d, mode forced to 0) ===\n", DUMP_CHUNK, chunk0_rot);
+        printf("  %d crumbs, decimal 0-3:\n   ", chunk0_len);
+        for (int i = 0; i < chunk0_len; i++) {
+            printf(" %d", chunk0_rotout[i]);
+            if ((i & 31) == 31 && i + 1 < chunk0_len) printf("\n   ");
+        }
+        printf("\n");
+    }
+
+    /* CTDT_RESIDUAL=path writes the actual layer-1(+1.5) OUTPUT (winning seed
+       applied, then rotated so each chunk's own mode lands on crumb value 0,
+       packed 4 crumbs/byte) for every processed chunk, not just DUMP_CHUNK --
+       so a downstream tool can resweep chunk-size x S1 fresh on the real
+       post-layer-1.5 residual instead of the raw file. The 2-bit rotation
+       chosen per chunk is NOT serialized here, same as the seed stream isn't
+       -- this writes the transformed data only, for measuring what a real
+       codec could achieve, not a full invertible encoding. */
+    { const char *e = getenv("CTDT_RESIDUAL");
+      if (e) {
+          FILE *rf = fopen(e, "wb");
+          if (!rf) { fprintf(stderr, "cannot write %s\n", e); return 1; }
+          long global_raw[4] = {0,0,0,0}, global_rot[4] = {0,0,0,0};
+          for (int c = 0; c < nc; c++) {
+              /* no candidate found for this chunk -- key 0 leaves the
+                 keystream well-defined (still a valid, just unsearched, seed)
+                 rather than reading the -1 sentinel as a huge bogus seed;
+                 rot likewise falls back to 0 (no-op) since best_f is all-zero
+                 for such a chunk (see the calloc comment above). */
+              uint64_t k = prng_seed_key(best_s[c] >= 0 ? (uint64_t)best_s[c] : 0);
+              int rot = best_s[c] >= 0 ? rotate_for_mode(&best_f[c*4]) : 0;
+              int total = (int)all_total[c];
+              const unsigned char *src = all_crumbs + (size_t)c * crumbs_per_chunk;
+              for (int i = 0; i < total; i += 4) {
+                  int b = 0;
+                  for (int j = 0; j < 4; j++) {
+                      int pos = i + j;
+                      unsigned char l1  = (unsigned char)((src[pos] + prng_crumb_keyed(k, (uint32_t)pos)) & 3u);
+                      unsigned char out = (unsigned char)((l1 + rot) & 3u);
+                      global_raw[l1]++; global_rot[out]++;
+                      b = (b << 2) | out;
+                  }
+                  unsigned char byte = (unsigned char)b;
+                  fwrite(&byte, 1, 1, rf);
+              }
+          }
+          fclose(rf);
+          fprintf(stderr, "wrote residual (%d chunks, %d bytes/chunk) to %s\n", nc, CHUNK_BYTES, e);
+
+          /* Does the rotate step actually concentrate the GLOBAL (whole-run,
+             non-per-chunk) crumb distribution the way the theory predicts?
+             Directly measured, not assumed: pool every processed crumb's
+             value across all chunks, before vs after rotation, and compare
+             what ONE shared entropy code (not per-chunk-adaptive) could do
+             on each. The HONEST bottom line has to charge the seed's S1
+             bits/chunk here too, not just the rotation's 2 -- this global
+             code is a candidate REPLACEMENT for the per-chunk-adaptive
+             assumption baked into "net" above (which needs the decoder to
+             magically know each chunk's exact histogram for free, already
+             shown elsewhere to be an illusory assumption once null-tested),
+             so it has to stand on its own against the flat-2-bit/crumb
+             baseline, fully costed -- there's no "already paid for" free
+             pass on the seed just because a different metric spent it too. */
+          long total_crumbs = global_raw[0]+global_raw[1]+global_raw[2]+global_raw[3];
+          double H_before = crumb_entropy(global_raw, total_crumbs);
+          double H_after  = crumb_entropy(global_rot,  total_crumbs);
+          double raw_gain_bits    = (H_before - H_after) * (double)total_crumbs;
+          double honest_gain_bits = raw_gain_bits - (double)(STAGE1_BITS + 2) * (double)nc;
+          fprintf(stderr, "  global pooled histogram before rotate: %ld/%ld/%ld/%ld  (H=%.4f bits/crumb)\n",
+                  global_raw[0], global_raw[1], global_raw[2], global_raw[3], H_before);
+          fprintf(stderr, "  global pooled histogram after  rotate: %ld/%ld/%ld/%ld  (H=%.4f bits/crumb)\n",
+                  global_rot[0], global_rot[1], global_rot[2], global_rot[3], H_after);
+          fprintf(stderr, "  raw entropy gain from ONE global code (before charging any overhead): %+.1f bits over %d chunks (%+.4f bits/chunk)\n",
+                  raw_gain_bits, nc, raw_gain_bits / (double)nc);
+          fprintf(stderr, "  HONEST net (charging seed S1=%d + rotation 2 = %d bits/chunk side channel): %+.1f bits over %d chunks (%+.4f bits/chunk)\n",
+                  STAGE1_BITS, STAGE1_BITS + 2, honest_gain_bits, nc, honest_gain_bits / (double)nc);
+      }
+    }
+
+    fclose(f);
+    return 0;
+}
